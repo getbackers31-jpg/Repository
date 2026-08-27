@@ -55,8 +55,9 @@ app.get('/', (req, res) => {
 app.post('/api/submit-report', upload.array('photos'), async (req, res) => {
     try {
         console.log("收到新的日報提交請求！");
-        const reportData = JSON.parse(req.body.reportData); // 前端傳來的文字與耗用數據
-        const photos = req.files; // 前端傳來的照片檔案
+        // 直接讀取前端傳來的 JSON 資料
+        const reportData = req.body; 
+        const photos = req.files;
 
         // 1. 取得擁有權限的 Graph Client
         const graphClient = await getGraphClient();
