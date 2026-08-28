@@ -68,18 +68,20 @@ ${reportData.content || '無內容'}
         // 3. 設定要寫入 OneDrive 的資料夾與檔名
         const dateStr = new Date().toISOString().split('T')[0]; 
         const fileName = `${reportData.projectName || '未命名案場'}_${reportData.workerName || '師傅'}_${dateStr}.txt`;
-        const targetFolderPath = "工程專案管理"; // 您可以在這裡改資料夾名稱
+        const targetFolderPath = "工程專案管理"; // 您設定的主管資料夾名稱
         
-        // 🌟🌟🌟【請務必修改這裡】🌟🌟🌟
-        // 伺服器需要知道存進哪一位使用者的 OneDrive
-        // 請將下方引號內的中文，替換成您登入微軟 Azure / OneDrive 的那個 Email 信箱
+        // 指定主管的微軟信箱
         const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
 
-        if (TARGET_USER_EMAIL === "kate@cyber-cloud.info") {
-            return res.status(400).json({ success: false, message: '後端尚未設定微軟信箱，請管理員修改 server.js' });
-        }
-
         console.log(`準備寫入 OneDrive: 使用者 [${TARGET_USER_EMAIL}], 資料夾 [${targetFolderPath}], 檔名 [${fileName}]`);
+
+        // 4. 呼叫 Graph API 實際寫入檔案到指定使用者的 OneDrive 根目錄中
+        await graphClient
+            .api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`)
+            .put(fileContent);
+
+        console.log("日報成功寫入 OneDrive！");
+        res.status(200).json({ success: true, message: '日報已成功歸檔至 OneDrive' });
 
         // 4. 呼叫 Graph API 實際寫入檔案到指定使用者的 OneDrive 根目錄中
         await graphClient
