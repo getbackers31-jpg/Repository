@@ -46,16 +46,37 @@ app.get('/', (req, res) => {
 // 這是前端 (LINE LIFF) 送出日報會呼叫的路由
 app.post('/api/submit-report', upload.array('photos'), async (req, res) => {
     try {
-        console.log("收到新的日報提交請求！");
         const reportData = req.body; 
-
-        // 1. 取得擁有權限的 Graph Client
+        const photos = req.files; 
         const graphClient = await getGraphClient();
+        const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
 
-        // 2. 將前端傳來的資料排版成要存入文字檔的內容
-        const fileContent = `
+        const dateStr = new Date().toISOString().split('T')[0]; 
+        // 自動建立「工程專案管理/案場名稱_日期」的專屬資料夾
+        const targetFolderPath = `工程專案管理/${reportData.projectName}_${dateStr}`;
+        const fileName = `${reportData.workerName}_日報表.txt`;
+
+        const fileContent = `提交人員：${reportData.workerName}\n工程名稱：${reportData.projectName}\n時間：${reportData.date}\n\n施工進度：\n${reportData.content}`;
+
+        // 1. 寫入文字檔
+        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(fileContent);
+
+        // 2. 將照片一張一張寫入同一個資料夾
+        if (photos && photos.length > 0) {
+            for (let file of photos) {
+                // 為避免檔名重複，加上時間戳記
+                const photoName = `${Date.now()}_${file.originalname}`;
+                await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${photoName}:/content`).put(file.buffer);
+            }
+        }
+
+        res.status(200).json({ success: true, message: '日報與照片已成功歸檔' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 ====================
-詮達工程 - 施工日報表
+云說工程 - 施工日報表
 ====================
 提交人員：${reportData.workerName || '未知師傅'}
 工程名稱：${reportData.projectName || '未填寫'}
