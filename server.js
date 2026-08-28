@@ -46,9 +46,12 @@ app.get('/', (req, res) => {
 // 這是前端 (LINE LIFF) 送出日報會呼叫的路由
 app.post('/api/submit-report', upload.array('photos'), async (req, res) => {
     try {
+        console.log("收到圖文日報提交請求！");
         const reportData = req.body; 
         const photos = req.files; 
         const graphClient = await getGraphClient();
+        
+        // 您的主管信箱
         const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
 
         const dateStr = new Date().toISOString().split('T')[0]; 
@@ -60,19 +63,28 @@ app.post('/api/submit-report', upload.array('photos'), async (req, res) => {
 
         // 1. 寫入文字檔
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(fileContent);
+        console.log("✅ 文字日報寫入成功");
 
         // 2. 將照片一張一張寫入同一個資料夾
         if (photos && photos.length > 0) {
             for (let file of photos) {
-                // 為避免檔名重複，加上時間戳記
-                const photoName = `${Date.now()}_${file.originalname}`;
+                // 處理中文檔名可能造成的亂碼，並加上時間戳記防重複
+                const safeName = Buffer.from(file.originalname, 'latin1').toString('utf8');
+                const photoName = `${Date.now()}_${safeName}`;
                 await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${photoName}:/content`).put(file.buffer);
             }
+            console.log(`✅ ${photos.length} 張照片上傳成功`);
         }
 
-        res.status(200).json({ success: true, message: '日報與照片已成功歸檔' });
+        // 3. 成功回傳 (加上 return 確保執行到此結束)
+        return res.status(200).json({ success: true, message: '日報與照片已成功歸檔' });
+
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        console.error("❌ 上傳發生錯誤:", error);
+        // 防呆檢查：如果還沒回傳過，才回傳錯誤訊息給手機
+        if (!res.headersSent) {
+            return res.status(500).json({ success: false, error: error.message });
+        }
     }
 });
 ====================
