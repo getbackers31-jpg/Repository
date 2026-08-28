@@ -71,7 +71,7 @@ ${reportData.content || '無內容'}
         const targetFolderPath = "工程專案管理"; // 您設定的主管資料夾名稱
         
         // 指定主管的微軟信箱
-        const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
+        const TARGET_USER_EMAIL = "otto@cyber-cloud.info"; 
 
         console.log(`準備寫入 OneDrive: 使用者 [${TARGET_USER_EMAIL}], 資料夾 [${targetFolderPath}], 檔名 [${fileName}]`);
 
