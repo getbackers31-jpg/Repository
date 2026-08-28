@@ -1,19 +1,17 @@
-require('dotenv').config(); // 讓本機測試時可以讀取 .env 檔
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer'); // 用於處理照片檔案上傳
+const multer = require('multer');
 const msal = require('@azure/msal-node');
 const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json()); // 處理前端傳來的 JSON 資料
 
-// 設定上傳記憶體暫存 (不直接存硬碟，方便轉傳到 OneDrive)
 const upload = multer({ storage: multer.memoryStorage() });
 
-// 這裡會讀取我們稍早要在 Render 填寫的環境變數 (金鑰)
 const msalConfig = {
     auth: {
         clientId: process.env.AZURE_CLIENT_ID,
@@ -25,65 +23,78 @@ const msalConfig = {
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
 async function getGraphClient() {
-    // 因為我們是背景伺服器，使用 Client Credentials 流程 (應用程式權限)
     const tokenRequest = {
         scopes: ['https://graph.microsoft.com/.default'],
     };
-
     try {
         const response = await cca.acquireTokenByClientCredential(tokenRequest);
-        
-        // 建立並回傳 Graph Client
-        const client = Client.init({
+        return Client.init({
             authProvider: (done) => {
                 done(null, response.accessToken);
             }
         });
-        return client;
     } catch (error) {
         console.error("取得 Azure Token 失敗:", error);
         throw error;
     }
 }
 
-// 當我們部署到 Render 時，可以用這個網址看伺服器有沒有醒來
 app.get('/', (req, res) => {
-    res.send('✅ 詮達工程：LINE 日報後端伺服器已成功啟動！');
+    res.send('✅ 云說工程：LINE 日報後端伺服器已成功啟動！');
 });
 
-// 這是前端 (LINE LIFF) 按下「確認送出日報」時會呼叫的網址
+// 這是前端 (LINE LIFF) 送出日報會呼叫的路由
 app.post('/api/submit-report', upload.array('photos'), async (req, res) => {
     try {
         console.log("收到新的日報提交請求！");
-        // 直接讀取前端傳來的 JSON 資料
         const reportData = req.body; 
-        const photos = req.files;
 
         // 1. 取得擁有權限的 Graph Client
         const graphClient = await getGraphClient();
 
-        // 2. 處理照片上傳至 OneDrive (概念示範)
-        // 注意：正式上線前需確認貴公司 OneDrive 的 ID 或 SharePoint Site ID
-        if (photos && photos.length > 0) {
-            const dateStr = reportData.date.replace(/\//g, '-');
-            const targetPath = `案場照片/${reportData.projectName}/${dateStr}`;
-            
-            console.log(`準備將 ${photos.length} 張照片上傳至 OneDrive 路徑: ${targetPath}`);
-            
-            // 這裡實作迴圈上傳 (由於 Graph API 限制，大檔案可能需改用 Upload Session)
-            // for (let file of photos) { ... }
+        // 2. 將前端傳來的資料排版成要存入文字檔的內容
+        const fileContent = `
+====================
+詮達工程 - 施工日報表
+====================
+提交人員：${reportData.workerName || '未知師傅'}
+工程名稱：${reportData.projectName || '未填寫'}
+提交時間：${reportData.date || new Date().toLocaleString()}
+--------------------
+今日用料與施工進度：
+${reportData.content || '無內容'}
+        `.trim();
+
+        // 3. 設定要寫入 OneDrive 的資料夾與檔名
+        const dateStr = new Date().toISOString().split('T')[0]; 
+        const fileName = `${reportData.projectName || '未命名案場'}_${reportData.workerName || '師傅'}_${dateStr}.txt`;
+        const targetFolderPath = "工程專案管理"; // 您可以在這裡改資料夾名稱
+        
+        // 🌟🌟🌟【請務必修改這裡】🌟🌟🌟
+        // 伺服器需要知道存進哪一位使用者的 OneDrive
+        // 請將下方引號內的中文，替換成您登入微軟 Azure / OneDrive 的那個 Email 信箱
+        const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
+
+        if (TARGET_USER_EMAIL === "kate@cyber-cloud.info") {
+            return res.status(400).json({ success: false, message: '後端尚未設定微軟信箱，請管理員修改 server.js' });
         }
 
-        // 3. (未來可加) 呼叫 LINE Messaging API 推播圖文卡片到群組
+        console.log(`準備寫入 OneDrive: 使用者 [${TARGET_USER_EMAIL}], 資料夾 [${targetFolderPath}], 檔名 [${fileName}]`);
 
-        res.status(200).json({ success: true, message: '日報與照片已成功歸檔至 OneDrive' });
+        // 4. 呼叫 Graph API 實際寫入檔案到指定使用者的 OneDrive 根目錄中
+        await graphClient
+            .api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`)
+            .put(fileContent);
+
+        console.log("日報成功寫入 OneDrive！");
+        res.status(200).json({ success: true, message: '日報已成功歸檔至 OneDrive' });
+
     } catch (error) {
         console.error('處理日報失敗:', error);
-        res.status(500).json({ success: false, error: '伺服器處理失敗' });
+        res.status(500).json({ success: false, error: '伺服器處理失敗: ' + error.message });
     }
 });
 
-// Render 會自動分配 PORT，若在本機測試則預設使用 3000
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 伺服器運作中：http://localhost:${PORT}`);
