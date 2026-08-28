@@ -1,37 +1,3 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const msal = require('@azure/msal-node');
-const { Client } = require('@microsoft/microsoft-graph-client');
-require('isomorphic-fetch');
-
-const app = express();
-app.use(cors());
-app.use(express.json()); 
-
-// 🌟🌟🌟【請務必在這裡貼上您的 Channel access token (long-lived)】🌟🌟🌟
-const LINE_ACCESS_TOKEN = "WJwUI8ZuAUkawqYSYRz+lmuZ2sHuAdCF6Ffe9l+oZwOXz4/ZQ0vCulcwQwE7LCeFjgjMwKHSK3CAproDQobNqH+ZIjQIgU7Sxzn2osK9JPZYFreCsoSNOz1L8E1l95C+WGmCWRZfQRO48kAJXhB88wdB04t89/1O/w1cDnyilFU="; 
-
-const msalConfig = {
-    auth: {
-        clientId: process.env.AZURE_CLIENT_ID,
-        authority: `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}`,
-        clientSecret: process.env.AZURE_CLIENT_SECRET
-    }
-};
-
-const cca = new msal.ConfidentialClientApplication(msalConfig);
-
-async function getGraphClient() {
-    const tokenRequest = { scopes: ['https://graph.microsoft.com/.default'] };
-    try {
-        const response = await cca.acquireTokenByClientCredential(tokenRequest);
-        return Client.init({ authProvider: (done) => { done(null, response.accessToken); } });
-    } catch (error) { throw error; }
-}
-
-app.get('/', (req, res) => { res.send('✅ 伺服器運作中 (強制推播版)！'); });
-
 app.post('/api/submit-report', async (req, res) => {
     try {
         console.log("收到日報提交請求！");
@@ -58,13 +24,15 @@ app.post('/api/submit-report', async (req, res) => {
         reportText += `_____________________\n`;
         reportText += `以上為今日進度報告\n(由 ${reportData.workerName} 提交)`;
 
-        // 1. 寫入 OneDrive
+        // 1. 寫入 OneDrive (核心功能，絕對不受影響)
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(reportText);
         console.log("✅ 文字日報寫入 OneDrive 成功！");
 
-        // 2. 🎯 強制推播（如果前端沒抓到群組ID，這裡會印出警告，方便我們除錯）
-        if (reportData.targetId) {
-            console.log(`🚀 準備將日報推播至對象 ID: ${reportData.targetId}`);
+        // 2. 🎯 LINE 群組推播（加上嚴格的 ID 格式檢查）
+        let targetId = reportData.targetId;
+        // LINE 群組 ID 通常是以 'C' 或 'R' 開頭的長字串
+        if (targetId && (targetId.startsWith('C') || targetId.startsWith('R'))) {
+            console.log(`🚀 準備將日報推播至 LINE 群組: ${targetId}`);
             
             const lineResponse = await fetch('https://api.line.me/v2/bot/message/push', {
                 method: 'POST',
@@ -73,7 +41,7 @@ app.post('/api/submit-report', async (req, res) => {
                     'Authorization': `Bearer ${LINE_ACCESS_TOKEN}`
                 },
                 body: JSON.stringify({
-                    to: reportData.targetId,
+                    to: targetId,
                     messages: [{ type: 'text', text: reportText }]
                 })
             });
@@ -85,7 +53,7 @@ app.post('/api/submit-report', async (req, res) => {
                 console.log("🎉 LINE 機器人推播成功！");
             }
         } else {
-            console.log("⚠️ 警告：前端沒有傳入 targetId (群組ID)！");
+            console.log(`⚠️ 略過 LINE 推播：收到的 ID (${targetId}) 不是群組 ID (需為 C 或 R 開頭)。但 OneDrive 存檔已順利完成！`);
         }
 
         return res.status(200).json({ success: true, message: '處理完成' });
@@ -97,6 +65,3 @@ app.post('/api/submit-report', async (req, res) => {
         }
     }
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 伺服器運作中：http://localhost:${PORT}`); });
