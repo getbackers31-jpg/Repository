@@ -1,7 +1,7 @@
 {
   "name": "chuanda-backend",
   "version": "1.0.0",
-  "description": "詮達工程 - LINE日報與OneDrive串接後端",
+  "description": "云說工程 - LINE日報與OneDrive串接後端",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
