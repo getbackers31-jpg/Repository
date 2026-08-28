@@ -30,7 +30,7 @@ async function getGraphClient() {
     } catch (error) { throw error; }
 }
 
-app.get('/', (req, res) => { res.send('✅ 伺服器運作中 (機器人連動版)！'); });
+app.get('/', (req, res) => { res.send('✅ 伺服器運作中 (強制推播版)！'); });
 
 app.post('/api/submit-report', async (req, res) => {
     try {
@@ -43,7 +43,6 @@ app.post('/api/submit-report', async (req, res) => {
         const targetFolderPath = `工程專案管理/${reportData.projectName}_${dateStr}`;
         const fileName = `${reportData.workerName}_日報表.txt`;
 
-        // 1. 準備日報的純文字排版
         const dateDisplay = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
         
         let reportText = `${dateDisplay}\n\n`;
@@ -59,13 +58,13 @@ app.post('/api/submit-report', async (req, res) => {
         reportText += `_____________________\n`;
         reportText += `以上為今日進度報告\n(由 ${reportData.workerName} 提交)`;
 
-        // 2. 寫入 OneDrive
+        // 1. 寫入 OneDrive
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(reportText);
         console.log("✅ 文字日報寫入 OneDrive 成功！");
 
-        // 3. 🎯 呼叫「云說工程小幫手」把日報推播到群組
-        if (reportData.targetId && LINE_ACCESS_TOKEN !== "WJwUI8ZuAUkawqYSYRz+lmuZ2sHuAdCF6Ffe9l+oZwOXz4/ZQ0vCulcwQwE7LCeFjgjMwKHSK3CAproDQobNqH+ZIjQIgU7Sxzn2osK9JPZYFreCsoSNOz1L8E1l95C+WGmCWRZfQRO48kAJXhB88wdB04t89/1O/w1cDnyilFU=") {
-            console.log(`準備將日報推播至 LINE 群組: ${reportData.targetId}`);
+        // 2. 🎯 強制推播（如果前端沒抓到群組ID，這裡會印出警告，方便我們除錯）
+        if (reportData.targetId) {
+            console.log(`🚀 準備將日報推播至對象 ID: ${reportData.targetId}`);
             
             const lineResponse = await fetch('https://api.line.me/v2/bot/message/push', {
                 method: 'POST',
@@ -79,15 +78,17 @@ app.post('/api/submit-report', async (req, res) => {
                 })
             });
 
+            const lineResultText = await lineResponse.text();
             if (!lineResponse.ok) {
-                const errorDetail = await lineResponse.text();
-                console.error("❌ LINE 推播失敗:", errorDetail);
+                console.error("❌ LINE 推播失敗詳細原因:", lineResultText);
             } else {
-                console.log("✅ LINE 機器人推播成功！");
+                console.log("🎉 LINE 機器人推播成功！");
             }
+        } else {
+            console.log("⚠️ 警告：前端沒有傳入 targetId (群組ID)！");
         }
 
-        return res.status(200).json({ success: true, message: '日報已成功歸檔與推播' });
+        return res.status(200).json({ success: true, message: '處理完成' });
 
     } catch (error) {
         console.error("❌ 系統處理錯誤:", error);
