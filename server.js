@@ -246,4 +246,6 @@ const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_
 if (requiredVars.some(v => !process.env[v])) process.exit(1);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🚀 伺服器運作中：http://localhost:${PORT}`);
+});
