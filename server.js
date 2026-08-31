@@ -34,6 +34,51 @@ function sanitizePathSegment(value) {
     return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim();
 }
 
+function normalizeProjectName(value) {
+    return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+}
+
+function validateProjectName(projectName) {
+    const normalizedName = normalizeProjectName(projectName);
+    if (!normalizedName) {
+        throw new Error('案場名稱不可為空');
+    }
+    if (normalizedName.length > 80) {
+        throw new Error('案場名稱不可超過 80 個字');
+    }
+    if (/[<>:"/\\|?*#%]/.test(normalizedName)) {
+        throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
+    }
+    return normalizedName;
+}
+
+function getProjectRegistrationErrorMessage(error) {
+    const safeMessages = [
+        '案場名稱不可為空',
+        '案場名稱不可超過 80 個字',
+        '案場名稱不可包含以下字元'
+    ];
+    const message = String(error?.message || '');
+    const isSafeMessage = safeMessages.some(prefix => {
+        return message.startsWith(prefix);
+    });
+    return isSafeMessage ? message : '系統暫時無法建立案場，請稍後再試';
+}
+
+let projectWriteQueue = Promise.resolve();
+function withProjectWriteLock(task) {
+    const result = projectWriteQueue.then(task, task);
+    projectWriteQueue = result.catch(() => undefined);
+    return result;
+}
+
+let bindingWriteQueue = Promise.resolve();
+function withBindingWriteLock(task) {
+    const result = bindingWriteQueue.then(task, task);
+    bindingWriteQueue = result.catch(() => undefined);
+    return result;
+}
+
 async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = false) {
     try {
         const graphClient = await getGraphClient();
@@ -63,6 +108,10 @@ async function writeJsonToOneDrive(filePath, data) {
 async function readProjectsFromOneDrive() {
     return await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
 }
+async function writeProjectsToOneDrive(config) {
+    await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
+}
+
 async function readBindingsFromOneDrive() {
     return await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
 }
@@ -70,11 +119,101 @@ async function writeBindingsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
 }
 
+async function ensureProjectFolder(projectName) {
+    const graphClient = await getGraphClient();
+    const safeProjectName = sanitizePathSegment(projectName);
+    
+    if (!safeProjectName) {
+        throw new Error('案場資料夾名稱不可為空');
+    }
+    
+    const folderPath = `工程專案管理/${safeProjectName}`;
+    
+    try {
+        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
+        if (!item.folder) {
+            throw new Error(`同名項目不是資料夾：${safeProjectName}`);
+        }
+        return { created: false, folderId: item.id, folderPath };
+    } catch (error) {
+        const statusCode = error?.statusCode || error?.status || error?.code;
+        const notFound = statusCode === 404 || statusCode === 'itemNotFound';
+        if (!notFound) {
+            throw error;
+        }
+    }
+    
+    try {
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理:/children`).post({
+            name: safeProjectName,
+            folder: {},
+            '@microsoft.graph.conflictBehavior': 'fail'
+        });
+        return { created: true, folderId: createdFolder.id, folderPath };
+    } catch (error) {
+        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
+        if (!item.folder) {
+            throw error;
+        }
+        return { created: false, folderId: item.id, folderPath };
+    }
+}
+
 async function findProjectByName(projectName) {
     const config = await readProjectsFromOneDrive();
     const projects = Array.isArray(config.projects) ? config.projects : [];
-    const normalizedName = String(projectName).trim();
-    return projects.find(p => p.active === true && String(p.projectName).trim() === normalizedName) || null;
+    const normalizedName = normalizeProjectName(projectName);
+    
+    return projects.find(project => {
+        return (
+            project.active === true &&
+            normalizeProjectName(project.projectName) === normalizedName
+        );
+    }) || null;
+}
+
+function createProjectId() {
+    return `PRJ-${crypto.randomUUID()}`;
+}
+
+async function registerProjectByName(projectName) {
+    return withProjectWriteLock(async () => {
+        const normalizedName = validateProjectName(projectName);
+        
+        const config = await readProjectsFromOneDrive();
+        const projects = Array.isArray(config.projects) ? config.projects : [];
+        
+        const existingProject = projects.find(project => {
+            return (
+                project.active === true &&
+                normalizeProjectName(project.projectName) === normalizedName
+            );
+        });
+        
+        if (existingProject) {
+            await ensureProjectFolder(existingProject.projectName);
+            return { project: existingProject, created: false };
+        }
+        
+        const project = {
+            projectId: createProjectId(),
+            projectName: normalizedName,
+            active: true,
+            createdAt: new Date().toISOString()
+        };
+        
+        await ensureProjectFolder(project.projectName);
+        
+        projects.push(project);
+        
+        await writeProjectsToOneDrive({
+            ...config,
+            projects,
+            updatedAt: new Date().toISOString()
+        });
+        
+        return { project, created: true };
+    });
 }
 
 async function replyLineMessage(replyToken, text) {
@@ -87,7 +226,10 @@ async function replyLineMessage(replyToken, text) {
         },
         body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] })
     });
-    if (!response.ok) console.error(`LINE Reply 失敗 ${response.status}`);
+    const responseBody = await response.text();
+    if (!response.ok) {
+        throw new Error(`LINE Reply 失敗 ${response.status}: ` + responseBody);
+    }
 }
 
 async function pushLineMessage(targetId, text) {
@@ -99,7 +241,10 @@ async function pushLineMessage(targetId, text) {
         },
         body: JSON.stringify({ to: targetId, messages: [{ type: 'text', text }] })
     });
-    if (!response.ok) throw new Error(`LINE Push 失敗 ${response.status}`);
+    const responseBody = await response.text();
+    if (!response.ok) {
+        throw new Error(`LINE Push 失敗 ${response.status}: ` + responseBody);
+    }
 }
 
 function verifyLineSignature(rawBody, signature) {
@@ -135,6 +280,25 @@ function validateReportData(reportData) {
     return { valid: missingFields.length === 0, missingFields };
 }
 
+app.get('/api/projects', async (req, res) => {
+    try {
+        const config = await readProjectsFromOneDrive();
+        const projects = Array.isArray(config.projects) ? config.projects : [];
+        const activeProjects = projects
+            .filter(project => project.active === true)
+            .map(project => ({
+                projectId: project.projectId,
+                projectName: project.projectName
+            }))
+            .sort((a, b) => a.projectName.localeCompare(b.projectName, 'zh-Hant'));
+
+        return res.status(200).json({ success: true, projects: activeProjects });
+    } catch (error) {
+        console.error('讀取案場清單失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得案場清單' });
+    }
+});
+
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -165,20 +329,65 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         continue;
                     }
                     const projectName = match[1].trim();
-                    const project = await findProjectByName(projectName);
-                    if (!project) {
-                        await replyLineMessage(event.replyToken, `⚠️ 找不到這個案場\n\n輸入名稱：${projectName}\n\n請先在系統建立正式案場。`);
+                    
+                    let registration;
+                    try {
+                        registration = await registerProjectByName(projectName);
+                    } catch (error) {
+                        console.error('建立案場失敗：', error);
+                        try {
+                            await replyLineMessage(
+                                event.replyToken,
+                                [
+                                    '⚠️ 無法建立案場',
+                                    '',
+                                    getProjectRegistrationErrorMessage(error)
+                                ].join('\n')
+                            );
+                        } catch (replyError) {
+                            console.error('回覆案場建立失敗訊息時發生錯誤：', replyError);
+                        }
                         continue;
                     }
-                    const config = await readBindingsFromOneDrive();
-                    const bindings = Array.isArray(config.bindings) ? config.bindings : [];
-                    const filteredBindings = bindings.filter(b => b.projectId !== project.projectId && b.groupId !== targetId);
-                    filteredBindings.push({
-                        projectId: project.projectId, projectName: project.projectName, groupId: targetId,
-                        sourceType: event.source.type, active: true, boundAt: new Date().toISOString()
+
+                    const project = registration.project;
+
+                    await withBindingWriteLock(async () => {
+                        const config = await readBindingsFromOneDrive();
+                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
+                        const filteredBindings = bindings.filter(binding => {
+                            return (
+                                binding.projectId !== project.projectId &&
+                                binding.groupId !== targetId
+                            );
+                        });
+                        
+                        filteredBindings.push({
+                            projectId: project.projectId,
+                            projectName: project.projectName,
+                            groupId: targetId,
+                            sourceType: event.source.type,
+                            active: true,
+                            boundAt: new Date().toISOString()
+                        });
+                        
+                        await writeBindingsToOneDrive({
+                            ...config,
+                            bindings: filteredBindings,
+                            updatedAt: new Date().toISOString()
+                        });
                     });
-                    await writeBindingsToOneDrive({ bindings: filteredBindings });
-                    await replyLineMessage(event.replyToken, `✅ 案場設定完成\n\n本群組案場：${project.projectName}`);
+
+                    const statusText = registration.created ? '已建立新案場及 OneDrive 資料夾' : '已使用現有案場';
+                    await replyLineMessage(event.replyToken, [
+                        '✅ 案場設定完成',
+                        '',
+                        `案場：${project.projectName}`,
+                        `狀態：${statusText}`,
+                        '',
+                        '之後該案場的施工日報，',
+                        '將自動發布至本群組。'
+                    ].join('\n'));
                 }
                 else if (text === '查詢案場') {
                     if (!targetId) continue;
@@ -188,13 +397,28 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                 }
                 else if (text === '解除案場') {
                     if (!targetId) continue;
-                    const config = await readBindingsFromOneDrive();
-                    const originalCount = config.bindings.length;
-                    config.bindings = config.bindings.filter(b => b.groupId !== targetId);
-                    if (config.bindings.length !== originalCount) {
-                        await writeBindingsToOneDrive(config);
+                    await withBindingWriteLock(async () => {
+                        const config = await readBindingsFromOneDrive();
+                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
+                        const filteredBindings = bindings.filter(binding => {
+                            return binding.groupId !== targetId;
+                        });
+                        
+                        if (filteredBindings.length === bindings.length) {
+                            await replyLineMessage(
+                                event.replyToken,
+                                '本群組目前沒有設定任何案場。'
+                            );
+                            return;
+                        }
+                        
+                        await writeBindingsToOneDrive({
+                            ...config,
+                            bindings: filteredBindings,
+                            updatedAt: new Date().toISOString()
+                        });
                         await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
-                    }
+                    });
                 }
             }
         } catch (error) { console.error('LINE 事件處理失敗：', error); }
@@ -209,10 +433,24 @@ app.post('/api/submit-report', async (req, res) => {
     try {
         const reportData = req.body || {}; 
         const validation = validateReportData(reportData);
-        if (!validation.valid) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_REPORT_DATA', error: `缺少必要欄位：${validation.missingFields.join(', ')}` });
+        if (!validation.valid) {
+            return res.status(400).json({
+                success: false, archived: false, pushed: false,
+                reason: 'INVALID_REPORT_DATA',
+                error: `缺少必要欄位：${validation.missingFields.join(', ')}`
+            });
+        }
 
         const project = await findProjectByName(reportData.projectName);
-        if (!project) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'PROJECT_NOT_FOUND', error: '找不到指定案場' });
+        if (!project) {
+            return res.status(400).json({
+                success: false, archived: false, pushed: false,
+                reason: 'PROJECT_NOT_FOUND',
+                error: '找不到指定案場，請先在施工群組使用「設定案場」建立案場'
+            });
+        }
+
+        await ensureProjectFolder(project.projectName);
 
         const graphClient = await getGraphClient();
         const { dateStr, timeStr } = getTaiwanDateParts();
@@ -227,18 +465,35 @@ app.post('/api/submit-report', async (req, res) => {
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(reportText);
 
         const config = await readBindingsFromOneDrive();
-        const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.projectName === project.projectName && b.active);
+        const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(binding => {
+            return (
+                binding.projectId === project.projectId &&
+                binding.active === true
+            );
+        });
 
-        if (!binding) return res.status(200).json({ success: true, archived: true, pushed: false, reason: 'PROJECT_NOT_BOUND' });
+        if (!binding) {
+            return res.status(200).json({
+                success: true, archived: true, pushed: false, reason: 'PROJECT_NOT_BOUND'
+            });
+        }
 
         try {
             await pushLineMessage(binding.groupId, reportText);
             return res.status(200).json({ success: true, archived: true, pushed: true, message: '日報已歸檔並發布' });
         } catch (lineError) {
+            console.error('LINE 推播失敗：', lineError);
             return res.status(200).json({ success: true, archived: true, pushed: false, reason: 'LINE_PUSH_FAILED' });
         }
     } catch (error) {
-        if (!res.headersSent) return res.status(500).json({ success: false, error: error.message });
+        console.error('提交日報失敗：', error);
+        if (!res.headersSent) {
+            return res.status(500).json({
+                success: false, archived: false, pushed: false,
+                reason: 'INTERNAL_ERROR',
+                error: '系統處理失敗，請稍後再試'
+            });
+        }
     }
 });
 
