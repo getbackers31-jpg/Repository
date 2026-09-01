@@ -271,8 +271,27 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     for (const event of body.events || []) {
         try {
             const targetId = getLineTargetId(event);
-            if (event.type === 'join') {
-                await replyLineMessage(event.replyToken, '👷 云說工程小幫手已加入本群組\n\n請輸入：\n設定案場 案場名稱\n\n例如：\n設定案場 台塑大樓');
+           if (event.type === 'join') {
+                const welcomeText = [
+                    '👷 歡迎使用「云說工程小幫手」！',
+                    '我是負責協助自動化建案與日報歸檔的機器人。將我邀請至施工群組後，即可使用以下完整功能：',
+                    '',
+                    '【📝 日常填寫日報】',
+                    '不用打指令！請直接點擊下方「圖文選單」，或於聊天室輸入「日報」、「表單」，即可開啟專屬網址填寫。',
+                    '',
+                    '【⚙️ 群組管理指令】(請於施工群組內輸入)',
+                    '🔹 設定案場 案場名稱',
+                    '👉 首次開工必填！將群組綁定案場，並自動於雲端建立專屬資料夾。(範例：設定案場 台塑大樓)',
+                    '',
+                    '🔹 查詢案場 或 案場查詢',
+                    '👉 查詢目前該群組是綁定在哪一個案場，避免日報發錯地方。',
+                    '',
+                    '🔹 解除案場',
+                    '👉 工程退場或不小心綁錯時使用，立刻解除群組與案場的綁定。',
+                    '',
+                    '💡 提示：指令與案場名稱之間，請務必空一格喔！'
+                ].join('\n');
+                await replyLineMessage(event.replyToken, welcomeText);
                 continue;
             }
             if (event.type === 'message' && event.message.type === 'text') {
@@ -337,7 +356,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         '將自動發布至本群組。'
                     ].join('\n'));
                 }
-                else if (text === '查詢案場') {
+                else if (text === '查詢案場' || text === '案場查詢') {
                     if (!targetId) continue;
                     const config = await readBindingsFromOneDrive();
                     const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.groupId === targetId && b.active);
