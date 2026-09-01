@@ -289,7 +289,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     '🔹 解除案場',
                     '👉 工程退場或不小心綁錯時使用，立刻解除群組與案場的綁定。',
                     '',
-                    '💡 提示：指令與案場名稱之間，請務必空一格喔！'
+                    '💡 提示：指令與案場名稱之間，請務必空一格喔！',
+                    '', 
+                    '👉 https://liff.line.me/2011289657-vQgMb0eI
                 ].join('\n');
                 await replyLineMessage(event.replyToken, welcomeText);
                 continue;
