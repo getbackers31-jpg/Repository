@@ -405,6 +405,27 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
                     });
                 }
+                else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
+                    const helpText = [
+                        '📖 「云說工程小幫手」群組指令說明',
+                        '',
+                        '請在施工專案群組中直接傳送以下指令：',
+                        '',
+                        '🔹 設定案場 案場名稱',
+                        '👉 首次開工必用！將本群組與案場綁定，自動建立雲端資料夾並取得專屬填表網址。',
+                        '（範例：設定案場 台北雙星，中間請記得空一格）',
+                        '',
+                        '🔹 查詢案場 或 案場查詢',
+                        '👉 查詢目前群組綁定的案場名稱。',
+                        '',
+                        '🔹 解除案場',
+                        '👉 完工退場或綁錯案場時使用，立刻解除本群組的綁定。',
+                        '',
+                        '💡 日常填報提醒：',
+                        '綁定案場後，請將機器人回覆的「專屬網址」設為【群組置頂公告】，日常填寫日報直接點擊公告即可，不需要再輸入指令喔！'
+                    ].join('\n');
+                    await replyLineMessage(event.replyToken, helpText);
+                }
             }
         } catch (error) { console.error('LINE 事件處理失敗：', error); }
     }
