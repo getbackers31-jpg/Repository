@@ -119,7 +119,8 @@ async function ensureProjectFolder(projectName) {
     const safeProjectName = sanitizePathSegment(projectName);
     if (!safeProjectName) throw new Error('案場資料夾名稱不可為空');
 
-    const folderPath = `工程專案管理/${safeProjectName}`;
+    // 👉 修改 1：將路徑加上 2026_工程專案
+    const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
 
     try {
         const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
@@ -131,7 +132,8 @@ async function ensureProjectFolder(projectName) {
     }
 
     try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理:/children`).post({
+        // 👉 修改 2：建立資料夾的目標父層也改為 工程專案管理/2026_工程專案
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({
             name: safeProjectName,
             folder: {},
             '@microsoft.graph.conflictBehavior': 'fail'
