@@ -493,7 +493,8 @@ app.post('/api/submit-report', async (req, res) => {
 
         const graphClient = await getGraphClient();
         const { dateStr, timeStr } = getTaiwanDateParts();
-        const targetFolderPath = `工程專案管理/${sanitizePathSegment(project.projectName)}`;
+        // 👉 修改 3：日報上傳的路徑加上 2026_工程專案
+        const targetFolderPath = `工程專案管理/2026_工程專案/${sanitizePathSegment(project.projectName)}`;
         const fileName = `${dateStr}_${timeStr}_施工日報.txt`;
 
         let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
