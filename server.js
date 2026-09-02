@@ -11,6 +11,7 @@ app.use(cors());
 
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
 const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
 
 const msalConfig = {
@@ -150,6 +151,18 @@ async function findProjectByName(projectName) {
     return projects.find(p => p.active === true && normalizeProjectName(p.projectName) === normalizedName) || null;
 }
 
+async function findProjectById(projectId) {
+    const config = await readProjectsFromOneDrive();
+    const projects = Array.isArray(config.projects) ? config.projects : [];
+    const normalizedProjectId = String(projectId || '').trim();
+    if (!normalizedProjectId) {
+        return null;
+    }
+    return projects.find(project => {
+        return project.active === true && project.projectId === normalizedProjectId;
+    }) || null;
+}
+
 function createProjectId() {
     return `PRJ-${crypto.randomUUID()}`;
 }
@@ -271,7 +284,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     for (const event of body.events || []) {
         try {
             const targetId = getLineTargetId(event);
-           if (event.type === 'join') {
+            if (event.type === 'join') {
                 const welcomeText = [
                     '👷 歡迎使用「云說工程小幫手」！',
                     '我是負責協助自動化建案與日報歸檔的機器人。將我邀請至施工群組後，即可使用以下完整功能：',
@@ -291,7 +304,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     '',
                     '💡 提示：指令與案場名稱之間，請務必空一格喔！',
                     '', 
-                    '👉 https://liff.line.me/2011289657-vQgMb0eI
+                    `👉 https://liff.line.me/${LIFF_ID}`
                 ].join('\n');
                 await replyLineMessage(event.replyToken, welcomeText);
                 continue;
@@ -348,15 +361,23 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     });
 
                     const statusText = registration.created ? '已建立新案場及 OneDrive 資料夾' : '已使用現有案場';
-                    await replyLineMessage(event.replyToken, [
-                        '✅ 案場設定完成',
-                        '',
-                        `案場：${project.projectName}`,
-                        `狀態：${statusText}`,
-                        '',
-                        '之後該案場的施工日報，',
-                        '將自動發布至本群組。'
-                    ].join('\n'));
+                    const reportUrl = `https://liff.line.me/${LIFF_ID}/?projectId=${encodeURIComponent(project.projectId)}`;
+                    await replyLineMessage(
+                        event.replyToken,
+                        [
+                            '✅ 案場設定完成',
+                            '',
+                            `案場：${project.projectName}`,
+                            `狀態：${statusText}`,
+                            '',
+                            '請使用以下專屬連結填寫施工日報：',
+                            reportUrl,
+                            '',
+                            '此連結已綁定本案場，',
+                            '建議將這則訊息設為群組公告。',
+                            '之後從此連結開啟即可自動鎖定案場。'
+                        ].join('\n')
+                    );
                 }
                 else if (text === '查詢案場' || text === '案場查詢') {
                     if (!targetId) continue;
@@ -391,6 +412,35 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 app.use(express.json());
 
+app.get('/api/projects/:projectId', async (req, res) => {
+    try {
+        const project = await findProjectById(req.params.projectId);
+        
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                reason: 'PROJECT_NOT_FOUND',
+                error: '找不到指定案場'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            project: {
+                projectId: project.projectId,
+                projectName: project.projectName
+            }
+        });
+    } catch (error) {
+        console.error('讀取指定案場失敗：', error);
+        return res.status(500).json({
+            success: false,
+            reason: 'INTERNAL_ERROR',
+            error: '無法取得案場資料'
+        });
+    }
+});
+
 app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
 
 app.post('/api/submit-report', async (req, res) => {
@@ -399,12 +449,20 @@ app.post('/api/submit-report', async (req, res) => {
         const validation = validateReportData(reportData);
         if (!validation.valid) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_REPORT_DATA', error: `缺少必要欄位：${validation.missingFields.join(', ')}` });
 
-        const project = await findProjectByName(reportData.projectName);
+        const submittedProjectId = String(reportData.projectId || '').trim();
+        let project;
+        
+        if (submittedProjectId) {
+            project = await findProjectById(submittedProjectId);
+        } else {
+            project = await findProjectByName(reportData.projectName);
+        }
+        
         if (!project) {
             return res.status(400).json({
                 success: false, archived: false, pushed: false,
                 reason: 'PROJECT_NOT_FOUND',
-                error: '找不到指定案場，請先在施工群組使用「設定案場」建立案場'
+                error: '找不到指定案場，請重新從施工群組的專屬連結開啟表單'
             });
         }
 
