@@ -405,7 +405,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
                     });
                 }
-                else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
+                else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
                     const helpText = [
                         '📖 「云說工程小幫手」群組指令說明',
                         '',
