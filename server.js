@@ -523,8 +523,6 @@ app.post('/api/submit-report', async (req, res) => {
         // 原有的目錄創建邏輯
         await ensureProjectFolder(project.projectName);
 
-        await ensureProjectFolder(project.projectName);
-
         const graphClient = await getGraphClient();
         const { dateStr, timeStr } = getTaiwanDateParts();
         // 👉 修改 3：日報上傳的路徑加上 2026_工程專案
