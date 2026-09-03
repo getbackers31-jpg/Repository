@@ -144,6 +144,34 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
+async function ensureChildFolder(graphClient, parentPath, childFolderName) {
+    const safeChildName = sanitizePathSegment(childFolderName);
+    if (!safeChildName) throw new Error('子資料夾名稱不可為空');
+    const childPath = `${parentPath}/${safeChildName}`;
+
+    try {
+        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
+        if (!existingItem.folder) throw new Error(`同名項目不是資料夾：${childPath}`);
+        return { created: false, folderId: existingItem.id, folderPath: childPath };
+    } catch (error) {
+        const statusCode = error?.statusCode || error?.status || error?.code;
+        if (statusCode !== 404 && statusCode !== 'itemNotFound') throw error;
+    }
+
+    try {
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({
+            name: safeChildName,
+            folder: {},
+            '@microsoft.graph.conflictBehavior': 'fail'
+        });
+        return { created: true, folderId: createdFolder.id, folderPath: childPath };
+    } catch (createError) {
+        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
+        if (!existingItem.folder) throw createError;
+        return { created: false, folderId: existingItem.id, folderPath: childPath };
+    }
+}
+
 async function findProjectByName(projectName) {
     const config = await readProjectsFromOneDrive();
     const projects = Array.isArray(config.projects) ? config.projects : [];
@@ -479,7 +507,6 @@ app.post('/api/submit-report', async (req, res) => {
             project = await findProjectByName(reportData.projectName);
         }
         
-        // 原有的案場驗證邏輯
         if (!project) {
             return res.status(400).json({
                 success: false,
@@ -490,71 +517,87 @@ app.post('/api/submit-report', async (req, res) => {
             });
         }
 
-        // 確保目錄存在 (只有這裡呼叫一次，刪除了原本重複的行)
+        // ==========================================
+        // 👇 資料夾建立與 JSON 結構化落檔邏輯 👇
+        // ==========================================
         await ensureProjectFolder(project.projectName);
         const safeProjectName = sanitizePathSegment(project.projectName);
-
-        // 取得 GraphClient 與台灣時間，供給 JSON 與 TXT 共用
         const graphClient = await getGraphClient();
-        const { dateStr, timeStr } = getTaiwanDateParts();
+        
+        const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
+        const textFolderResult = await ensureChildFolder(graphClient, projectFolderPath, '施工日報');
+        const dataFolderResult = await ensureChildFolder(graphClient, projectFolderPath, '結構化資料');
+        
+        const textFolderPath = textFolderResult.folderPath;
+        const dataFolderPath = dataFolderResult.folderPath;
 
-        // ==========================================
-        // 👇 開始處理結構化 JSON 落檔 👇
-        // ==========================================
-        const reportDate = reportData.reportDate || dateStr;
-        const submittedAt = new Date().toISOString(); 
-        
-        const fullSubmissionId = reportData.submissionId || Date.now().toString(36);
-        const shortSubId = fullSubmissionId.substring(0, 8);
-        
+        const { dateStr, timeStr } = getTaiwanDateParts();
+        const reportDate = dateStr; // 後端強制押上台灣時間日期
+
+        const fullSubmissionId = String(reportData.submissionId || crypto.randomUUID()).trim();
+        const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8);
+
+        const isNoWork = reportData.isNoWork === true;
+        const contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
+        const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
+        const materialItems = Array.isArray(reportData.materialItems) ? reportData.materialItems : [];
+
+        // 後端重新計算總人數
+        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => {
+            const workerCount = Number(item.workerCount || 0);
+            return total + (Number.isFinite(workerCount) ? workerCount : 0);
+        }, 0);
+
         const structuredReport = {
+            schemaVersion: 1,
             projectId: project.projectId,
             projectName: project.projectName,
-            reportDate: reportDate,
+            reportDate,
             submissionId: fullSubmissionId,
-            submittedAt: submittedAt,
-            isNoWork: reportData.isNoWork === true,
-            noWorkReason: String(reportData.noWorkReason || ''),
+            submittedAt: new Date().toISOString(),
+            submittedDateLocal: dateStr,
+            submittedTimeLocal: timeStr,
+            isNoWork,
+            noWorkReason: isNoWork ? String(reportData.noWorkReason || '') : '',
             weather: {
                 temp: reportData.temp,
                 humidity: reportData.humidity,
                 wind: reportData.wind
             },
-            contractorItems: Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [],
-            totalWorkerCount: Number(reportData.totalWorkerCount || 0),
-            workItems: Array.isArray(reportData.workItems) ? reportData.workItems : [],
-            customWorkItem: String(reportData.customWorkItem || ''),
-            workNotes: String(reportData.workNotes || ''),
-            materialItems: Array.isArray(reportData.materialItems) ? reportData.materialItems : [],
+            contractorItems: isNoWork ? [] : contractorItems,
+            totalWorkerCount: calculatedTotalWorkerCount,
+            workItems: isNoWork ? [] : workItems,
+            customWorkItem: isNoWork ? '' : String(reportData.customWorkItem || ''),
+            workNotes: isNoWork ? '' : String(reportData.workNotes || ''),
+            materialItems: isNoWork ? [] : materialItems,
             remarks: String(reportData.remarks || '')
         };
 
-        const [year, month] = reportDate.split('-');
-        const jsonFileName = `${reportDate}_${timeStr}_${shortSubId}_結構化日報.json`;
-        const jsonFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/日報資料/${year}/${month}/${jsonFileName}`;
+        const baseFileName = `${reportDate}_${shortSubmissionId}`;
+        const jsonFileName = `${baseFileName}.json`;
+        const txtFileName = `${baseFileName}_施工日報.txt`;
+        const jsonFilePath = `${dataFolderPath}/${jsonFileName}`;
+        const txtFilePath = `${textFolderPath}/${txtFileName}`;
 
+        // 1. 強制先寫入 JSON (若失敗則直接中斷拋錯)
         try {
             const jsonFileContent = Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8');
             await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(jsonFileContent);
-            console.log(`[Success] 結構化 JSON 已寫入: ${jsonFilePath}`);
+            console.log(`[Success] 結構化 JSON 已寫入：${jsonFilePath}`);
         } catch (jsonUploadError) {
-            console.error('[Error] 結構化 JSON 寫入 OneDrive 失敗:', jsonUploadError);
+            console.error('[Error] 結構化 JSON 寫入失敗：', jsonUploadError);
+            throw new Error('結構化日報寫入失敗'); // 拋錯中斷，前端會保留草稿並恢復按鈕
         }
+
         // ==========================================
-        // 👆 結束處理結構化 JSON 落檔 👆
+        // 👇 繼續處理原本的 TXT 與 LINE 推播邏輯 👇
         // ==========================================
-
-
-        // 👇 繼續處理原本的 TXT 文字檔落檔 👇
-        const targetFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-        const fileName = `${dateStr}_${timeStr}_施工日報.txt`;
-
-        let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
+        let reportText = `📋 施工日報\n\n日期：${reportDate.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
         reportText += `溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n`;
         reportText += `施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n`;
         reportText += `今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
 
-        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${targetFolderPath}/${fileName}:/content`).put(reportText);
+        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
 
         const config = await readBindingsFromOneDrive();
         const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.projectId === project.projectId && b.active);
