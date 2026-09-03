@@ -510,7 +510,6 @@ app.post('/api/submit-report', async (req, res) => {
         const isNoWork = reportData.isNoWork === true;
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
 
-        // 👇 新增：後端必須強制驗證廠商人數格式
         if (!isNoWork) {
             if (contractorItems.length === 0) {
                 return res.status(400).json({
@@ -544,7 +543,6 @@ app.post('/api/submit-report', async (req, res) => {
             contractorItems = [];
         }
 
-        // 後端依據正確的數值重新加總
         const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
 
         await ensureProjectFolder(project.projectName);
@@ -561,10 +559,15 @@ app.post('/api/submit-report', async (req, res) => {
         const { dateStr, timeStr } = getTaiwanDateParts();
         const reportDate = dateStr; 
 
-        const fullSubmissionId = String(reportData.submissionId || crypto.randomUUID()).trim();
-        // 👇 新增：將長度從 8 擴展為 16 碼，杜絕碰撞機率
+        // 👇 加入了最新的 ID 終極空白防呆機制
+        const submittedSubmissionId = String(reportData.submissionId || '').trim();
+        const fullSubmissionId = submittedSubmissionId || crypto.randomUUID();
         const safeSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '');
         const shortSubmissionId = safeSubmissionId.slice(0, 16);
+
+        if (!shortSubmissionId) {
+            throw new Error('無法產生日報識別碼');
+        }
 
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
         const materialItems = Array.isArray(reportData.materialItems) ? reportData.materialItems : [];
@@ -637,6 +640,117 @@ app.post('/api/submit-report', async (req, res) => {
                 error: '系統處理失敗，請稍後再試'
             });
         }
+    }
+});
+
+// ==========================================
+// 👇 新增：結案統計產生器 API 👇
+// ==========================================
+app.get('/api/project-stats/:projectId', async (req, res) => {
+    try {
+        const projectId = req.params.projectId;
+        const project = await findProjectById(projectId);
+        if (!project) {
+            return res.status(404).json({ success: false, error: '找不到該案場' });
+        }
+
+        const safeProjectName = sanitizePathSegment(project.projectName);
+        const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
+        const graphClient = await getGraphClient();
+
+        // 1. 取得資料夾內所有 JSON 檔案列表
+        let files = [];
+        try {
+            const result = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${dataFolderPath}:/children`).select('id,name,@microsoft.graph.downloadUrl').get();
+            files = result.value.filter(file => file.name.endsWith('.json'));
+        } catch (error) {
+            if (error.statusCode === 404) {
+                return res.status(200).json({ success: true, message: '尚無日報資料', stats: null });
+            }
+            throw error;
+        }
+
+        // 2. 下載並解析所有 JSON 內容
+        const reports = [];
+        for (const file of files) {
+            const downloadUrl = file['@microsoft.graph.downloadUrl'];
+            if (downloadUrl) {
+                const response = await fetch(downloadUrl);
+                if (response.ok) {
+                    reports.push(await response.json());
+                }
+            }
+        }
+
+        // 3. 同日修正過濾：相同 reportDate 只取 submittedAt 最新者
+        const latestReportsMap = new Map();
+        for (const report of reports) {
+            const date = report.reportDate;
+            if (!latestReportsMap.has(date)) {
+                latestReportsMap.set(date, report);
+            } else {
+                const existing = latestReportsMap.get(date);
+                if (new Date(report.submittedAt) > new Date(existing.submittedAt)) {
+                    latestReportsMap.set(date, report);
+                }
+            }
+        }
+        const validReports = Array.from(latestReportsMap.values());
+
+        // 4. 開始統計計算
+        const stats = {
+            totalDays: validReports.length,
+            workDays: 0,
+            noWorkDays: 0,
+            totalWorkerCount: 0,
+            contractorStats: {},
+            materialStats: {},
+            workItemsStats: {},
+            noWorkReasons: {}
+        };
+
+        for (const report of validReports) {
+            if (report.isNoWork) {
+                stats.noWorkDays++;
+                const reason = report.noWorkReason || '未填寫原因';
+                stats.noWorkReasons[reason] = (stats.noWorkReasons[reason] || 0) + 1;
+            } else {
+                stats.workDays++;
+                stats.totalWorkerCount += Number(report.totalWorkerCount) || 0;
+
+                if (Array.isArray(report.contractorItems)) {
+                    report.contractorItems.forEach(item => {
+                        const name = item.contractorName;
+                        const count = Number(item.workerCount) || 0;
+                        stats.contractorStats[name] = (stats.contractorStats[name] || 0) + count;
+                    });
+                }
+
+                if (Array.isArray(report.workItems)) {
+                    report.workItems.forEach(item => {
+                        stats.workItemsStats[item] = (stats.workItemsStats[item] || 0) + 1;
+                    });
+                }
+
+                if (Array.isArray(report.materialItems)) {
+                    report.materialItems.forEach(item => {
+                        const key = `${item.materialName} (${item.baseUnit})`;
+                        const qty = Number(item.baseQuantity) || 0;
+                        stats.materialStats[key] = (stats.materialStats[key] || 0) + qty;
+                    });
+                }
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            projectName: project.projectName,
+            stats
+        });
+
+    } catch (error) {
+        console.error('統計產生失敗：', error);
+        return res.status(500).json({ success: false, error: '統計產生失敗' });
     }
 });
 
