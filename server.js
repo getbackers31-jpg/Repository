@@ -413,26 +413,67 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.groupId === targetId && b.active);
                     await replyLineMessage(event.replyToken, binding ? `📍 本群組目前設定案場\n\n${binding.projectName}` : '⚠️ 本群組尚未設定案場\n\n請輸入：\n設定案場 案場名稱');
                 }
-                else if (text === '解除案場') {
-                    if (!targetId) continue;
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
-                        const filteredBindings = bindings.filter(b => b.groupId !== targetId);
-                        
-                        if (filteredBindings.length === bindings.length) {
-                            await replyLineMessage(event.replyToken, '本群組目前沒有設定任何案場。');
+                // 👇 新增結案指令 👇
+                else if (text.startsWith('結案')) {
+                    if (!targetId) {
+                        await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「結案」指令。');
+                        continue;
+                    }
+                    const match = text.match(/^結案\s+(.+)$/);
+                    if (!match) {
+                        await replyLineMessage(event.replyToken, '⚠️ 指令格式錯誤\n\n正確格式：\n結案 大安區');
+                        continue;
+                    }
+                    const targetProjectName = match[1].trim();
+
+                    await withProjectWriteLock(async () => {
+                        const config = await readProjectsFromOneDrive();
+                        const projects = Array.isArray(config.projects) ? config.projects : [];
+                        const normalizedTarget = normalizeProjectName(targetProjectName);
+
+                        // 尋找目標案場在陣列中的位置
+                        const projectIndex = projects.findIndex(p => normalizeProjectName(p.projectName) === normalizedTarget);
+
+                        if (projectIndex === -1) {
+                            await replyLineMessage(event.replyToken, `⚠️ 找不到名為「${targetProjectName}」的案場，可能已經結案或名稱輸入錯誤。`);
                             return;
                         }
 
-                        await writeBindingsToOneDrive({
+                        // 將案場從陣列中徹底刪除 (Hard Delete)
+                        projects.splice(projectIndex, 1);
+
+                        // 寫回 OneDrive
+                        await writeProjectsToOneDrive({
                             ...config,
-                            bindings: filteredBindings,
+                            projects,
                             updatedAt: new Date().toISOString()
                         });
-                        await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
+
+                        // 同步檢查並解除本群組的綁定
+                        await withBindingWriteLock(async () => {
+                            const bindingConfig = await readBindingsFromOneDrive();
+                            const bindings = Array.isArray(bindingConfig.bindings) ? bindingConfig.bindings : [];
+                            const filteredBindings = bindings.filter(b => b.projectName !== targetProjectName);
+                            
+                            await writeBindingsToOneDrive({
+                                ...bindingConfig,
+                                bindings: filteredBindings,
+                                updatedAt: new Date().toISOString()
+                            });
+                        });
+
+                        await replyLineMessage(
+                            event.replyToken,
+                            [
+                                `✅ 案場「${targetProjectName}」已成功結案！`,
+                                '',
+                                '系統已自動將此案場從選單中下架，並解除相關的群組綁定。',
+                                '您現在可以安心將 OneDrive 中的資料夾移動至「已完工」目錄了。'
+                            ].join('\n')
+                        );
                     });
                 }
+                // 👆 新增結案指令結束 👆
                 else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
                     const helpText = [
                         '📖 「云說工程小幫手」群組指令說明',
