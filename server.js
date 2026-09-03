@@ -481,13 +481,47 @@ app.post('/api/submit-report', async (req, res) => {
             project = await findProjectByName(reportData.projectName);
         }
         
+        // 原有的案場驗證邏輯
         if (!project) {
             return res.status(400).json({
-                success: false, archived: false, pushed: false,
+                success: false,
+                archived: false,
+                pushed: false,
                 reason: 'PROJECT_NOT_FOUND',
                 error: '找不到指定案場，請重新從施工群組的專屬連結開啟表單'
             });
         }
+
+        // 👇 本階段唯一新增的後端驗證 Log 👇
+        console.log(
+            '[Structured Report]',
+            JSON.stringify(
+                {
+                    projectId: project.projectId,
+                    projectName: project.projectName,
+                    isNoWork: reportData.isNoWork === true,
+                    noWorkReason: String(reportData.noWorkReason || ''),
+                    contractorItems: Array.isArray(reportData.contractorItems)
+                        ? reportData.contractorItems
+                        : [],
+                    totalWorkerCount: Number(reportData.totalWorkerCount || 0),
+                    workItems: Array.isArray(reportData.workItems)
+                        ? reportData.workItems
+                        : [],
+                    customWorkItem: String(reportData.customWorkItem || ''),
+                    workNotes: String(reportData.workNotes || ''),
+                    materialItems: Array.isArray(reportData.materialItems)
+                        ? reportData.materialItems
+                        : []
+                },
+                null,
+                2
+            )
+        );
+        // 👆 新增結束 👆
+
+        // 原有的目錄創建邏輯
+        await ensureProjectFolder(project.projectName);
 
         await ensureProjectFolder(project.projectName);
 
