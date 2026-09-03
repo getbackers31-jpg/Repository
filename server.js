@@ -144,7 +144,6 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
-// 建立子資料夾用的函式
 async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
@@ -329,7 +328,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
                 
-                // 🔍 除錯雷達：在 Render 後台印出 LINE 傳來的所有文字，幫你抓出空白或錯字
                 console.log(`[Webhook 收到訊息] 內容: "${text}", 來源類型: ${event.source.type}, targetId: ${targetId}`);
 
                 if (text.startsWith('設定案場')) {
@@ -411,7 +409,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
                     });
                 }
-                // 👇 全新的結案指令 👇
                 else if (text.startsWith('結案')) {
                     if (!targetId) {
                         await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「結案」指令。');
@@ -436,11 +433,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             return;
                         }
 
-                        // 從陣列中徹底刪除
                         projects.splice(projectIndex, 1);
                         await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
-                        // 同步解除相關群組綁定
                         await withBindingWriteLock(async () => {
                             const bindingConfig = await readBindingsFromOneDrive();
                             const bindings = Array.isArray(bindingConfig.bindings) ? bindingConfig.bindings : [];
@@ -512,9 +507,46 @@ app.post('/api/submit-report', async (req, res) => {
             });
         }
 
-        // ==========================================
-        // 👇 資料夾建立與 JSON 結構化落檔邏輯 👇
-        // ==========================================
+        const isNoWork = reportData.isNoWork === true;
+        let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
+
+        // 👇 新增：後端必須強制驗證廠商人數格式
+        if (!isNoWork) {
+            if (contractorItems.length === 0) {
+                return res.status(400).json({
+                    success: false, archived: false, pushed: false,
+                    reason: 'INVALID_CONTRACTOR_ITEMS',
+                    error: '請至少填寫一組有效施工廠商'
+                });
+            }
+            
+            for (const item of contractorItems) {
+                const contractorName = String(item.contractorName || '').trim();
+                const workerCount = Number(item.workerCount);
+                
+                if (!contractorName) {
+                    return res.status(400).json({
+                        success: false, archived: false, pushed: false,
+                        reason: 'INVALID_CONTRACTOR_NAME',
+                        error: '施工廠商名稱不可為空'
+                    });
+                }
+                
+                if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) {
+                    return res.status(400).json({
+                        success: false, archived: false, pushed: false,
+                        reason: 'INVALID_WORKER_COUNT',
+                        error: `施工廠商「${contractorName}」的人數格式不正確`
+                    });
+                }
+            }
+        } else {
+            contractorItems = [];
+        }
+
+        // 後端依據正確的數值重新加總
+        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
+
         await ensureProjectFolder(project.projectName);
         const safeProjectName = sanitizePathSegment(project.projectName);
         const graphClient = await getGraphClient();
@@ -530,17 +562,12 @@ app.post('/api/submit-report', async (req, res) => {
         const reportDate = dateStr; 
 
         const fullSubmissionId = String(reportData.submissionId || crypto.randomUUID()).trim();
-        const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8);
+        // 👇 新增：將長度從 8 擴展為 16 碼，杜絕碰撞機率
+        const safeSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '');
+        const shortSubmissionId = safeSubmissionId.slice(0, 16);
 
-        const isNoWork = reportData.isNoWork === true;
-        const contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
         const materialItems = Array.isArray(reportData.materialItems) ? reportData.materialItems : [];
-
-        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => {
-            const workerCount = Number(item.workerCount || 0);
-            return total + (Number.isFinite(workerCount) ? workerCount : 0);
-        }, 0);
 
         const structuredReport = {
             schemaVersion: 1,
@@ -558,7 +585,7 @@ app.post('/api/submit-report', async (req, res) => {
                 humidity: reportData.humidity,
                 wind: reportData.wind
             },
-            contractorItems: isNoWork ? [] : contractorItems,
+            contractorItems,
             totalWorkerCount: calculatedTotalWorkerCount,
             workItems: isNoWork ? [] : workItems,
             customWorkItem: isNoWork ? '' : String(reportData.customWorkItem || ''),
@@ -582,9 +609,6 @@ app.post('/api/submit-report', async (req, res) => {
             throw new Error('結構化日報寫入失敗');
         }
 
-        // ==========================================
-        // 👇 TXT 與 LINE 推播邏輯 👇
-        // ==========================================
         let reportText = `📋 施工日報\n\n日期：${reportDate.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
         reportText += `溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n`;
         reportText += `施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n`;
