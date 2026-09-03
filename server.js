@@ -144,6 +144,7 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
+// 建立子資料夾用的函式
 async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
@@ -320,25 +321,17 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     '【📝 日常填寫日報 3 步驟】',
                     '1️⃣ 首次開工請先輸入「設定案場 案場名稱」。',
                     '2️⃣ 將機器人回覆的專屬網址「設為群組置頂公告」。',
-                    '3️⃣ 以後只需點擊群組公告，即可自動鎖定案場填寫日報！',
-                    '',
-                    '【⚙️ 群組管理指令】(請於施工群組內輸入)',
-                    '🔹 設定案場 案場名稱',
-                    '👉 首次開工必填！將群組綁定案場，並自動於雲端建立專屬資料夾。(範例：設定案場 台塑大樓)',
-                    '',
-                    '🔹 查詢案場 或 案場查詢',
-                    '👉 查詢目前該群組是綁定在哪一個案場，避免日報發錯地方。',
-                    '',
-                    '🔹 解除案場',
-                    '👉 工程退場或不小心綁錯時使用，立刻解除群組與案場的綁定。',
-                    '',
-                    '💡 提示：指令與案場名稱之間，請務必空一格喔！'
+                    '3️⃣ 以後只需點擊群組公告，即可自動鎖定案場填寫日報！'
                 ].join('\n');
                 await replyLineMessage(event.replyToken, welcomeText);
                 continue;
             }
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
+                
+                // 🔍 除錯雷達：在 Render 後台印出 LINE 傳來的所有文字，幫你抓出空白或錯字
+                console.log(`[Webhook 收到訊息] 內容: "${text}", 來源類型: ${event.source.type}, targetId: ${targetId}`);
+
                 if (text.startsWith('設定案場')) {
                     if (!targetId) {
                         await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「設定案場」指令。');
@@ -356,18 +349,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         registration = await registerProjectByName(projectName);
                     } catch (error) {
                         console.error('建立案場失敗：', error);
-                        try {
-                            await replyLineMessage(
-                                event.replyToken,
-                                [
-                                    '⚠️ 無法建立案場',
-                                    '',
-                                    getProjectRegistrationErrorMessage(error)
-                                ].join('\n')
-                            );
-                        } catch (replyError) {
-                            console.error('回覆案場建立失敗訊息時發生錯誤：', replyError);
-                        }
+                        await replyLineMessage(event.replyToken, `⚠️ 無法建立案場\n\n${getProjectRegistrationErrorMessage(error)}`);
                         continue;
                     }
 
@@ -381,11 +363,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             projectId: project.projectId, projectName: project.projectName, groupId: targetId,
                             sourceType: event.source.type, active: true, boundAt: new Date().toISOString()
                         });
-                        await writeBindingsToOneDrive({
-                            ...config,
-                            bindings: filteredBindings,
-                            updatedAt: new Date().toISOString()
-                        });
+                        await writeBindingsToOneDrive({ ...config, bindings: filteredBindings, updatedAt: new Date().toISOString() });
                     });
 
                     const statusText = registration.created ? '已建立新案場及 OneDrive 資料夾' : '已使用現有案場';
@@ -401,19 +379,39 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             '請使用以下專屬連結填寫施工日報：',
                             reportUrl,
                             '',
-                            '此連結已綁定本案場，',
-                            '建議將這則訊息設為群組公告。',
-                            '之後從此連結開啟即可自動鎖定案場。'
+                            '此連結已綁定本案場，建議將這則訊息設為群組公告。'
                         ].join('\n')
                     );
                 }
                 else if (text === '查詢案場' || text === '案場查詢') {
-                    if (!targetId) continue;
+                    if (!targetId) {
+                        await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「查詢案場」指令。');
+                        continue;
+                    }
                     const config = await readBindingsFromOneDrive();
                     const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.groupId === targetId && b.active);
                     await replyLineMessage(event.replyToken, binding ? `📍 本群組目前設定案場\n\n${binding.projectName}` : '⚠️ 本群組尚未設定案場\n\n請輸入：\n設定案場 案場名稱');
                 }
-                // 👇 新增結案指令 👇
+                else if (text === '解除案場') {
+                    if (!targetId) {
+                        await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「解除案場」指令。');
+                        continue;
+                    }
+                    await withBindingWriteLock(async () => {
+                        const config = await readBindingsFromOneDrive();
+                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
+                        const filteredBindings = bindings.filter(b => b.groupId !== targetId);
+                        
+                        if (filteredBindings.length === bindings.length) {
+                            await replyLineMessage(event.replyToken, '本群組目前沒有設定任何案場。');
+                            return;
+                        }
+
+                        await writeBindingsToOneDrive({ ...config, bindings: filteredBindings, updatedAt: new Date().toISOString() });
+                        await replyLineMessage(event.replyToken, '✅ 已解除本群組的案場設定。');
+                    });
+                }
+                // 👇 全新的結案指令 👇
                 else if (text.startsWith('結案')) {
                     if (!targetId) {
                         await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「結案」指令。');
@@ -431,7 +429,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         const projects = Array.isArray(config.projects) ? config.projects : [];
                         const normalizedTarget = normalizeProjectName(targetProjectName);
 
-                        // 尋找目標案場在陣列中的位置
                         const projectIndex = projects.findIndex(p => normalizeProjectName(p.projectName) === normalizedTarget);
 
                         if (projectIndex === -1) {
@@ -439,27 +436,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             return;
                         }
 
-                        // 將案場從陣列中徹底刪除 (Hard Delete)
+                        // 從陣列中徹底刪除
                         projects.splice(projectIndex, 1);
+                        await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
-                        // 寫回 OneDrive
-                        await writeProjectsToOneDrive({
-                            ...config,
-                            projects,
-                            updatedAt: new Date().toISOString()
-                        });
-
-                        // 同步檢查並解除本群組的綁定
+                        // 同步解除相關群組綁定
                         await withBindingWriteLock(async () => {
                             const bindingConfig = await readBindingsFromOneDrive();
                             const bindings = Array.isArray(bindingConfig.bindings) ? bindingConfig.bindings : [];
                             const filteredBindings = bindings.filter(b => b.projectName !== targetProjectName);
-                            
-                            await writeBindingsToOneDrive({
-                                ...bindingConfig,
-                                bindings: filteredBindings,
-                                updatedAt: new Date().toISOString()
-                            });
+                            await writeBindingsToOneDrive({ ...bindingConfig, bindings: filteredBindings, updatedAt: new Date().toISOString() });
                         });
 
                         await replyLineMessage(
@@ -473,25 +459,14 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         );
                     });
                 }
-                // 👆 新增結案指令結束 👆
                 else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
                     const helpText = [
                         '📖 「云說工程小幫手」群組指令說明',
                         '',
-                        '請在施工專案群組中直接傳送以下指令：',
-                        '',
                         '🔹 設定案場 案場名稱',
-                        '👉 首次開工必用！將本群組與案場綁定，自動建立雲端資料夾並取得專屬填表網址。',
-                        '（範例：設定案場 台北雙星，中間請記得空一格）',
-                        '',
-                        '🔹 查詢案場 或 案場查詢',
-                        '👉 查詢目前群組綁定的案場名稱。',
-                        '',
+                        '🔹 查詢案場',
                         '🔹 解除案場',
-                        '👉 完工退場或綁錯案場時使用，立刻解除本群組的綁定。',
-                        '',
-                        '💡 日常填報提醒：',
-                        '綁定案場後，請將機器人回覆的「專屬網址」設為【群組置頂公告】，日常填寫日報直接點擊公告即可，不需要再輸入指令喔！'
+                        '🔹 結案 案場名稱 (徹底下架選單)'
                     ].join('\n');
                     await replyLineMessage(event.replyToken, helpText);
                 }
@@ -505,29 +480,11 @@ app.use(express.json());
 app.get('/api/projects/:projectId', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId);
-        
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                reason: 'PROJECT_NOT_FOUND',
-                error: '找不到指定案場'
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            project: {
-                projectId: project.projectId,
-                projectName: project.projectName
-            }
-        });
+        if (!project) return res.status(404).json({ success: false, reason: 'PROJECT_NOT_FOUND', error: '找不到指定案場' });
+        return res.status(200).json({ success: true, project: { projectId: project.projectId, projectName: project.projectName } });
     } catch (error) {
         console.error('讀取指定案場失敗：', error);
-        return res.status(500).json({
-            success: false,
-            reason: 'INTERNAL_ERROR',
-            error: '無法取得案場資料'
-        });
+        return res.status(500).json({ success: false, reason: 'INTERNAL_ERROR', error: '無法取得案場資料' });
     }
 });
 
@@ -541,7 +498,6 @@ app.post('/api/submit-report', async (req, res) => {
 
         const submittedProjectId = String(reportData.projectId || '').trim();
         let project;
-        
         if (submittedProjectId) {
             project = await findProjectById(submittedProjectId);
         } else {
@@ -550,9 +506,7 @@ app.post('/api/submit-report', async (req, res) => {
         
         if (!project) {
             return res.status(400).json({
-                success: false,
-                archived: false,
-                pushed: false,
+                success: false, archived: false, pushed: false,
                 reason: 'PROJECT_NOT_FOUND',
                 error: '找不到指定案場，請重新從施工群組的專屬連結開啟表單'
             });
@@ -573,7 +527,7 @@ app.post('/api/submit-report', async (req, res) => {
         const dataFolderPath = dataFolderResult.folderPath;
 
         const { dateStr, timeStr } = getTaiwanDateParts();
-        const reportDate = dateStr; // 後端強制押上台灣時間日期
+        const reportDate = dateStr; 
 
         const fullSubmissionId = String(reportData.submissionId || crypto.randomUUID()).trim();
         const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8);
@@ -583,7 +537,6 @@ app.post('/api/submit-report', async (req, res) => {
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
         const materialItems = Array.isArray(reportData.materialItems) ? reportData.materialItems : [];
 
-        // 後端重新計算總人數
         const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => {
             const workerCount = Number(item.workerCount || 0);
             return total + (Number.isFinite(workerCount) ? workerCount : 0);
@@ -620,18 +573,17 @@ app.post('/api/submit-report', async (req, res) => {
         const jsonFilePath = `${dataFolderPath}/${jsonFileName}`;
         const txtFilePath = `${textFolderPath}/${txtFileName}`;
 
-        // 1. 強制先寫入 JSON (若失敗則直接中斷拋錯)
         try {
             const jsonFileContent = Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8');
             await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(jsonFileContent);
             console.log(`[Success] 結構化 JSON 已寫入：${jsonFilePath}`);
         } catch (jsonUploadError) {
             console.error('[Error] 結構化 JSON 寫入失敗：', jsonUploadError);
-            throw new Error('結構化日報寫入失敗'); // 拋錯中斷，前端會保留草稿並恢復按鈕
+            throw new Error('結構化日報寫入失敗');
         }
 
         // ==========================================
-        // 👇 繼續處理原本的 TXT 與 LINE 推播邏輯 👇
+        // 👇 TXT 與 LINE 推播邏輯 👇
         // ==========================================
         let reportText = `📋 施工日報\n\n日期：${reportDate.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
         reportText += `溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n`;
