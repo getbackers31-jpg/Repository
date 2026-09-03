@@ -119,7 +119,6 @@ async function ensureProjectFolder(projectName) {
     const safeProjectName = sanitizePathSegment(projectName);
     if (!safeProjectName) throw new Error('案場資料夾名稱不可為空');
 
-    // 👉 修改 1：將路徑加上 2026_工程專案
     const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
 
     try {
@@ -132,7 +131,6 @@ async function ensureProjectFolder(projectName) {
     }
 
     try {
-        // 👉 修改 2：建立資料夾的目標父層也改為 工程專案管理/2026_工程專案
         const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({
             name: safeProjectName,
             folder: {},
@@ -492,41 +490,63 @@ app.post('/api/submit-report', async (req, res) => {
             });
         }
 
-        // 👇 本階段唯一新增的後端驗證 Log 👇
-        console.log(
-            '[Structured Report]',
-            JSON.stringify(
-                {
-                    projectId: project.projectId,
-                    projectName: project.projectName,
-                    isNoWork: reportData.isNoWork === true,
-                    noWorkReason: String(reportData.noWorkReason || ''),
-                    contractorItems: Array.isArray(reportData.contractorItems)
-                        ? reportData.contractorItems
-                        : [],
-                    totalWorkerCount: Number(reportData.totalWorkerCount || 0),
-                    workItems: Array.isArray(reportData.workItems)
-                        ? reportData.workItems
-                        : [],
-                    customWorkItem: String(reportData.customWorkItem || ''),
-                    workNotes: String(reportData.workNotes || ''),
-                    materialItems: Array.isArray(reportData.materialItems)
-                        ? reportData.materialItems
-                        : []
-                },
-                null,
-                2
-            )
-        );
-        // 👆 新增結束 👆
-
-        // 原有的目錄創建邏輯
+        // 確保目錄存在 (只有這裡呼叫一次，刪除了原本重複的行)
         await ensureProjectFolder(project.projectName);
+        const safeProjectName = sanitizePathSegment(project.projectName);
 
+        // 取得 GraphClient 與台灣時間，供給 JSON 與 TXT 共用
         const graphClient = await getGraphClient();
         const { dateStr, timeStr } = getTaiwanDateParts();
-        // 👉 修改 3：日報上傳的路徑加上 2026_工程專案
-        const targetFolderPath = `工程專案管理/2026_工程專案/${sanitizePathSegment(project.projectName)}`;
+
+        // ==========================================
+        // 👇 開始處理結構化 JSON 落檔 👇
+        // ==========================================
+        const reportDate = reportData.reportDate || dateStr;
+        const submittedAt = new Date().toISOString(); 
+        
+        const fullSubmissionId = reportData.submissionId || Date.now().toString(36);
+        const shortSubId = fullSubmissionId.substring(0, 8);
+        
+        const structuredReport = {
+            projectId: project.projectId,
+            projectName: project.projectName,
+            reportDate: reportDate,
+            submissionId: fullSubmissionId,
+            submittedAt: submittedAt,
+            isNoWork: reportData.isNoWork === true,
+            noWorkReason: String(reportData.noWorkReason || ''),
+            weather: {
+                temp: reportData.temp,
+                humidity: reportData.humidity,
+                wind: reportData.wind
+            },
+            contractorItems: Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [],
+            totalWorkerCount: Number(reportData.totalWorkerCount || 0),
+            workItems: Array.isArray(reportData.workItems) ? reportData.workItems : [],
+            customWorkItem: String(reportData.customWorkItem || ''),
+            workNotes: String(reportData.workNotes || ''),
+            materialItems: Array.isArray(reportData.materialItems) ? reportData.materialItems : [],
+            remarks: String(reportData.remarks || '')
+        };
+
+        const [year, month] = reportDate.split('-');
+        const jsonFileName = `${reportDate}_${timeStr}_${shortSubId}_結構化日報.json`;
+        const jsonFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/日報資料/${year}/${month}/${jsonFileName}`;
+
+        try {
+            const jsonFileContent = Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8');
+            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(jsonFileContent);
+            console.log(`[Success] 結構化 JSON 已寫入: ${jsonFilePath}`);
+        } catch (jsonUploadError) {
+            console.error('[Error] 結構化 JSON 寫入 OneDrive 失敗:', jsonUploadError);
+        }
+        // ==========================================
+        // 👆 結束處理結構化 JSON 落檔 👆
+        // ==========================================
+
+
+        // 👇 繼續處理原本的 TXT 文字檔落檔 👇
+        const targetFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         const fileName = `${dateStr}_${timeStr}_施工日報.txt`;
 
         let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n\n`;
