@@ -24,32 +24,31 @@ const msalConfig = {
 };
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
+// ⚡ 效能大補丸 1：Token 與 Graph Client 實例快取
+let cachedGraphClient = null;
+let tokenExpiresAt = null;
 async function getGraphClient() {
-    const tokenRequest = { scopes: ['https://graph.microsoft.com/.default'] };
-    try {
-        const response = await cca.acquireTokenByClientCredential(tokenRequest);
-        return Client.init({ authProvider: (done) => { done(null, response.accessToken); } });
-    } catch (error) { throw error; }
+    if (!cachedGraphClient || Date.now() >= tokenExpiresAt) {
+        const tokenRequest = { scopes: ['https://graph.microsoft.com/.default'] };
+        try {
+            const response = await cca.acquireTokenByClientCredential(tokenRequest);
+            // 提早 5 分鐘過期，確保 Token 安全
+            tokenExpiresAt = response.expiresOn ? response.expiresOn.getTime() - 5 * 60000 : Date.now() + 50 * 60000;
+            cachedGraphClient = Client.init({ authProvider: (done) => { done(null, response.accessToken); } });
+        } catch (error) { throw error; }
+    }
+    return cachedGraphClient;
 }
 
-function sanitizePathSegment(value) {
-    return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim();
-}
-
-function normalizeProjectName(value) {
-    return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-}
-
+function sanitizePathSegment(value) { return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); }
+function normalizeProjectName(value) { return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim(); }
 function validateProjectName(projectName) {
     const normalizedName = normalizeProjectName(projectName);
     if (!normalizedName) throw new Error('案場名稱不可為空');
     if (normalizedName.length > 80) throw new Error('案場名稱不可超過 80 個字');
-    if (/[<>:"/\\|?*#%]/.test(normalizedName)) {
-        throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
-    }
+    if (/[<>:"/\\|?*#%]/.test(normalizedName)) throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
     return normalizedName;
 }
-
 function getProjectRegistrationErrorMessage(error) {
     const safeMessages = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
     const message = String(error?.message || '');
@@ -77,7 +76,6 @@ async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = fal
         const meta = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}`).get();
         const downloadUrl = meta['@microsoft.graph.downloadUrl'];
         if (!downloadUrl) throw new Error('Graph 未回傳檔案下載網址');
-        
         const response = await fetch(downloadUrl);
         if (!response.ok) throw new Error(`下載設定檔失敗 ${response.status}`);
         return await response.json();
@@ -93,34 +91,48 @@ async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = fal
 
 async function writeJsonToOneDrive(filePath, data) {
     const graphClient = await getGraphClient();
-    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`)
-        .put(JSON.stringify(data, null, 2));
+    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
 }
 
-async function readProjectsFromOneDrive() { return await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true); }
-async function writeProjectsToOneDrive(config) { await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config); }
-async function readBindingsFromOneDrive() { return await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] }); }
-async function writeBindingsToOneDrive(config) { await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config); }
+// ⚡ 效能大補丸 2-1：OneDrive 讀取記憶體快取 (60秒 TTL)
+const CACHE_TTL = 60 * 1000;
+const configCache = { projects: { data: null, timestamp: 0 }, bindings: { data: null, timestamp: 0 } };
+
+async function readProjectsFromOneDrive() {
+    if (configCache.projects.data && Date.now() - configCache.projects.timestamp < CACHE_TTL) return configCache.projects.data;
+    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
+    configCache.projects = { data, timestamp: Date.now() };
+    return data;
+}
+async function writeProjectsToOneDrive(config) {
+    await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
+    configCache.projects = { data: config, timestamp: Date.now() };
+}
+async function readBindingsFromOneDrive() {
+    if (configCache.bindings.data && Date.now() - configCache.bindings.timestamp < CACHE_TTL) return configCache.bindings.data;
+    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
+    configCache.bindings = { data, timestamp: Date.now() };
+    return data;
+}
+async function writeBindingsToOneDrive(config) {
+    await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
+    configCache.bindings = { data: config, timestamp: Date.now() };
+}
 
 async function ensureProjectFolder(projectName) {
     const graphClient = await getGraphClient();
     const safeProjectName = sanitizePathSegment(projectName);
     if (!safeProjectName) throw new Error('案場資料夾名稱不可為空');
     const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-
     try {
         const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
         if (!item.folder) throw new Error(`同名項目不是資料夾：${safeProjectName}`);
         return { created: false, folderId: item.id, folderPath };
     } catch (error) {
-        const statusCode = error?.statusCode || error?.status || error?.code;
-        if (statusCode !== 404 && statusCode !== 'itemNotFound') throw error;
+        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
     }
-
     try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({
-            name: safeProjectName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail'
-        });
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({ name: safeProjectName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
         return { created: true, folderId: createdFolder.id, folderPath };
     } catch (error) {
         const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
@@ -133,20 +145,15 @@ async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
     const childPath = `${parentPath}/${safeChildName}`;
-
     try {
         const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
         if (!existingItem.folder) throw new Error(`同名項目不是資料夾：${childPath}`);
         return { created: false, folderId: existingItem.id, folderPath: childPath };
     } catch (error) {
-        const statusCode = error?.statusCode || error?.status || error?.code;
-        if (statusCode !== 404 && statusCode !== 'itemNotFound') throw error;
+        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
     }
-
     try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({
-            name: safeChildName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail'
-        });
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({ name: safeChildName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
         return { created: true, folderId: createdFolder.id, folderPath: childPath };
     } catch (createError) {
         const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
@@ -270,17 +277,26 @@ async function generateProjectStats(project) {
     const reports = [];
     const invalidFiles = [];
     
-    for (const file of allItems) {
-        try {
-            const downloadUrl = file['@microsoft.graph.downloadUrl'];
-            if (!downloadUrl) throw new Error('缺少下載網址');
-            const response = await fetch(downloadUrl);
-            if (!response.ok) throw new Error(`下載失敗 HTTP ${response.status}`);
-            reports.push(await response.json());
-        } catch (error) {
-            console.error(`統計資料讀取失敗：${file.name}`, error);
-            invalidFiles.push({ fileName: file.name, error: String(error.message || '未知錯誤') });
-        }
+    // ⚡ 效能大補丸 3：分批平行下載 JSON (解決 N+1 與防範 429 請求過多)
+    const CHUNK_SIZE = 20;
+    for (let i = 0; i < allItems.length; i += CHUNK_SIZE) {
+        const chunk = allItems.slice(i, i + CHUNK_SIZE);
+        const chunkPromises = chunk.map(async (file) => {
+            try {
+                const downloadUrl = file['@microsoft.graph.downloadUrl'];
+                if (!downloadUrl) throw new Error('缺少下載網址');
+                const response = await fetch(downloadUrl);
+                if (!response.ok) throw new Error(`下載失敗 HTTP ${response.status}`);
+                return await response.json();
+            } catch (error) {
+                console.error(`統計資料讀取失敗：${file.name}`, error);
+                invalidFiles.push({ fileName: file.name, error: String(error.message || '未知錯誤') });
+                return null;
+            }
+        });
+
+        const chunkResults = await Promise.all(chunkPromises);
+        reports.push(...chunkResults.filter(r => r !== null));
     }
 
     const latestReportsMap = new Map();
@@ -418,6 +434,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     try { body = JSON.parse(req.body.toString('utf8')); } 
     catch (error) { return res.status(400).send('Invalid JSON'); }
     
+    // LINE Webhook 逾時解耦：先回覆 OK，再慢慢算
     res.status(200).send('OK');
 
     for (const event of body.events || []) {
@@ -535,12 +552,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         msg += `* 資料計算至最新一份日報`;
 
                         if (result.dataQuality) {
-                            if (result.dataQuality.invalidFileCount > 0) {
-                                msg += `\n⚠️ 注意：發現 ${result.dataQuality.invalidFileCount} 份資料異常，統計可能不完整`;
-                            }
-                            if (result.dataQuality.supersededReportCount > 0) {
-                                msg += `\n* 同日舊版已排除：${result.dataQuality.supersededReportCount} 份`;
-                            }
+                            if (result.dataQuality.invalidFileCount > 0) msg += `\n⚠️ 注意：發現 ${result.dataQuality.invalidFileCount} 份資料異常，統計可能不完整`;
+                            if (result.dataQuality.supersededReportCount > 0) msg += `\n* 同日舊版已排除：${result.dataQuality.supersededReportCount} 份`;
                         }
 
                         await replyLineMessage(event.replyToken, msg);
@@ -703,13 +716,16 @@ app.post('/api/submit-report', async (req, res) => {
 
         const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
 
-        await ensureProjectFolder(project.projectName);
         const safeProjectName = sanitizePathSegment(project.projectName);
         const graphClient = await getGraphClient();
-        
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-        const textFolderResult = await ensureChildFolder(graphClient, projectFolderPath, '施工日報');
-        const dataFolderResult = await ensureChildFolder(graphClient, projectFolderPath, '結構化資料');
+
+        // ⚡ 效能大補丸 2-2：同時建立兩個資料夾 (Promise.all 平行處理)
+        await ensureProjectFolder(project.projectName);
+        const [textFolderResult, dataFolderResult] = await Promise.all([
+            ensureChildFolder(graphClient, projectFolderPath, '施工日報'),
+            ensureChildFolder(graphClient, projectFolderPath, '結構化資料')
+        ]);
 
         const { dateStr, timeStr } = getTaiwanDateParts();
         
