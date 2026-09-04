@@ -251,7 +251,7 @@ async function generateProjectStats(project) {
     const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
     const graphClient = await getGraphClient();
 
-    let requestUrl = `/users/${TARGET_USER_EMAIL}/drive/root:/${dataFolderPath}:/children?$select=id,name,@microsoft.graph.downloadUrl`;
+    let requestUrl = `/users/${TARGET_USER_EMAIL}/drive/root:/${dataFolderPath}:/children`;
     const allItems = [];
     
     try {
