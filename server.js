@@ -1,1019 +1,986 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const msal = require('@azure/msal-node');
-const { Client } = require('@microsoft/microsoft-graph-client');
-require('isomorphic-fetch');
-const ExcelJS = require('exceljs');
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>云說工程 - 施工日報表</title>
+  <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    body { font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; background:#f4f7f6; padding:15px; color:#333; margin:0; }
+    .container { background:white; padding:20px; border-radius:10px; box-shadow:0 4px 8px rgba(0,0,0,.1); max-width:500px; margin:auto; }
+    h2 { text-align:center; color:#00B900; margin-top:0; font-size:22px; }
+    label { font-weight:bold; display:block; margin-top:15px; margin-bottom:5px; color:#444; }
+    select, textarea, input[type="text"], input[type="number"] { width:100%; padding:10px; border:1px solid #ccc; border-radius:5px; box-sizing:border-box; font-size:16px; background:#fafafa; margin-bottom:5px; }
+    .flex-row { display:flex; gap:10px; margin-bottom:5px; }
+    .flex-row > * { flex:1; min-width:0; }
+    .btn-weather { background:#17a2b8; color:white; border:0; padding:9px; border-radius:5px; cursor:pointer; font-size:14px; width:100%; margin-bottom:10px; }
+    .btn-weather:disabled, .btn-add:disabled, .submit-btn:disabled { background:#ccc; cursor:not-allowed; }
+    .checkbox-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; background:#f9f9f9; padding:10px; border-radius:5px; border:1px solid #eee; }
+    .checkbox-label { display:flex; align-items:center; font-weight:normal; margin:0; font-size:15px; }
+    .checkbox-label input { margin-right:8px; transform:scale(1.2); }
+    .material-group { background:#f9f9f9; padding:10px; border-radius:5px; border:1px solid #eee; margin-bottom:10px; }
+    .material-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:5px; }
+    .material-title { font-size:14px; font-weight:bold; color:#666; }
+    .remove-material-button { color:#d9534f; border:0; background:none; font-weight:bold; cursor:pointer; }
+    .btn-add { background:#6c757d; color:white; border:0; padding:9px; border-radius:5px; cursor:pointer; font-size:14px; width:100%; margin-bottom:10px; }
+    .submit-btn { width:100%; background:#00B900; color:white; border:0; padding:12px; font-size:18px; border-radius:5px; margin-top:20px; cursor:pointer; font-weight:bold; }
+    .section-divider { border-bottom:2px dashed #ddd; margin:20px 0; }
+    .hidden { display:none !important; }
+    .no-material-option { display:flex; align-items:center; font-weight:bold; color:#d9534f; margin-bottom:15px; background:#fdf5f5; padding:10px; border-radius:5px; border:1px solid #f5c6c6; }
+    .no-material-option input { width:auto; margin-right:10px; transform:scale(1.3); }
+    .field-help { margin-top: 4px; color: #777; font-size: 13px; line-height: 1.5; }
+    .readonly-input { background-color: #e9ecef; color: #495057; cursor: not-allowed; }
+    @media (max-width:380px) { .checkbox-grid { grid-template-columns:1fr; } .flex-row { flex-direction:column; gap:4px; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>👷 施工日報表</h2>
+    <form id="dailyReportForm">
+      
+      <!-- 💡 新增：填表人欄位 -->
+      <label for="reporterName">👤 填表人姓名</label>
+      <input type="text" id="reporterName" placeholder="請輸入您的姓名 (將自動記憶)" oninput="saveDraft()" required>
 
-const app = express();
-app.use(cors());
+      <div id="lockedProjectSection" class="hidden">
+        <label for="lockedProjectName">📍 案場名稱</label>
+        <input type="text" id="lockedProjectName" class="readonly-input" readonly>
+        <div class="field-help" style="color: #666; font-size: 0.9em; margin-top: 4px;">
+          🔒 此連結已綁定以下案場，案場名稱不可修改
+        </div>
+      </div>
 
-const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
-const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
-const STATS_API_KEY = process.env.STATS_API_KEY;
+      <div id="compatibleProjectSection">
+        <label for="projectName">📍 案場名稱</label>
+        <select id="projectName" onchange="saveDraft()" required disabled>
+          <option value="" disabled selected>正在載入案場清單...</option>
+        </select>
+        <div class="field-help" style="color: #666; font-size: 0.9em; margin-top: 4px;">
+          新案場請先在施工群組輸入「設定案場 案場名稱」
+        </div>
+      </div>
 
-const msalConfig = {
-    auth: {
-        clientId: process.env.AZURE_CLIENT_ID,
-        authority: `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}`,
-        clientSecret: process.env.AZURE_CLIENT_SECRET
+      <input type="hidden" id="projectId" value="">
+
+      <!-- 今日無出工選項 -->
+      <label class="no-material-option" style="margin-top:15px; background:#fff3f3; border-color:#ffcccc; color:#cc0000;">
+        <input type="checkbox" id="noWorkToday" onchange="handleNoWorkChange(); saveDraft()">今日無出工 (停工/休息)
+      </label>
+
+      <!-- 無出工原因 -->
+      <div id="noWorkReasonSection" class="hidden">
+        <select id="noWorkReason" onchange="saveDraft()" style="border-color:#ffcccc; background:#fffcfc;">
+          <option value="" disabled selected>請選擇無出工原因</option>
+          <option value="天候因素 (下雨/颱風等)">天候因素 (下雨/颱風等)</option>
+          <option value="例假日休息">例假日休息</option>
+          <option value="現場無施工安排">現場無施工安排</option>
+          <option value="停工/待料">停工/待料</option>
+          <option value="其他">其他 (請於最下方備註說明)</option>
+        </select>
+        <div class="section-divider"></div>
+      </div>
+
+      <div id="contractorSection">
+        <label>🤝 施工廠商與人數</label>
+        <div id="contractorsContainer"></div>
+        <button type="button" class="btn-add" onclick="addContractorRow()" style="background:#5bc0de;">➕ 新增一組廠商</button>
+        <button type="button" class="btn-add" onclick="resetContractorsCache()" style="background:#d9534f; margin-top:5px;">🗑️ 清除所有自訂廠商紀錄</button>
+        <div class="section-divider"></div>
+      </div>
+
+      <label>🌤️ 氣象資訊</label>
+      <button type="button" class="btn-weather" onclick="getWeather()">一鍵獲取當地天氣</button>
+      <div class="flex-row">
+        <input type="number" id="temp" placeholder="溫度(度)" step="0.1" oninput="saveDraft()">
+        <input type="number" id="humidity" placeholder="濕度(%)" min="0" max="100" step="1" oninput="saveDraft()">
+        <input type="number" id="wind" placeholder="風速(m/s)" min="0" step="0.1" oninput="saveDraft()">
+      </div>
+      <div class="section-divider"></div>
+
+      <div id="workAndMaterialSection">
+        <label>🛠️ 今日作業</label>
+        <div class="checkbox-grid" id="workItemsGrid"></div>
+        <input type="text" id="customWorkItem" class="hidden" placeholder="請輸入其他作業項目" maxlength="100" oninput="saveDraft()" style="margin-top:10px">
+        <textarea id="workNotes" rows="2" placeholder="作業補充（選填）" oninput="saveDraft()" style="margin-top:10px"></textarea>
+        <div class="section-divider"></div>
+
+        <label>📦 今日用料</label>
+        <label class="no-material-option">
+          <input type="checkbox" id="noMaterial" onchange="handleNoMaterialChange(); saveDraft()">今日無用料
+        </label>
+        <div id="materialsContainer"></div>
+        <button type="button" id="addMaterialButton" class="btn-add" onclick="addMaterialRow()">新增一項用料</button>
+
+        <div class="section-divider"></div>
+      </div>
+
+      <label for="remarks">📝 備註（選填）</label>
+      <textarea id="remarks" rows="2" placeholder="天候影響、材料短缺、人員異動等狀況" oninput="saveDraft()"></textarea>
+
+      <button type="button" id="submitButton" class="submit-btn" onclick="submitForm()">確認送出並發布至群組</button>
+    </form>
+  </div>
+
+  <script>
+    const LIFF_ID = '2011289657-vQgMb0eI';
+    const API_URL = 'https://gong-cheng-linechuan-jie.onrender.com/api/submit-report';
+    const PROJECTS_API_URL = 'https://gong-cheng-linechuan-jie.onrender.com/api/projects';
+    const MATERIALS_API_URL = 'https://gong-cheng-linechuan-jie.onrender.com/api/materials';
+    
+    const MAX_MATERIAL_ROWS = 10;
+    const MAX_CONTRACTOR_ROWS = 10;
+    const CONTRACTORS_KEY = 'savedContractors';
+
+    const workItemsList = [
+      '材料進場', '現場放樣', '鷹架搭設', '鷹架拆除', '水刀除鏽',
+      '手動工具除鏽', '底漆施工', '中塗漆施工', '面漆施工', '底漆修補',
+      '中塗漆修補', '面漆修補', '底漆膜厚檢測', '中塗漆膜厚檢測',
+      '面漆膜厚檢測', '缺失改善', '現場清潔', '等待驗收', '完成驗收', '其他'
+    ];
+
+    let MATERIAL_OPTIONS = [];
+
+    const UNIT_OPTIONS = [
+      '桶 (1加侖)', '桶 (5加侖)', '桶', '組', '支', '公斤', '公升', '個', '捲'
+    ];
+
+    let isSubmitting = false;
+    let isRestoringDraft = false;
+    let reportArchived = false;
+    let projectMode = 'LOADING';
+    let currentSubmissionId = '';
+
+    function createSubmissionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
     }
-};
-const cca = new msal.ConfidentialClientApplication(msalConfig);
 
-let cachedGraphClient = null;
-let tokenExpiresAt = 0;
-let graphClientPromise = null;
+    function ensureSubmissionId() {
+      if (!currentSubmissionId) {
+        currentSubmissionId = createSubmissionId();
+      }
+      return currentSubmissionId;
+    }
 
-async function getGraphClient() {
-    const now = Date.now();
-    if (cachedGraphClient && now < tokenExpiresAt) return cachedGraphClient;
-    if (graphClientPromise) return graphClientPromise;
+    function getSelectedProjectName() {
+      if (projectMode === 'LOCKED') {
+        return document.getElementById('lockedProjectName').value.trim();
+      }
+      return document.getElementById('projectName').value.trim();
+    }
 
-    graphClientPromise = (async () => {
+    function getDraftKey() {
+      const projectId = document.getElementById('projectId').value.trim();
+      if (projectId) return `dailyReportDraft:${projectId}`;
+      return 'dailyReportDraft';
+    }
+
+    function getProjectIdFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      return String(params.get('projectId') || '').trim();
+    }
+
+    async function fetchMaterials(projectId = '') {
+      try {
+        const url = projectId ? `${MATERIALS_API_URL}?projectId=${projectId}` : MATERIALS_API_URL;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.success && Array.isArray(data.materials) && data.materials.length > 0) {
+            MATERIAL_OPTIONS = data.materials;
+        } else {
+            MATERIAL_OPTIONS = ['立邦9011', '虹牌MIO', '虹牌優利面UP-04', '矽利康'];
+        }
+      } catch (err) {
+        console.warn('材料清單讀取失敗，使用預設值', err);
+        MATERIAL_OPTIONS = ['立邦9011', '虹牌MIO', '虹牌優利面UP-04', '矽利康'];
+      }
+    }
+
+    window.addEventListener('load', async () => {
+      initializeStaticForm();
+
+      try {
+        await liff.init({ liffId: LIFF_ID });
+      } catch (error) {
+        console.error('LIFF 初始化失敗：', error);
+      }
+
+      const projectIdFromUrl = getProjectIdFromUrl();
+
+      try {
+        if (projectIdFromUrl) {
+          await loadLockedProject(projectIdFromUrl);
+          await fetchMaterials(projectIdFromUrl);
+        } else {
+          await loadProjects();
+          await fetchMaterials('');
+        }
+        loadDraft();
+      } catch (error) {
+        console.error('案場初始化失敗：', error);
+        projectMode = 'ERROR';
+        document.getElementById('submitButton').disabled = true;
+        alert('案場載入失敗，請重新從施工群組開啟表單');
+      }
+    });
+
+    async function loadLockedProject(projectId) {
+      const response = await fetch(`${PROJECTS_API_URL}/${encodeURIComponent(projectId)}`);
+      const responseText = await response.text();
+      let result;
+      try { result = responseText ? JSON.parse(responseText) : {}; } catch { throw new Error(`HTTP ${response.status}`); }
+      if (!response.ok || result.success !== true || !result.project) throw new Error(result.error || '找不到指定案場');
+
+      document.getElementById('projectId').value = result.project.projectId;
+      document.getElementById('lockedProjectName').value = result.project.projectName;
+      document.getElementById('compatibleProjectSection').classList.add('hidden');
+      document.getElementById('lockedProjectSection').classList.remove('hidden');
+      projectMode = 'LOCKED';
+    }
+
+    async function loadProjects() {
+      const projectSelect = document.getElementById('projectName');
+      const response = await fetch(PROJECTS_API_URL);
+      const responseText = await response.text();
+      let result;
+      try { result = responseText ? JSON.parse(responseText) : {}; } catch { throw new Error(`HTTP ${response.status}`); }
+      if (!response.ok || result.success !== true || !Array.isArray(result.projects)) throw new Error(result.error || '無法取得案場清單');
+
+      if (result.projects.length === 0) {
+        projectSelect.innerHTML = '';
+        const emptyOption = new Option('目前沒有可用案場', '');
+        emptyOption.disabled = true;
+        emptyOption.selected = true;
+        projectSelect.add(emptyOption);
+        projectSelect.disabled = true;
+        projectMode = 'ERROR';
+        throw new Error('目前沒有可用案場');
+      }
+
+      projectSelect.innerHTML = '';
+      const placeholder = new Option('請選擇正式案場', '');
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      projectSelect.add(placeholder);
+
+      result.projects.forEach(project => projectSelect.add(new Option(project.projectName, project.projectName)));
+      projectSelect.disabled = false;
+      projectMode = 'COMPATIBLE';
+    }
+
+    function safeReadArray(key) {
+      try {
+        const value = JSON.parse(localStorage.getItem(key) || '[]');
+        return Array.isArray(value) ? value : [];
+      } catch { return []; }
+    }
+
+    function getSavedContractorsList() {
+      let savedStr = localStorage.getItem(CONTRACTORS_KEY);
+      if (!savedStr) {
+        const defaultList = ['容煜', '詮達'];
+        localStorage.setItem(CONTRACTORS_KEY, JSON.stringify(defaultList));
+        return defaultList;
+      }
+      return safeReadArray(CONTRACTORS_KEY);
+    }
+
+    function resetContractorsCache() {
+      if (confirm('確定要清除所有自行輸入的廠商名稱紀錄嗎？(容煜、詮達等預設廠商將保留)')) {
+        localStorage.removeItem(CONTRACTORS_KEY);
+        document.querySelectorAll('.contractor-name').forEach(select => {
+            const currentVal = select.value;
+            select.innerHTML = '';
+            select.add(new Option('請選擇廠商', ''));
+            select.options[0].disabled = true;
+            getSavedContractorsList().forEach(c => select.add(new Option(c, c)));
+            select.add(new Option('其他 (自行輸入)', '其他'));
+            const exists = [...select.options].some(opt => opt.value === currentVal);
+            select.value = exists ? currentVal : (currentVal ? '其他' : '');
+            toggleCustomContractorRow(select);
+        });
+        saveDraft();
+        alert('已清除自訂廠商紀錄！');
+      }
+    }
+
+    function initializeStaticForm() {
+      const grid = document.getElementById('workItemsGrid');
+      workItemsList.forEach(item => {
+        const label = document.createElement('label');
+        label.className = 'checkbox-label';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = 'workItem';
+        checkbox.value = item;
+        checkbox.addEventListener('change', handleWorkItemChange);
+        label.append(checkbox, document.createTextNode(` ${item}`));
+        grid.appendChild(label);
+      });
+    }
+
+    function handleWorkItemChange() {
+      if (isRestoringDraft) return;
+      const otherChecked = [...document.querySelectorAll('input[name="workItem"]:checked')].some(cb => cb.value === '其他');
+      const input = document.getElementById('customWorkItem');
+      input.classList.toggle('hidden', !otherChecked);
+      if (!otherChecked) input.value = '';
+      saveDraft();
+    }
+
+    function handleNoWorkChange() {
+      const isNoWork = document.getElementById('noWorkToday').checked;
+      document.getElementById('noWorkReasonSection').classList.toggle('hidden', !isNoWork);
+      document.getElementById('contractorSection').classList.toggle('hidden', isNoWork);
+      document.getElementById('workAndMaterialSection').classList.toggle('hidden', isNoWork);
+    }
+
+    function handleNoMaterialChange() {
+      const noMaterial = document.getElementById('noMaterial').checked;
+      const container = document.getElementById('materialsContainer');
+      const addButton = document.getElementById('addMaterialButton');
+      container.style.display = noMaterial ? 'none' : 'block';
+      addButton.style.display = noMaterial ? 'none' : 'block';
+      if (!noMaterial && container.children.length === 0) addMaterialRow();
+    }
+
+    function appendOption(select, value, text = value) { select.add(new Option(text, value)); }
+
+    function addContractorRow(name = '', customName = '', workers = '') {
+      const container = document.getElementById('contractorsContainer');
+      if (container.children.length >= MAX_CONTRACTOR_ROWS) {
+        alert(`最多可填寫 ${MAX_CONTRACTOR_ROWS} 組廠商`); return;
+      }
+
+      const div = document.createElement('div');
+      div.className = 'contractor-group material-group';
+
+      const header = document.createElement('div');
+      header.className = 'material-header';
+      const title = document.createElement('div');
+      title.className = 'material-title';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove-material-button';
+      removeBtn.textContent = '移除';
+      removeBtn.onclick = () => { div.remove(); refreshContractorTitles(); saveDraft(); };
+      header.append(title, removeBtn);
+
+      const row = document.createElement('div');
+      row.className = 'flex-row';
+
+      const nameSelect = document.createElement('select');
+      nameSelect.className = 'contractor-name';
+      nameSelect.add(new Option('請選擇廠商', ''));
+      nameSelect.options[0].disabled = true;
+      getSavedContractorsList().forEach(c => nameSelect.add(new Option(c, c)));
+      nameSelect.add(new Option('其他 (自行輸入)', '其他'));
+
+      const workerInput = document.createElement('input');
+      workerInput.type = 'number';
+      workerInput.className = 'contractor-workers';
+      workerInput.placeholder = '施工人數';
+      workerInput.min = '1';
+      workerInput.step = '1';            
+      workerInput.inputMode = 'numeric'; 
+      workerInput.style.maxWidth = '100px';
+
+      row.append(nameSelect, workerInput);
+
+      const customInput = document.createElement('input');
+      customInput.type = 'text';
+      customInput.className = 'custom-contractor-name hidden';
+      customInput.placeholder = '請輸入新廠商名稱';
+      customInput.maxLength = 50;
+      customInput.style.marginTop = '5px';
+
+      div.append(header, row, customInput);
+
+      nameSelect.onchange = () => { toggleCustomContractorRow(nameSelect); saveDraft(); };
+      customInput.oninput = saveDraft;
+      workerInput.oninput = saveDraft;
+
+      const isCustomVal = name === '其他' || (name && !getSavedContractorsList().includes(name));
+      nameSelect.value = isCustomVal ? '其他' : name;
+      if (isCustomVal) {
+         customInput.value = name === '其他' ? customName : name;
+         customInput.classList.remove('hidden');
+      }
+      if (workers !== '') workerInput.value = workers;
+
+      container.appendChild(div);
+      refreshContractorTitles();
+      if (!isRestoringDraft) saveDraft();
+    }
+
+    function refreshContractorTitles() {
+      const groups = document.querySelectorAll('.contractor-group');
+      groups.forEach((group, index) => group.querySelector('.material-title').textContent = `施工廠商 ${index + 1}`);
+    }
+
+    function toggleCustomContractorRow(select) {
+      const input = select.closest('.contractor-group').querySelector('.custom-contractor-name');
+      const isCustom = select.value === '其他';
+      input.classList.toggle('hidden', !isCustom);
+      if (isCustom) input.focus(); else input.value = '';
+    }
+
+    function saveNewContractorsFromForm() {
+       const groups = document.querySelectorAll('.contractor-group');
+       let savedList = getSavedContractorsList();
+       let updated = false;
+       groups.forEach(group => {
+          const selectVal = group.querySelector('.contractor-name').value;
+          if (selectVal === '其他') {
+             const custom = group.querySelector('.custom-contractor-name').value.trim();
+             if (custom && !savedList.includes(custom)) {
+                savedList.push(custom);
+                updated = true;
+             }
+          }
+       });
+       if (updated) localStorage.setItem(CONTRACTORS_KEY, JSON.stringify(savedList));
+    }
+
+    function addMaterialRow(name = '', customName = '', qty = '', unit = '') {
+      const container = document.getElementById('materialsContainer');
+      if (container.children.length >= MAX_MATERIAL_ROWS) {
+        alert(`最多可填寫 ${MAX_MATERIAL_ROWS} 筆用料`); return;
+      }
+      const div = document.createElement('div');
+      div.className = 'material-group';
+
+      const header = document.createElement('div');
+      header.className = 'material-header';
+      const title = document.createElement('div');
+      title.className = 'material-title';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove-material-button';
+      removeBtn.textContent = '移除';
+      removeBtn.onclick = () => { div.remove(); refreshMaterialTitles(); saveDraft(); };
+      header.append(title, removeBtn);
+
+      const nameSelect = document.createElement('select');
+      nameSelect.className = 'mat-name';
+      appendOption(nameSelect, '', '請選擇品項');
+      nameSelect.options[0].disabled = true;
+      MATERIAL_OPTIONS.forEach(option => appendOption(nameSelect, option));
+      appendOption(nameSelect, '其他');
+
+      const customInput = document.createElement('input');
+      customInput.type = 'text';
+      customInput.className = 'custom-mat-name hidden';
+      customInput.placeholder = '請輸入材料名稱';
+      customInput.maxLength = 50;
+
+      const row = document.createElement('div');
+      row.className = 'flex-row';
+      const qtyInput = document.createElement('input');
+      qtyInput.type = 'number';
+      qtyInput.className = 'mat-qty';
+      qtyInput.placeholder = '數量';
+      qtyInput.step = '0.5';
+      qtyInput.min = '0.5';
+
+      const unitSelect = document.createElement('select');
+      unitSelect.className = 'mat-unit';
+      appendOption(unitSelect, '', '單位');
+      unitSelect.options[0].disabled = true;
+      UNIT_OPTIONS.forEach(option => appendOption(unitSelect, option));
+      row.append(qtyInput, unitSelect);
+      div.append(header, nameSelect, customInput, row);
+
+      nameSelect.onchange = () => { toggleCustomMaterial(nameSelect); saveDraft(); };
+      customInput.oninput = saveDraft;
+      qtyInput.oninput = saveDraft;
+      unitSelect.onchange = saveDraft;
+
+      const isCustom = name === '其他' || (name && !MATERIAL_OPTIONS.includes(name));
+      nameSelect.value = isCustom ? '其他' : name;
+      if (isCustom) {
+        customInput.value = name === '其他' ? customName : name;
+        customInput.classList.remove('hidden');
+      }
+      if (qty !== '') qtyInput.value = qty;
+      if (unit) unitSelect.value = unit;
+
+      container.appendChild(div);
+      refreshMaterialTitles();
+      if (!isRestoringDraft) saveDraft();
+    }
+
+    function refreshMaterialTitles() {
+      const groups = document.querySelectorAll('#materialsContainer .material-group');
+      groups.forEach((group, index) => group.querySelector('.material-title').textContent = `用料 ${index + 1}`);
+      const addButton = document.getElementById('addMaterialButton');
+      addButton.disabled = groups.length >= MAX_MATERIAL_ROWS;
+      addButton.textContent = groups.length >= MAX_MATERIAL_ROWS ? `已達上限，共 ${MAX_MATERIAL_ROWS} 筆` : '新增一項用料';
+    }
+
+    function toggleCustomMaterial(select) {
+      const input = select.closest('.material-group').querySelector('.custom-mat-name');
+      const isCustom = select.value === '其他';
+      input.classList.toggle('hidden', !isCustom);
+      if (isCustom) input.focus(); else input.value = '';
+    }
+
+    function formatMaterial(name, qty, unit) {
+      if (unit === '桶 (1加侖)') return `${name}：${qty}桶，每桶1加侖`;
+      if (unit === '桶 (5加侖)') return `${name}：${qty}桶，每桶5加侖`;
+      return `${name}：${qty}${unit}`;
+    }
+
+    async function getWeather() {
+      if (!navigator.geolocation) { alert('此裝置不支援定位，請手動輸入氣象'); return; }
+      const button = document.querySelector('.btn-weather');
+      button.disabled = true;
+      button.textContent = '正在取得天氣...';
+      navigator.geolocation.getCurrentPosition(async position => {
         try {
-            const response = await cca.acquireTokenByClientCredential({ scopes: ['https://graph.microsoft.com/.default'] });
-            if (!response || !response.accessToken) throw new Error('Microsoft Graph Token 取得失敗');
-            const expiresAt = response.expiresOn ? response.expiresOn.getTime() : Date.now() + 50 * 60 * 1000;
-            tokenExpiresAt = Math.max(Date.now() + 60 * 1000, expiresAt - 5 * 60 * 1000);
-            cachedGraphClient = Client.init({ authProvider(done) { done(null, response.accessToken); } });
-            return cachedGraphClient;
+          const lat = position.coords.latitude, lon = position.coords.longitude;
+          const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m&wind_speed_unit=ms&timezone=Asia%2FTaipei`);
+          if (!res.ok) throw new Error('氣象服務錯誤');
+          const data = await res.json();
+          document.getElementById('temp').value = Number(data.current.temperature_2m).toFixed(1);
+          document.getElementById('humidity').value = Math.round(data.current.relative_humidity_2m);
+          document.getElementById('wind').value = Number(data.current.wind_speed_10m).toFixed(1);
+          saveDraft();
         } catch (error) {
-            cachedGraphClient = null;
-            tokenExpiresAt = 0;
-            throw error;
+          alert('氣象抓取失敗，請手動輸入');
         } finally {
-            graphClientPromise = null;
+          button.disabled = false; button.textContent = '一鍵獲取當地天氣';
         }
-    })();
-    return graphClientPromise;
-}
-
-function sanitizePathSegment(value) { return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); }
-function normalizeProjectName(value) { return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim(); }
-function validateProjectName(projectName) {
-    const normalizedName = normalizeProjectName(projectName);
-    if (!normalizedName) throw new Error('案場名稱不可為空');
-    if (normalizedName.length > 80) throw new Error('案場名稱不可超過 80 個字');
-    if (/[<>:"/\\|?*#%]/.test(normalizedName)) throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
-    return normalizedName;
-}
-function getProjectRegistrationErrorMessage(error) {
-    const safeMessages = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
-    const message = String(error?.message || '');
-    return safeMessages.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
-}
-
-let projectWriteQueue = Promise.resolve();
-function withProjectWriteLock(task) {
-    const result = projectWriteQueue.then(task, task);
-    projectWriteQueue = result.catch(() => undefined);
-    return result;
-}
-
-let bindingWriteQueue = Promise.resolve();
-function withBindingWriteLock(task) {
-    const result = bindingWriteQueue.then(task, task);
-    bindingWriteQueue = result.catch(() => undefined);
-    return result;
-}
-
-async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = false) {
-    try {
-        const graphClient = await getGraphClient();
-        const meta = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}`).get();
-        const downloadUrl = meta['@microsoft.graph.downloadUrl'];
-        if (!downloadUrl) throw new Error('Graph 未回傳檔案下載網址');
-        const response = await fetch(downloadUrl);
-        if (!response.ok) throw new Error(`下載設定檔失敗 ${response.status}`);
-        return await response.json();
-    } catch (error) {
-        const statusCode = error?.statusCode || error?.status || error?.code;
-        if (statusCode === 404 || statusCode === 'itemNotFound') {
-            if (throwOnNotFound) throw new Error(`找不到必要設定檔: ${filePath}`);
-            return defaultData;
-        }
-        throw error;
+      }, () => {
+        button.disabled = false; button.textContent = '一鍵獲取當地天氣';
+        alert('請允許網頁取用位置，或手動輸入氣象');
+      }, { timeout: 10000 });
     }
-}
 
-async function writeJsonToOneDrive(filePath, data) {
-    const graphClient = await getGraphClient();
-    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
-}
+    function saveDraft() {
+      if (isRestoringDraft || reportArchived || (projectMode !== 'LOCKED' && projectMode !== 'COMPATIBLE')) return;
+      
+      const materialsList = [...document.querySelectorAll('#materialsContainer .material-group')].map(group => ({
+        name: group.querySelector('.mat-name').value,
+        customName: group.querySelector('.custom-mat-name').value,
+        qty: group.querySelector('.mat-qty').value,
+        unit: group.querySelector('.mat-unit').value
+      }));
 
-function cloneJsonData(data) { return JSON.parse(JSON.stringify(data)); }
+      const contractorsList = [...document.querySelectorAll('#contractorsContainer .contractor-group')].map(group => ({
+        name: group.querySelector('.contractor-name').value,
+        customName: group.querySelector('.custom-contractor-name').value,
+        workers: group.querySelector('.contractor-workers').value
+      }));
 
-const CACHE_TTL = 30 * 1000;
-const configCache = { 
-    projects: { data: null, timestamp: 0 }, 
-    bindings: { data: null, timestamp: 0 },
-    globalMaterials: { data: null, timestamp: 0 },
-    projMaterials: {}
-};
-
-async function readProjectsFromOneDrive() {
-    const cache = configCache.projects;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
-    configCache.projects = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function writeProjectsToOneDrive(config) {
-    await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
-    configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
-}
-
-async function readBindingsFromOneDrive() {
-    const cache = configCache.bindings;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
-    configCache.bindings = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function writeBindingsToOneDrive(config) {
-    await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
-    configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
-}
-
-async function readGlobalMaterials() {
-    const cache = configCache.globalMaterials;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/materials.json', { materials: [] }, false);
-    configCache.globalMaterials = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function readProjectMaterials(projectName) {
-    const safeName = sanitizePathSegment(projectName);
-    const cache = configCache.projMaterials[safeName];
-    if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    try {
-        const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
-        if (data && Array.isArray(data.materials)) {
-            configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
-            return cloneJsonData(data);
-        }
-    } catch (e) {}
-    return null;
-}
-
-async function ensureProjectFolder(projectName) {
-    const graphClient = await getGraphClient();
-    const safeProjectName = sanitizePathSegment(projectName);
-    if (!safeProjectName) throw new Error('案場資料夾名稱不可為空');
-    const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-    try {
-        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
-        if (!item.folder) throw new Error(`同名項目不是資料夾：${safeProjectName}`);
-        return { created: false, folderId: item.id, folderPath };
-    } catch (error) {
-        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
+      const draft = {
+        submissionId: ensureSubmissionId(),
+        projectId: document.getElementById('projectId').value.trim(),
+        projectName: getSelectedProjectName(),
+        reporterName: document.getElementById('reporterName').value.trim(), // 💡 儲存填表人
+        isNoWork: document.getElementById('noWorkToday').checked,
+        noWorkReason: document.getElementById('noWorkReason').value,
+        contractorsList,
+        workItems: [...document.querySelectorAll('input[name="workItem"]:checked')].map(cb => cb.value),
+        customWorkItem: document.getElementById('customWorkItem').value,
+        workNotes: document.getElementById('workNotes').value,
+        noMaterial: document.getElementById('noMaterial').checked,
+        materialsList,
+        remarks: document.getElementById('remarks').value,
+        temp: document.getElementById('temp').value,
+        humidity: document.getElementById('humidity').value,
+        wind: document.getElementById('wind').value
+      };
+      localStorage.setItem(getDraftKey(), JSON.stringify(draft));
     }
-    try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({ name: safeProjectName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
-        return { created: true, folderId: createdFolder.id, folderPath };
-    } catch (error) {
-        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
-        if (!item.folder) throw error;
-        return { created: false, folderId: item.id, folderPath };
-    }
-}
 
-async function ensureChildFolder(graphClient, parentPath, childFolderName) {
-    const safeChildName = sanitizePathSegment(childFolderName);
-    if (!safeChildName) throw new Error('子資料夾名稱不可為空');
-    const childPath = `${parentPath}/${safeChildName}`;
-    try {
-        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
-        if (!existingItem.folder) throw new Error(`同名項目不是資料夾：${childPath}`);
-        return { created: false, folderId: existingItem.id, folderPath: childPath };
-    } catch (error) {
-        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
-    }
-    try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({ name: safeChildName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
-        return { created: true, folderId: createdFolder.id, folderPath: childPath };
-    } catch (createError) {
-        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
-        if (!existingItem.folder) throw createError;
-        return { created: false, folderId: existingItem.id, folderPath: childPath };
-    }
-}
-
-async function findProjectByName(projectName) {
-    const config = await readProjectsFromOneDrive();
-    const projects = Array.isArray(config.projects) ? config.projects : [];
-    const normalizedName = normalizeProjectName(projectName);
-    return projects.find(p => p.active === true && normalizeProjectName(p.projectName) === normalizedName) || null;
-}
-
-async function findProjectById(projectId) {
-    const config = await readProjectsFromOneDrive();
-    const projects = Array.isArray(config.projects) ? config.projects : [];
-    const normalizedProjectId = String(projectId || '').trim();
-    if (!normalizedProjectId) return null;
-    return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
-}
-
-function createProjectId() { return `PRJ-${crypto.randomUUID()}`; }
-
-async function registerProjectByName(projectName) {
-    return withProjectWriteLock(async () => {
-        const normalizedName = validateProjectName(projectName);
-        const config = await readProjectsFromOneDrive();
-        const projects = Array.isArray(config.projects) ? config.projects : [];
-        let existingProject = projects.find(p => p.active === true && normalizeProjectName(p.projectName) === normalizedName);
-
-        if (existingProject) {
-            await ensureProjectFolder(existingProject.projectName);
-            return { project: existingProject, created: false };
-        }
-
-        const project = { projectId: createProjectId(), projectName: normalizedName, active: true, createdAt: new Date().toISOString() };
-        await ensureProjectFolder(project.projectName);
-        projects.push(project);
-        await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
-        return { project, created: true };
-    });
-}
-
-async function replyLineMessage(replyToken, text) {
-    if (!replyToken) return;
-    const response = await fetch('https://api.line.me/v2/bot/message/reply', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
-        body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] })
-    });
-    if (!response.ok) throw new Error(`LINE Reply 失敗 ${response.status}: ${await response.text()}`);
-}
-
-async function pushLineMessage(targetId, text) {
-    const response = await fetch('https://api.line.me/v2/bot/message/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
-        body: JSON.stringify({ to: targetId, messages: [{ type: 'text', text }] })
-    });
-    if (!response.ok) throw new Error(`LINE Push 失敗 ${response.status}: ${await response.text()}`);
-}
-
-function verifyLineSignature(rawBody, signature) {
-    if (!LINE_CHANNEL_SECRET || !signature) return false;
-    const expectedSignature = crypto.createHmac('sha256', LINE_CHANNEL_SECRET).update(rawBody).digest('base64');
-    const actualBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
-    if (actualBuffer.length !== expectedBuffer.length) return false;
-    return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
-}
-
-function getLineTargetId(event) {
-    if (event.source?.type === 'group') return event.source.groupId;
-    if (event.source?.type === 'room') return event.source.roomId;
-    return null;
-}
-
-function getTaiwanDateParts() {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-    }).formatToParts(new Date());
-    const values = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
-    return { dateStr: `${values.year}-${values.month}-${values.day}`, timeStr: `${values.hour}${values.minute}${values.second}` };
-}
-
-function validateReportData(reportData) {
-    const requiredFields = ['projectName', 'contractor', 'workerCount', 'progress', 'materials'];
-    const missingFields = requiredFields.filter(field => !reportData[field] || String(reportData[field]).trim() === '');
-    return { valid: missingFields.length === 0, missingFields };
-}
-
-function normalizeMaterialItems(rawItems, isNoWork) {
-    if (isNoWork) return [];
-    if (!Array.isArray(rawItems)) return [];
-    
-    const allowedStockUnits = new Set(['桶', '組', '支', '公斤', '公升', '個', '捲']);
-    
-    return rawItems.map((item, index) => {
-        const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-        const quantity = Number(item.quantity);
-        const stockUnit = String(item.stockUnit || '').trim();
-        const packageQuantity = item.packageQuantity == null ? null : Number(item.packageQuantity);
-        const packageUnit = item.packageUnit == null ? null : String(item.packageUnit).trim();
+    function loadDraft() {
+      isRestoringDraft = true;
+      try {
+        const saved = localStorage.getItem(getDraftKey());
         
-        if (!materialName) throw new Error(`第 ${index + 1} 筆材料名稱不可為空`);
-        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`第 ${index + 1} 筆材料數量不正確`);
-        if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
+        // 💡 載入填表人記憶
+        const lastReporter = localStorage.getItem('lastReporterName') || '';
+
+        if (!saved) { 
+          currentSubmissionId = createSubmissionId();
+          document.getElementById('reporterName').value = lastReporter;
+          addContractorRow(); 
+          addMaterialRow(); 
+          return; 
+        }
         
-        let baseQuantity = quantity;
-        let baseUnit = stockUnit;
+        const draft = JSON.parse(saved);
+        currentSubmissionId = String(draft.submissionId || createSubmissionId());
         
-        if (stockUnit === '桶' && packageUnit === '加侖') {
-            if (packageQuantity !== 1 && packageQuantity !== 5) {
-                throw new Error(`第 ${index + 1} 筆桶裝容量不正確`);
-            }
-            baseQuantity = quantity * packageQuantity;
+        document.getElementById('reporterName').value = draft.reporterName || lastReporter;
+
+        const currentProjectId = document.getElementById('projectId').value.trim();
+        
+        if (projectMode === 'LOCKED') {
+          if ((draft.projectId && draft.projectId !== currentProjectId) || (!draft.projectId && draft.projectName && draft.projectName !== getSelectedProjectName())) {
+            console.warn('草稿不符合目前鎖定案場，已略過');
+            addContractorRow(); addMaterialRow(); return;
+          }
+        }
+
+        if (draft.isNoWork) {
+            document.getElementById('noWorkToday').checked = true;
+            document.getElementById('noWorkReason').value = draft.noWorkReason || '';
+            handleNoWorkChange();
+        }
+
+        document.getElementById('temp').value = draft.temp || '';
+        document.getElementById('humidity').value = draft.humidity || '';
+        document.getElementById('wind').value = draft.wind || '';
+        document.getElementById('workNotes').value = draft.workNotes || '';
+        document.getElementById('remarks').value = draft.remarks || '';
+
+        document.getElementById('contractorsContainer').innerHTML = '';
+        if (Array.isArray(draft.contractorsList) && draft.contractorsList.length > 0) {
+            draft.contractorsList.forEach(c => addContractorRow(c.name, c.customName, c.workers));
+        } else if (draft.contractor) {
+            addContractorRow(draft.contractor, draft.customContractor || '', draft.workerCount || '');
+        } else {
+            addContractorRow();
+        }
+
+        if (Array.isArray(draft.workItems)) {
+          document.querySelectorAll('input[name="workItem"]').forEach(cb => cb.checked = draft.workItems.includes(cb.value));
+          const hasOtherWork = draft.workItems.includes('其他');
+          const customWorkInput = document.getElementById('customWorkItem');
+          customWorkInput.classList.toggle('hidden', !hasOtherWork);
+          customWorkInput.value = hasOtherWork ? (draft.customWorkItem || '') : '';
+        }
+
+        const noMaterial = draft.noMaterial === true;
+        document.getElementById('noMaterial').checked = noMaterial;
+        
+        if (noMaterial) {
+          document.getElementById('materialsContainer').innerHTML = '';
+          handleNoMaterialChange();
+        } else {
+          document.getElementById('materialsContainer').style.display = 'block';
+          document.getElementById('addMaterialButton').style.display = 'block';
+          if (Array.isArray(draft.materialsList) && draft.materialsList.length > 0) {
+            document.getElementById('materialsContainer').innerHTML = '';
+            draft.materialsList.forEach(m => addMaterialRow(m.name || '', m.customName || '', m.qty || '', m.unit || ''));
+          } else {
+            addMaterialRow();
+          }
+        }
+
+        if (projectMode === 'COMPATIBLE' && draft.projectName) {
+          const projectSelect = document.getElementById('projectName');
+          if ([...projectSelect.options].some(option => option.value === draft.projectName)) {
+            projectSelect.value = draft.projectName;
+          }
+        }
+      } catch (error) {
+        localStorage.removeItem(getDraftKey());
+        document.getElementById('contractorsContainer').innerHTML = '';
+        document.getElementById('materialsContainer').innerHTML = '';
+        addContractorRow(); addMaterialRow();
+      } finally {
+        isRestoringDraft = false;
+      }
+    }
+
+    function buildProgressString() {
+      const customWorkItem = document.getElementById('customWorkItem').value.trim();
+      const items = [...document.querySelectorAll('input[name="workItem"]:checked')].map(item =>
+        `• ${item.value === '其他' ? customWorkItem : item.value}`
+      );
+      const notes = document.getElementById('workNotes').value.trim();
+      return items.join('\n') + (notes ? `\n\n作業補充：\n${notes}` : '');
+    }
+
+    function buildMaterialString() {
+      if (document.getElementById('noMaterial').checked) return '無';
+      const materials = [];
+      document.querySelectorAll('#materialsContainer .material-group').forEach(group => {
+        const selected = group.querySelector('.mat-name').value;
+        const name = selected === '其他' ? group.querySelector('.custom-mat-name').value.trim() : selected;
+        const qty = group.querySelector('.mat-qty').value;
+        const unit = group.querySelector('.mat-unit').value;
+        if (name && qty && unit) materials.push(formatMaterial(name, qty, unit));
+      });
+      return materials.join('\n');
+    }
+
+    function buildContractorItems() {
+      if (document.getElementById('noWorkToday').checked) {
+        return [];
+      }
+      return [...document.querySelectorAll('#contractorsContainer .contractor-group')]
+        .map(group => {
+          const selected = group.querySelector('.contractor-name').value;
+          const contractorName = selected === '其他' 
+            ? group.querySelector('.custom-contractor-name').value.trim() 
+            : selected;
+          const workerCount = Number(group.querySelector('.contractor-workers').value) || 0;
+          return { contractorName, workerCount };
+        })
+        .filter(item => {
+          return item.contractorName && item.workerCount > 0;
+        });
+    }
+
+    function buildWorkItems() {
+      if (document.getElementById('noWorkToday').checked) {
+        return [];
+      }
+      return [...document.querySelectorAll('input[name="workItem"]:checked')]
+        .map(item => item.value);
+    }
+
+    function buildMaterialItems() {
+      const isNoWork = document.getElementById('noWorkToday').checked;
+      const isNoMaterial = document.getElementById('noMaterial').checked;
+      if (isNoWork || isNoMaterial) {
+        return [];
+      }
+
+      return [...document.querySelectorAll('#materialsContainer .material-group')]
+        .map(group => {
+          const selected = group.querySelector('.mat-name').value;
+          const materialName = selected === '其他' 
+            ? group.querySelector('.custom-mat-name').value.trim() 
+            : selected;
+          const quantity = Number(group.querySelector('.mat-qty').value) || 0;
+          const selectedUnit = group.querySelector('.mat-unit').value;
+
+          let stockUnit = selectedUnit;
+          let packageQuantity = null;
+          let packageUnit = null;
+          let baseQuantity = quantity;
+          let baseUnit = selectedUnit;
+
+          if (selectedUnit === '桶 (1加侖)') {
+            stockUnit = '桶';
+            packageQuantity = 1;
+            packageUnit = '加侖';
+            baseQuantity = quantity;
             baseUnit = '加侖';
-        }
+          } else if (selectedUnit === '桶 (5加侖)') {
+            stockUnit = '桶';
+            packageQuantity = 5;
+            packageUnit = '加侖';
+            baseQuantity = quantity * 5;
+            baseUnit = '加侖';
+          }
+
+          return {
+            materialId: null,
+            materialName,
+            quantity,
+            stockUnit,
+            packageQuantity,
+            packageUnit,
+            baseQuantity,
+            baseUnit
+          };
+        })
+        .filter(item => {
+          return item.materialName && item.quantity > 0;
+        });
+    }
+
+    function validateProject() {
+      if (projectMode !== 'LOCKED' && projectMode !== 'COMPATIBLE') { alert('案場資料尚未成功載入'); return false; }
+      if (!getSelectedProjectName()) { alert('請選擇案場'); return false; }
+      if (projectMode === 'LOCKED' && !document.getElementById('projectId').value.trim()) { alert('案場識別資料不完整'); return false; }
+      return true;
+    }
+
+    function validateForm() {
+      const reporterName = document.getElementById('reporterName').value.trim();
+      if (!reporterName) { alert('請填寫您的填表人姓名'); return false; }
+
+      const isNoWork = document.getElementById('noWorkToday').checked;
+
+      if (isNoWork) {
+         if (!document.getElementById('noWorkReason').value) { alert('請選擇今日無出工原因'); return false; }
+      } else {
+          const cGroups = document.querySelectorAll('#contractorsContainer .contractor-group');
+          if (cGroups.length === 0) { alert('請至少填寫一組施工廠商'); return false; }
+          
+          const contractorNames = new Set(); 
+
+          for (let i = 0; i < cGroups.length; i++) {
+              const group = cGroups[i];
+              const name = group.querySelector('.contractor-name').value;
+              const custom = group.querySelector('.custom-contractor-name').value.trim();
+              const workers = group.querySelector('.contractor-workers').value;
+
+              if (!name) { alert(`請選擇施工廠商 ${i + 1} 的名稱`); return false; }
+              if (name === '其他' && !custom) { alert(`請輸入施工廠商 ${i + 1} 的自訂名稱`); return false; }
+              
+              const workerCount = Number(workers);
+              if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) { 
+                  alert(`請輸入施工廠商 ${i + 1} 的正確整數人數`); 
+                  return false; 
+              }
+
+              const finalContractorName = name === '其他' ? custom : name;
+              const normalizedContractorName = finalContractorName.normalize('NFKC').replace(/\s+/g, ' ').trim();
+              
+              if (contractorNames.has(normalizedContractorName)) {
+                  alert(`施工廠商「${finalContractorName}」重複填寫，請合併人數`);
+                  return false;
+              }
+              contractorNames.add(normalizedContractorName);
+          }
+
+          const selectedWorkItems = [...document.querySelectorAll('input[name="workItem"]:checked')];
+          if (!selectedWorkItems.length) { alert('請至少勾選一項今日作業'); return false; }
+          if (selectedWorkItems.some(cb => cb.value === '其他') && !document.getElementById('customWorkItem').value.trim()) { alert('請輸入其他作業項目名稱'); return false; }
+
+          if (!document.getElementById('noMaterial').checked) {
+            let completed = 0;
+            const groups = [...document.querySelectorAll('#materialsContainer .material-group')];
+            for (let i = 0; i < groups.length; i++) {
+              const group = groups[i];
+              const selected = group.querySelector('.mat-name').value;
+              const custom = group.querySelector('.custom-mat-name').value.trim();
+              const qty = Number(group.querySelector('.mat-qty').value);
+              const unit = group.querySelector('.mat-unit').value;
+              
+              if (!selected && !custom && !qty && !unit) continue;
+              if (!selected) { alert(`請選擇用料 ${i + 1} 的品項`); return false; }
+              if (selected === '其他' && !custom) { alert(`請輸入用料 ${i + 1} 的名稱`); return false; }
+              if (!qty || qty <= 0) { alert(`請輸入用料 ${i + 1} 的正確數量`); return false; }
+              if (!unit) { alert(`請選擇用料 ${i + 1} 的單位`); return false; }
+              completed++;
+            }
+            if (!completed) { alert('請至少填寫一筆今日用料，或勾選「今日無用料」'); return false; }
+          }
+      }
+
+      const temp = document.getElementById('temp').value.trim();
+      const hum = document.getElementById('humidity').value.trim();
+      const wind = document.getElementById('wind').value.trim();
+      if (temp && !Number.isFinite(Number(temp))) { alert('溫度必須是數字'); return false; }
+      if (hum && (!Number.isFinite(Number(hum)) || Number(hum) < 0 || Number(hum) > 100)) { alert('濕度必須介於 0 至 100'); return false; }
+      if (wind && (!Number.isFinite(Number(wind)) || Number(wind) < 0)) { alert('風速必須是大於或等於 0 的數字'); return false; }
+
+      return true;
+    }
+
+    async function submitForm() {
+      if (isSubmitting) return;
+      if (reportArchived) { alert('這份日報已歸檔，請勿重複送出。'); return; }
+      if (!validateProject()) return;
+      if (!validateForm()) return;
+
+      const submitButton = document.getElementById('submitButton');
+      isSubmitting = true;
+      submitButton.disabled = true;
+      submitButton.textContent = '正在送出...';
+
+      // 💡 送出成功後，永久記憶這次填寫的名字
+      const reporterName = document.getElementById('reporterName').value.trim();
+      localStorage.setItem('lastReporterName', reporterName);
+
+      let finalContractorStr, finalWorkerCountStr, finalProgressStr, finalMaterialStr;
+      
+      const isNoWork = document.getElementById('noWorkToday').checked;
+      if (isNoWork) {
+          const reason = document.getElementById('noWorkReason').value;
+          finalContractorStr = '無出工';
+          finalWorkerCountStr = '0';
+          finalProgressStr = `今日無出工 (停工/休息)\n原因：${reason}`;
+          finalMaterialStr = '無';
+      } else {
+          saveNewContractorsFromForm();
+
+          let totalWorkers = 0;
+          const contractorList = [];
+          document.querySelectorAll('#contractorsContainer .contractor-group').forEach(group => {
+              const select = group.querySelector('.contractor-name').value;
+              const name = select === '其他' ? group.querySelector('.custom-contractor-name').value.trim() : select;
+              const workers = Number(group.querySelector('.contractor-workers').value);
+              contractorList.push(`• ${name}（${workers}人）`);
+              totalWorkers += workers;
+          });
+
+          finalContractorStr = '\n' + contractorList.join('\n');
+          finalWorkerCountStr = `共 ${totalWorkers} 人`;
+          finalProgressStr = buildProgressString();
+          finalMaterialStr = buildMaterialString();
+      }
+
+      const contractorItems = buildContractorItems();
+      const workItems = buildWorkItems();
+      const materialItems = buildMaterialItems();
+      const totalWorkerCount = contractorItems.reduce((total, item) => total + item.workerCount, 0);
+
+      const submissionIdStr = ensureSubmissionId();
+
+      const payload = {
+        projectId: document.getElementById('projectId').value.trim(),
+        projectName: getSelectedProjectName(),
+        submissionId: submissionIdStr,
+        reporterName: reporterName, // 💡 把填表人包進去送給伺服器
         
-        return {
-            materialId: null, materialName, quantity, stockUnit,
-            packageQuantity, packageUnit, baseQuantity, baseUnit
-        };
-    });
-}
-
-async function generateProjectStats(project) {
-    const safeProjectName = sanitizePathSegment(project.projectName);
-    const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
-    const graphClient = await getGraphClient();
-
-    let requestUrl = `/users/${TARGET_USER_EMAIL}/drive/root:/${dataFolderPath}:/children`;
-    const allItems = [];
-    
-    try {
-        while (requestUrl) {
-            const result = await graphClient.api(requestUrl).get();
-            if (Array.isArray(result.value)) {
-                allItems.push(...result.value.filter(f => f.name.endsWith('.json')));
-            }
-            requestUrl = result['@odata.nextLink'] || null;
-        }
-    } catch (error) {
-        if (error.statusCode === 404 || error.code === 'itemNotFound') {
-            return { error: '尚無日報資料或資料夾不存在', dataQuality: null, stats: null, reports: [] };
-        }
-        throw error;
-    }
-
-    const reports = [];
-    const invalidFiles = [];
-    const DOWNLOAD_CONCURRENCY = 10;
-    
-    for (let i = 0; i < allItems.length; i += DOWNLOAD_CONCURRENCY) {
-        const chunk = allItems.slice(i, i + DOWNLOAD_CONCURRENCY);
-        const chunkResults = await Promise.all(chunk.map(async file => {
-            try {
-                const downloadUrl = file['@microsoft.graph.downloadUrl'];
-                if (!downloadUrl) throw new Error('缺少下載網址');
-                const response = await fetch(downloadUrl);
-                if (!response.ok) throw new Error(`下載失敗 HTTP ${response.status}`);
-                return { success: true, report: await response.json() };
-            } catch (error) {
-                return { success: false, fileName: file.name, error: String(error.message || '未知錯誤') };
-            }
-        }));
-
-        for (const result of chunkResults) {
-            if (result.success) {
-                reports.push(result.report);
-            } else {
-                console.error(`統計資料讀取失敗：${result.fileName}`, result.error);
-                invalidFiles.push({ fileName: result.fileName, error: result.error });
-            }
-        }
-    }
-
-    const latestReportsMap = new Map();
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    let supersededCount = 0;
-
-    for (const report of reports) {
-        const date = String(report.reportDate || '').trim();
-        const submittedAtTime = Date.parse(report.submittedAt || '');
-
-        if (!dateRegex.test(date) || !Number.isFinite(submittedAtTime)) {
-            invalidFiles.push({ fileName: `SubmissionId: ${report.submissionId}`, error: '時間格式錯誤' });
-            continue;
-        }
-
-        const existing = latestReportsMap.get(date);
-        if (!existing) {
-            latestReportsMap.set(date, report);
-            continue;
-        }
-
-        const existingTime = Date.parse(existing.submittedAt || '');
-        if (!Number.isFinite(existingTime) || submittedAtTime > existingTime) {
-            latestReportsMap.set(date, report);
-            supersededCount++;
-        } else {
-            supersededCount++;
-        }
-    }
-
-    const validReports = Array.from(latestReportsMap.values());
-    validReports.sort((a, b) => a.reportDate.localeCompare(b.reportDate));
-
-    const stats = {
-        totalDays: validReports.length,
-        workDays: 0,
-        noWorkDays: 0,
-        totalManDays: 0,
-        contractorStats: {},
-        materialStats: {},
-        workItemsStats: {},
-        customWorkItemsStats: {},
-        noWorkReasons: {},
-        reporterStats: {} // 💡 新增：紀錄填表人的出工天數
-    };
-
-    for (const report of validReports) {
-        if (report.isNoWork) {
-            stats.noWorkDays++;
-            const reason = report.noWorkReason || '未填寫原因';
-            stats.noWorkReasons[reason] = (stats.noWorkReasons[reason] || 0) + 1;
-        } else {
-            stats.workDays++;
-            stats.totalManDays += Number(report.totalWorkerCount) || 0;
-
-            // 💡 統計填表人 (帶班主管) 的出工天數
-            const reporter = String(report.reporterName || '未紀錄').trim();
-            stats.reporterStats[reporter] = (stats.reporterStats[reporter] || 0) + 1;
-
-            if (Array.isArray(report.contractorItems)) {
-                const dailyContractors = new Map();
-                for (const item of report.contractorItems) {
-                    const name = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-                    const count = Number(item.workerCount);
-                    if (!name || !Number.isFinite(count) || count <= 0) continue;
-                    dailyContractors.set(name, (dailyContractors.get(name) || 0) + count);
-                }
-                for (const [name, count] of dailyContractors.entries()) {
-                    if (!stats.contractorStats[name]) stats.contractorStats[name] = { manDays: 0, workDays: 0 };
-                    stats.contractorStats[name].manDays += count;
-                    stats.contractorStats[name].workDays += 1;
-                }
-            }
-
-            if (Array.isArray(report.workItems)) {
-                const uniqueWorkItems = new Set(report.workItems.map(item => String(item || '').trim()).filter(Boolean));
-                for (const item of uniqueWorkItems) {
-                    if (item === '其他' && report.customWorkItem) {
-                        const customName = String(report.customWorkItem).trim();
-                        stats.customWorkItemsStats[customName] = (stats.customWorkItemsStats[customName] || 0) + 1;
-                        stats.workItemsStats['其他(自訂)'] = (stats.workItemsStats['其他(自訂)'] || 0) + 1;
-                    } else {
-                        stats.workItemsStats[item] = (stats.workItemsStats[item] || 0) + 1;
-                    }
-                }
-            }
-
-            if (Array.isArray(report.materialItems)) {
-                report.materialItems.forEach(item => {
-                    const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-                    const baseUnit = String(item.baseUnit || '').trim();
-                    const baseQuantity = Number(item.baseQuantity);
-                    if (!materialName || !baseUnit || !Number.isFinite(baseQuantity) || baseQuantity <= 0) return;
-                    const key = `${materialName} (${baseUnit})`;
-                    stats.materialStats[key] = (stats.materialStats[key] || 0) + baseQuantity;
-                });
-            }
-        }
-    }
-
-    const dataQuality = {
-        sourceFileCount: allItems.length,
-        parsedFileCount: reports.length,
-        invalidFileCount: invalidFiles.length,
-        effectiveReportCount: validReports.length,
-        supersededReportCount: supersededCount
-    };
-
-    return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
-}
-
-function verifyStatsApiKey(req, res, next) {
-    const apiKey = req.get('x-api-key');
-    if (!STATS_API_KEY || apiKey !== STATS_API_KEY) {
-        return res.status(401).json({ success: false, error: '未授權存取' });
-    }
-    next();
-}
-
-app.get('/api/projects', async (req, res) => {
-    try {
-        const config = await readProjectsFromOneDrive();
-        const projects = Array.isArray(config.projects) ? config.projects : [];
-        const activeProjects = projects
-            .filter(p => p.active === true)
-            .map(p => ({ projectId: p.projectId, projectName: p.projectName }))
-            .sort((a, b) => a.projectName.localeCompare(b.projectName, 'zh-Hant'));
-        return res.status(200).json({ success: true, projects: activeProjects });
-    } catch (error) {
-        console.error('讀取案場清單失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得案場清單' });
-    }
-});
-
-app.get('/api/materials', async (req, res) => {
-    const projectId = req.query.projectId;
-    try {
-        if (projectId) {
-            const project = await findProjectById(projectId);
-            if (project) {
-                const customConfig = await readProjectMaterials(project.projectName);
-                if (customConfig && Array.isArray(customConfig.materials)) {
-                    return res.status(200).json({ success: true, materials: customConfig.materials, type: 'project' });
-                }
-            }
-        }
-        const globalConfig = await readGlobalMaterials();
-        const materials = Array.isArray(globalConfig.materials) ? globalConfig.materials : [];
-        return res.status(200).json({ success: true, materials, type: 'global' });
-    } catch (error) {
-        console.error('讀取材料清單失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得材料清單' });
-    }
-});
-
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const signature = req.get('x-line-signature');
-    if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
-    
-    let body;
-    try { body = JSON.parse(req.body.toString('utf8')); } 
-    catch (error) { return res.status(400).send('Invalid JSON'); }
-    
-    res.status(200).send('OK');
-
-    for (const event of body.events || []) {
-        try {
-            const targetId = getLineTargetId(event);
-            if (event.type === 'join') {
-                const welcomeText = [
-                    '👷 歡迎使用「云說工程小幫手」！',
-                    '我是負責協助自動化建案與日報歸檔的機器人。請依以下步驟啟用專屬日報：',
-                    '',
-                    '1️⃣ 首次開工請輸入「設定案場 案場名稱」',
-                    '2️⃣ 將回覆的專屬網址「設為置頂公告」'
-                ].join('\n');
-                await replyLineMessage(event.replyToken, welcomeText);
-                continue;
-            }
-            if (event.type === 'message' && event.message.type === 'text') {
-                const text = event.message.text.trim();
-                
-                if (text.startsWith('設定案場')) {
-                    if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用。'); continue; }
-                    const match = text.match(/^設定案場\s+(.+)$/);
-                    if (!match) { await replyLineMessage(event.replyToken, '⚠️ 格式錯誤\n正確格式：設定案場 大安區'); continue; }
-                    const projectName = match[1].trim();
-                    
-                    let registration;
-                    try { registration = await registerProjectByName(projectName); } 
-                    catch (error) { await replyLineMessage(event.replyToken, `⚠️ 無法建立案場\n${getProjectRegistrationErrorMessage(error)}`); continue; }
-
-                    const project = registration.project;
-
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
-                        const filteredBindings = bindings.filter(b => b.projectId !== project.projectId && b.groupId !== targetId);
-                        filteredBindings.push({
-                            projectId: project.projectId, projectName: project.projectName, groupId: targetId,
-                            sourceType: event.source.type, active: true, boundAt: new Date().toISOString()
-                        });
-                        await writeBindingsToOneDrive({ ...config, bindings: filteredBindings, updatedAt: new Date().toISOString() });
-                    });
-
-                    const reportUrl = `https://liff.line.me/${LIFF_ID}/?projectId=${encodeURIComponent(project.projectId)}`;
-                    await replyLineMessage(event.replyToken, `✅ 案場「${project.projectName}」設定完成\n\n請將以下網址設為群組公告：\n${reportUrl}`);
-                }
-                else if (text === '查詢案場' || text === '案場查詢') {
-                    if (!targetId) continue;
-                    const config = await readBindingsFromOneDrive();
-                    const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.groupId === targetId && b.active);
-                    await replyLineMessage(event.replyToken, binding ? `📍 本群組綁定案場：\n${binding.projectName}` : '⚠️ 尚未設定案場');
-                }
-                else if (text === '解除案場') {
-                    if (!targetId) continue;
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const bindings = Array.isArray(config.bindings) ? config.bindings : [];
-                        const filteredBindings = bindings.filter(b => b.groupId !== targetId);
-                        if (filteredBindings.length === bindings.length) { await replyLineMessage(event.replyToken, '無綁定紀錄。'); return; }
-                        await writeBindingsToOneDrive({ ...config, bindings: filteredBindings, updatedAt: new Date().toISOString() });
-                        await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
-                    });
-                }
-                else if (text === '查詢統計' || text === '案場統計') {
-                    if (!targetId) {
-                        await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「查詢統計」指令。');
-                        continue;
-                    }
-
-                    const bindingConfig = await readBindingsFromOneDrive();
-                    const bindings = Array.isArray(bindingConfig.bindings) ? bindingConfig.bindings : [];
-                    const currentBinding = bindings.find(b => b.groupId === targetId && b.active === true);
-
-                    if (!currentBinding) {
-                        await replyLineMessage(event.replyToken, '⚠️ 本群組目前沒有綁定案場，無法查詢統計。');
-                        continue;
-                    }
-
-                    const config = await readProjectsFromOneDrive();
-                    const projects = Array.isArray(config.projects) ? config.projects : [];
-                    const project = projects.find(p => p.projectId === currentBinding.projectId);
-
-                    if (!project) {
-                        await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場的詳細資料。');
-                        continue;
-                    }
-
-                    try {
-                        const result = await generateProjectStats(project);
-                        if (result.error) {
-                            await replyLineMessage(event.replyToken, `⚠️ 查詢失敗：${result.error}`);
-                            continue;
-                        }
-
-                        const stats = result.stats;
-                        
-                        let msg = `【${project.projectName}】累計統計表\n`;
-                        msg += `━━━━━━━━━━━━\n`;
-                        msg += `實際工作天：${stats.workDays} 天\n`;
-                        msg += `免計工作天：${stats.noWorkDays} 天\n`;
-                        msg += `全案總人天：${stats.totalManDays} 人天\n\n`;
-
-                        msg += `[ 各廠商出工統計 ]\n`;
-                        if (Object.keys(stats.contractorStats).length === 0) msg += ` • 無紀錄\n`;
-                        for (const [name, data] of Object.entries(stats.contractorStats)) {
-                            msg += ` • ${name}：${data.workDays} 工作天 (${data.manDays} 人天)\n`;
-                        }
-
-                        msg += `\n[ 材料累計消耗 ]\n`;
-                        if (Object.keys(stats.materialStats).length === 0) msg += ` • 無紀錄\n`;
-                        for (const [name, qty] of Object.entries(stats.materialStats)) {
-                            msg += ` • ${name}：共 ${qty}\n`;
-                        }
-
-                        msg += `━━━━━━━━━━━━\n`;
-                        msg += `* 資料計算至最新一份日報`;
-
-                        if (result.dataQuality) {
-                            if (result.dataQuality.invalidFileCount > 0) msg += `\n⚠️ 注意：發現 ${result.dataQuality.invalidFileCount} 份資料異常，統計可能不完整`;
-                            if (result.dataQuality.supersededReportCount > 0) msg += `\n* 同日舊版已排除：${result.dataQuality.supersededReportCount} 份`;
-                        }
-
-                        await replyLineMessage(event.replyToken, msg);
-
-                    } catch (err) {
-                        console.error('群組查詢統計失敗：', err);
-                        await replyLineMessage(event.replyToken, '⚠️ 統計計算過程中發生錯誤，請稍後再試。');
-                    }
-                }
-                else if (text.startsWith('結案')) {
-                    if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「結案」指令。'); continue; }
-                    const match = text.match(/^結案\s+(.+)$/);
-                    if (!match) { await replyLineMessage(event.replyToken, '⚠️ 格式錯誤\n正確格式：結案 大安區'); continue; }
-                    const targetProjectName = match[1].trim();
-
-                    const bindingConfig = await readBindingsFromOneDrive();
-                    const bindings = Array.isArray(bindingConfig.bindings) ? bindingConfig.bindings : [];
-                    const currentBinding = bindings.find(b => b.groupId === targetId && b.active === true);
-
-                    if (!currentBinding) {
-                        await replyLineMessage(event.replyToken, '⚠️ 本群組目前沒有綁定案場，無法執行結案。');
-                        continue;
-                    }
-                    if (normalizeProjectName(targetProjectName) !== normalizeProjectName(currentBinding.projectName)) {
-                        await replyLineMessage(event.replyToken, `⚠️ 結案名稱不符\n本群組案場：${currentBinding.projectName}\n輸入名稱：${targetProjectName}`);
-                        continue;
-                    }
-
-                    await withProjectWriteLock(async () => {
-                        const config = await readProjectsFromOneDrive();
-                        const projects = Array.isArray(config.projects) ? config.projects : [];
-                        const projectIndex = projects.findIndex(p => p.projectId === currentBinding.projectId);
-                        
-                        if (projectIndex === -1) {
-                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。'); return;
-                        }
-                        
-                        const closingProject = projects[projectIndex];
-
-                        let finalStatsResult;
-                        try {
-                            finalStatsResult = await generateProjectStats(closingProject);
-                            
-                            if (finalStatsResult.error || !finalStatsResult.stats) {
-                                await replyLineMessage(event.replyToken, ['⚠️ 結案暫停', '', finalStatsResult.error || '目前無法產生結案統計。', '', '案場尚未下架，群組綁定也未解除。'].join('\n'));
-                                return;
-                            }
-
-                            if (Array.isArray(finalStatsResult.warnings) && finalStatsResult.warnings.length > 0) {
-                                await replyLineMessage(event.replyToken, ['⚠️ 結案暫停', '', `發現 ${finalStatsResult.warnings.length} 份異常結構化資料。`, '為避免統計漏算，本次尚未完成結案。', '', '請先檢查 OneDrive 資料或 Render Logs。'].join('\n'));
-                                return;
-                            }
-
-                            const { dateStr, timeStr } = getTaiwanDateParts();
-                            const safeProjectName = sanitizePathSegment(closingProject.projectName);
-                            const graphClient = await getGraphClient();
-                            
-                            const statsFileName = `結案統計_${dateStr.replace(/-/g, '')}_${timeStr}.json`;
-                            const statsFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}`;
-                            const statsBuffer = Buffer.from(JSON.stringify({
-                                schemaVersion: 1, projectId: closingProject.projectId, projectName: closingProject.projectName,
-                                generatedAt: new Date().toISOString(), ...finalStatsResult
-                            }, null, 2), 'utf-8');
-                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${statsFilePath}:/content`).put(statsBuffer);
-
-                            const workbook = new ExcelJS.Workbook();
-                            workbook.creator = '云說工程小幫手';
-                            workbook.created = new Date();
-
-                            // 💡 Excel 總表新增：開案日期 與 填表人出工統計
-                            const summarySheet = workbook.addWorksheet('案場總表');
-                            summarySheet.columns = [
-                                { header: '統計項目', key: 'item', width: 25 },
-                                { header: '數據', key: 'value', width: 40 }
-                            ];
-                            const startDateStr = finalStatsResult.reports.length > 0 ? finalStatsResult.reports[0].reportDate : '無紀錄';
-                            
-                            summarySheet.addRow({ item: '案場名稱', value: closingProject.projectName });
-                            summarySheet.addRow({ item: '開案日期', value: startDateStr });
-                            summarySheet.addRow({ item: '結案日期', value: dateStr });
-                            summarySheet.addRow({ item: '累計日曆天', value: `${finalStatsResult.stats.totalDays} 天` });
-                            summarySheet.addRow({ item: '實際工作天', value: `${finalStatsResult.stats.workDays} 天` });
-                            summarySheet.addRow({ item: '免計工作天', value: `${finalStatsResult.stats.noWorkDays} 天` });
-                            summarySheet.addRow({ item: '全案總人天', value: `${finalStatsResult.stats.totalManDays} 人天` });
-                            
-                            summarySheet.addRow({ item: '', value: '' });
-                            summarySheet.addRow({ item: '【各人員填表(帶班)天數】', value: '' });
-                            for (const [name, days] of Object.entries(finalStatsResult.stats.reporterStats)) {
-                                summarySheet.addRow({ item: ` • ${name}`, value: `${days} 工作天` });
-                            }
-
-                            summarySheet.addRow({ item: '', value: '' });
-                            summarySheet.addRow({ item: '【各廠商出工統計】', value: '' });
-                            for (const [name, data] of Object.entries(finalStatsResult.stats.contractorStats)) {
-                                summarySheet.addRow({ item: ` • ${name}`, value: `${data.workDays} 工作天 (${data.manDays} 人天)` });
-                            }
-
-                            const inventorySheet = workbook.addWorksheet('材料累計消耗');
-                            inventorySheet.columns = [
-                                { header: '材料名稱', key: 'name', width: 25 },
-                                { header: '單位', key: 'unit', width: 15 },
-                                { header: '現場累計消耗', key: 'used', width: 20 },
-                                { header: '備註', key: 'remarks', width: 40 }
-                            ];
-                            for (const [key, qty] of Object.entries(finalStatsResult.stats.materialStats)) {
-                                const match = key.match(/(.+?)\s+\((.+)\)/);
-                                const name = match ? match[1] : key;
-                                const unit = match ? match[2] : '';
-                                inventorySheet.addRow({ name: name, unit: unit, used: qty, remarks: '' });
-                            }
-
-                            const materialLogSheet = workbook.addWorksheet('材料進出紀錄');
-                            materialLogSheet.columns = [
-                                { header: '日期', key: 'date', width: 15 },
-                                { header: '材料名稱', key: 'name', width: 25 },
-                                { header: '單位', key: 'unit', width: 15 },
-                                { header: '使用數量', key: 'used_qty', width: 15 },
-                                { header: '日報備註', key: 'remarks', width: 50 }
-                            ];
-                            for (const r of finalStatsResult.reports) {
-                                if (!r.isNoWork && Array.isArray(r.materialItems)) {
-                                    for (const m of r.materialItems) {
-                                        materialLogSheet.addRow({
-                                            date: r.reportDate,
-                                            name: m.materialName,
-                                            unit: m.baseUnit,
-                                            used_qty: m.baseQuantity,
-                                            remarks: r.remarks || r.workNotes || ''
-                                        });
-                                    }
-                                }
-                            }
-
-                            // 💡 Excel 日報明細新增：填表人 欄位
-                            const dailyLogSheet = workbook.addWorksheet('日報明細');
-                            dailyLogSheet.columns = [
-                                { header: '日期', key: 'date', width: 15 },
-                                { header: '填表人', key: 'reporter', width: 15 },
-                                { header: '出工狀態', key: 'status', width: 15 },
-                                { header: '出工人數', key: 'workers', width: 15 },
-                                { header: '施作項目', key: 'work_items', width: 40 },
-                                { header: '日報備註', key: 'remarks', width: 50 }
-                            ];
-                            for (const r of finalStatsResult.reports) {
-                                let itemsStr = Array.isArray(r.workItems) ? r.workItems.join('、') : '';
-                                if (r.customWorkItem) itemsStr += ` (${r.customWorkItem})`;
-                                dailyLogSheet.addRow({
-                                    date: r.reportDate,
-                                    reporter: r.reporterName || '未紀錄',
-                                    status: r.isNoWork ? `停工 (${r.noWorkReason})` : '施工',
-                                    workers: r.totalWorkerCount || 0,
-                                    work_items: itemsStr,
-                                    remarks: r.remarks || ''
-                                });
-                            }
-
-                            workbook.eachSheet((sheet) => {
-                                const headerRow = sheet.getRow(1);
-                                headerRow.font = { bold: true, color: { arg: 'FFFFFFFF' } };
-                                headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { arg: 'FF4F81BD' } };
-                                headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
-                            });
-
-                            const excelBufferArray = await workbook.xlsx.writeBuffer();
-                            const excelBuffer = Buffer.from(excelBufferArray);
-                            const excelFileName = `結案總表_${safeProjectName}_${dateStr.replace(/-/g, '')}.xlsx`;
-                            const excelFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${excelFileName}`;
-                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${excelFilePath}:/content`).put(excelBuffer);
-
-                        } catch (statErr) {
-                            console.error('結案報表產生或儲存失敗：', statErr);
-                            await replyLineMessage(event.replyToken, ['⚠️ 結案失敗', '', '系統無法完成最終統計或寫入報表檔。', '案場尚未下架，群組綁定也未解除。', '', '請稍後再試。'].join('\n'));
-                            return;
-                        }
-
-                        projects.splice(projectIndex, 1);
-                        await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
-
-                        await withBindingWriteLock(async () => {
-                            const latestBindingConfig = await readBindingsFromOneDrive();
-                            const latestBindings = Array.isArray(latestBindingConfig.bindings) ? latestBindingConfig.bindings : [];
-                            const filteredBindings = latestBindings.filter(binding => binding.projectId !== closingProject.projectId);
-                            await writeBindingsToOneDrive({ ...latestBindingConfig, bindings: filteredBindings, updatedAt: new Date().toISOString() });
-                        });
-
-                        await replyLineMessage(event.replyToken, `✅ 案場「${targetProjectName}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
-                    });
-                }
-                else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
-                    const helpText = [
-                        '📖 「云說工程小幫手」群組指令說明',
-                        '',
-                        '🔹 設定案場 案場名稱',
-                        '🔹 查詢案場',
-                        '🔹 查詢統計',
-                        '🔹 解除案場',
-                        '🔹 結案 案場名稱 (自動結算並下架)'
-                    ].join('\n');
-                    await replyLineMessage(event.replyToken, helpText);
-                }
-            }
-        } catch (error) { console.error('LINE 事件處理失敗：', error); }
-    }
-});
-
-app.use(express.json());
-
-app.get('/api/project-stats/:projectId', verifyStatsApiKey, async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) return res.status(404).json({ success: false, error: '找不到該案場' });
+        temp: document.getElementById('temp').value || '未填寫',
+        humidity: document.getElementById('humidity').value || '未填寫',
+        wind: document.getElementById('wind').value || '未填寫',
+        contractor: finalContractorStr,
+        workerCount: finalWorkerCountStr,
+        progress: finalProgressStr,
+        materials: finalMaterialStr,
+        remarks: document.getElementById('remarks').value.trim() || '無',
         
-        const result = await generateProjectStats(project);
-        if (result.error) return res.status(200).json({ success: true, message: result.error });
+        isNoWork,
+        noWorkReason: isNoWork ? document.getElementById('noWorkReason').value : '',
+        contractorItems,
+        totalWorkerCount,
+        workItems,
+        customWorkItem: isNoWork ? '' : document.getElementById('customWorkItem').value.trim(),
+        workNotes: isNoWork ? '' : document.getElementById('workNotes').value.trim(),
+        materialItems
+      };
 
-        return res.status(200).json({ success: true, projectName: project.projectName, ...result });
-    } catch (error) {
-        console.error('統計產生失敗：', error);
-        return res.status(500).json({ success: false, error: '統計產生失敗' });
+      try {
+        const response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        
+        const responseText = await response.text();
+        let result;
+        try { result = responseText ? JSON.parse(responseText) : {}; } catch { throw new Error(`HTTP ${response.status}`); }
+        if (!response.ok || result.success === false) throw new Error(result.error || result.message || `系統處理失敗`);
+
+        if (result.archived) reportArchived = true;
+        if (result.archived && result.pushed) {
+          localStorage.removeItem(getDraftKey());
+          alert('日報已歸檔並發布至 LINE 群組');
+          if (window.liff && liff.isInClient()) liff.closeWindow();
+          return;
+        }
+        if (result.archived && result.reason === 'PROJECT_NOT_BOUND') {
+          submitButton.textContent = '日報已歸檔，尚未發布';
+          alert('日報已歸檔至 OneDrive，但案場尚未綁定 LINE。');
+          return;
+        }
+        if (result.archived && result.reason === 'LINE_PUSH_FAILED') {
+          submitButton.textContent = '日報已歸檔，發布失敗';
+          alert('日報已歸檔至 OneDrive，但 LINE 發布失敗。');
+          return;
+        }
+        alert(result.message || '日報處理完成');
+      } catch (error) {
+        alert(`傳送失敗：${error.message}`);
+      } finally {
+        isSubmitting = false;
+        if (!reportArchived) { submitButton.disabled = false; submitButton.textContent = '確認送出並發布至群組'; }
+      }
     }
-});
-
-app.get('/api/projects/:projectId', async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) return res.status(404).json({ success: false, reason: 'PROJECT_NOT_FOUND', error: '找不到指定案場' });
-        return res.status(200).json({ success: true, project: { projectId: project.projectId, projectName: project.projectName } });
-    } catch (error) {
-        console.error('讀取案場失敗：', error);
-        return res.status(500).json({ success: false, reason: 'INTERNAL_ERROR', error: '無法取得案場' });
-    }
-});
-
-app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
-
-app.post('/api/submit-report', async (req, res) => {
-    try {
-        const reportData = req.body || {}; 
-        const validation = validateReportData(reportData);
-        if (!validation.valid) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_REPORT_DATA', error: `缺少必要欄位：${validation.missingFields.join(', ')}` });
-
-        const submittedProjectId = String(reportData.projectId || '').trim();
-        let project = submittedProjectId ? await findProjectById(submittedProjectId) : await findProjectByName(reportData.projectName);
-        
-        if (!project) {
-            return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'PROJECT_NOT_FOUND', error: '找不到指定案場' });
-        }
-
-        const isNoWork = reportData.isNoWork === true;
-        
-        let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
-        if (!isNoWork) {
-            if (contractorItems.length === 0) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_CONTRACTOR_ITEMS', error: '請至少填寫一組有效廠商' });
-            
-            const contractorNameSet = new Set();
-            const validContractorItems = [];
-            
-            for (const item of contractorItems) {
-                const contractorName = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-                const workerCount = Number(item.workerCount);
-                
-                if (!contractorName) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_CONTRACTOR_NAME', error: '施工廠商名稱不可為空' });
-                if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) {
-                    return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_WORKER_COUNT', error: `廠商「${contractorName}」人數格式不正確` });
-                }
-                if (contractorNameSet.has(contractorName)) {
-                    return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'DUPLICATE_CONTRACTOR', error: `施工廠商「${contractorName}」重複填寫` });
-                }
-                
-                contractorNameSet.add(contractorName);
-                validContractorItems.push({ contractorName, workerCount });
-            }
-            contractorItems = validContractorItems;
-        } else {
-            contractorItems = [];
-        }
-
-        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
-
-        const safeProjectName = sanitizePathSegment(project.projectName);
-        const graphClient = await getGraphClient();
-        const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-
-        await ensureProjectFolder(project.projectName);
-        const [textFolderResult, dataFolderResult] = await Promise.all([
-            ensureChildFolder(graphClient, projectFolderPath, '施工日報'),
-            ensureChildFolder(graphClient, projectFolderPath, '結構化資料')
-        ]);
-
-        const { dateStr, timeStr } = getTaiwanDateParts();
-        
-        const submittedSubmissionId = String(reportData.submissionId || '').trim();
-        const fullSubmissionId = submittedSubmissionId || crypto.randomUUID();
-        const safeSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '');
-        const shortSubmissionId = safeSubmissionId.slice(0, 16);
-
-        if (!shortSubmissionId) throw new Error('無法產生日報識別碼');
-
-        const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
-        
-        let materialItems;
-        try {
-            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork);
-        } catch (materialError) {
-            return res.status(400).json({
-                success: false, archived: false, pushed: false,
-                reason: 'INVALID_MATERIAL_ITEMS', error: materialError.message
-            });
-        }
-
-        const structuredReport = {
-            schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: dateStr,
-            submissionId: fullSubmissionId, submittedAt: new Date().toISOString(), submittedDateLocal: dateStr, submittedTimeLocal: timeStr,
-            reporterName: String(reportData.reporterName || '未紀錄').trim(), // 💡 新增：紀錄填表人
-            isNoWork, noWorkReason: isNoWork ? String(reportData.noWorkReason || '') : '',
-            weather: { temp: reportData.temp, humidity: reportData.humidity, wind: reportData.wind },
-            contractorItems, totalWorkerCount: calculatedTotalWorkerCount, workItems: isNoWork ? [] : workItems,
-            customWorkItem: isNoWork ? '' : String(reportData.customWorkItem || ''), workNotes: isNoWork ? '' : String(reportData.workNotes || ''),
-            materialItems, remarks: String(reportData.remarks || '')
-        };
-
-        const baseFileName = `${dateStr}_${shortSubmissionId}`;
-        const jsonFilePath = `${dataFolderResult.folderPath}/${baseFileName}.json`;
-        const txtFilePath = `${textFolderResult.folderPath}/${baseFileName}_施工日報.txt`;
-
-        try {
-            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8'));
-        } catch (jsonUploadError) {
-            console.error('[Error] 結構化 JSON 寫入失敗：', jsonUploadError);
-            throw new Error('結構化日報寫入失敗');
-        }
-
-        // 💡 修改 LINE 回報文字，加入填表人
-        const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
-        let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
-        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
-
-        const config = await readBindingsFromOneDrive();
-        const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.projectId === project.projectId && b.active);
-
-        if (!binding) return res.status(200).json({ success: true, archived: true, pushed: false, reason: 'PROJECT_NOT_BOUND' });
-
-        try {
-            await pushLineMessage(binding.groupId, reportText);
-            return res.status(200).json({ success: true, archived: true, pushed: true, message: '日報已歸檔並發布' });
-        } catch (lineError) {
-            return res.status(200).json({ success: true, archived: true, pushed: false, reason: 'LINE_PUSH_FAILED' });
-        }
-    } catch (error) {
-        if (!res.headersSent) return res.status(500).json({ success: false, archived: false, pushed: false, reason: 'INTERNAL_ERROR', error: '系統處理失敗' });
-    }
-});
-
-const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET', 'STATS_API_KEY'];
-if (requiredVars.some(v => !process.env[v])) process.exit(1);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+  </script>
+</body>
+</html>
