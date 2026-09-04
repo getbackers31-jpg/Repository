@@ -24,20 +24,44 @@ const msalConfig = {
 };
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
-// ⚡ 效能大補丸 1：Token 與 Graph Client 實例快取
+// 🛡️ Token 請求鎖與邊界保護
 let cachedGraphClient = null;
-let tokenExpiresAt = null;
+let tokenExpiresAt = 0;
+let graphClientPromise = null;
+
 async function getGraphClient() {
-    if (!cachedGraphClient || Date.now() >= tokenExpiresAt) {
-        const tokenRequest = { scopes: ['https://graph.microsoft.com/.default'] };
-        try {
-            const response = await cca.acquireTokenByClientCredential(tokenRequest);
-            // 提早 5 分鐘過期，確保 Token 安全
-            tokenExpiresAt = response.expiresOn ? response.expiresOn.getTime() - 5 * 60000 : Date.now() + 50 * 60000;
-            cachedGraphClient = Client.init({ authProvider: (done) => { done(null, response.accessToken); } });
-        } catch (error) { throw error; }
+    const now = Date.now();
+    if (cachedGraphClient && now < tokenExpiresAt) {
+        return cachedGraphClient;
     }
-    return cachedGraphClient;
+    if (graphClientPromise) {
+        return graphClientPromise;
+    }
+
+    graphClientPromise = (async () => {
+        try {
+            const response = await cca.acquireTokenByClientCredential({
+                scopes: ['https://graph.microsoft.com/.default']
+            });
+            if (!response || !response.accessToken) {
+                throw new Error('Microsoft Graph Token 取得失敗');
+            }
+            const expiresAt = response.expiresOn ? response.expiresOn.getTime() : Date.now() + 50 * 60 * 1000;
+            tokenExpiresAt = Math.max(Date.now() + 60 * 1000, expiresAt - 5 * 60 * 1000);
+            
+            cachedGraphClient = Client.init({
+                authProvider(done) { done(null, response.accessToken); }
+            });
+            return cachedGraphClient;
+        } catch (error) {
+            cachedGraphClient = null;
+            tokenExpiresAt = 0;
+            throw error;
+        } finally {
+            graphClientPromise = null;
+        }
+    })();
+    return graphClientPromise;
 }
 
 function sanitizePathSegment(value) { return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); }
@@ -52,8 +76,7 @@ function validateProjectName(projectName) {
 function getProjectRegistrationErrorMessage(error) {
     const safeMessages = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
     const message = String(error?.message || '');
-    const isSafeMessage = safeMessages.some(prefix => message.startsWith(prefix));
-    return isSafeMessage ? message : '系統暫時無法建立案場，請稍後再試';
+    return safeMessages.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
 }
 
 let projectWriteQueue = Promise.resolve();
@@ -94,29 +117,41 @@ async function writeJsonToOneDrive(filePath, data) {
     await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
 }
 
-// ⚡ 效能大補丸 2-1：OneDrive 讀取記憶體快取 (60秒 TTL)
-const CACHE_TTL = 60 * 1000;
+function cloneJsonData(data) {
+    return JSON.parse(JSON.stringify(data));
+}
+
+const CACHE_TTL = 30 * 1000;
 const configCache = { projects: { data: null, timestamp: 0 }, bindings: { data: null, timestamp: 0 } };
 
 async function readProjectsFromOneDrive() {
-    if (configCache.projects.data && Date.now() - configCache.projects.timestamp < CACHE_TTL) return configCache.projects.data;
+    const cache = configCache.projects;
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
+        return cloneJsonData(cache.data);
+    }
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
-    configCache.projects = { data, timestamp: Date.now() };
-    return data;
+    configCache.projects = { data: cloneJsonData(data), timestamp: Date.now() };
+    return cloneJsonData(data);
 }
+
 async function writeProjectsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
-    configCache.projects = { data: config, timestamp: Date.now() };
+    configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
 }
+
 async function readBindingsFromOneDrive() {
-    if (configCache.bindings.data && Date.now() - configCache.bindings.timestamp < CACHE_TTL) return configCache.bindings.data;
+    const cache = configCache.bindings;
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
+        return cloneJsonData(cache.data);
+    }
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
-    configCache.bindings = { data, timestamp: Date.now() };
-    return data;
+    configCache.bindings = { data: cloneJsonData(data), timestamp: Date.now() };
+    return cloneJsonData(data);
 }
+
 async function writeBindingsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
-    configCache.bindings = { data: config, timestamp: Date.now() };
+    configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
 }
 
 async function ensureProjectFolder(projectName) {
@@ -248,6 +283,42 @@ function validateReportData(reportData) {
     return { valid: missingFields.length === 0, missingFields };
 }
 
+// 🛡️ 新增：材料後端換算與驗證函式
+function normalizeMaterialItems(rawItems, isNoWork) {
+    if (isNoWork) return [];
+    if (!Array.isArray(rawItems)) return [];
+    
+    const allowedStockUnits = new Set(['桶', '組', '支', '公斤', '公升', '個', '捲']);
+    
+    return rawItems.map((item, index) => {
+        const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+        const quantity = Number(item.quantity);
+        const stockUnit = String(item.stockUnit || '').trim();
+        const packageQuantity = item.packageQuantity == null ? null : Number(item.packageQuantity);
+        const packageUnit = item.packageUnit == null ? null : String(item.packageUnit).trim();
+        
+        if (!materialName) throw new Error(`第 ${index + 1} 筆材料名稱不可為空`);
+        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`第 ${index + 1} 筆材料數量不正確`);
+        if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
+        
+        let baseQuantity = quantity;
+        let baseUnit = stockUnit;
+        
+        if (stockUnit === '桶' && packageUnit === '加侖') {
+            if (packageQuantity !== 1 && packageQuantity !== 5) {
+                throw new Error(`第 ${index + 1} 筆桶裝容量不正確`);
+            }
+            baseQuantity = quantity * packageQuantity;
+            baseUnit = '加侖';
+        }
+        
+        return {
+            materialId: null, materialName, quantity, stockUnit,
+            packageQuantity, packageUnit, baseQuantity, baseUnit
+        };
+    });
+}
+
 // ==========================================
 // 👇 核心統計引擎 (可供 API 與結案指令共用) 👇
 // ==========================================
@@ -276,27 +347,30 @@ async function generateProjectStats(project) {
 
     const reports = [];
     const invalidFiles = [];
+    const DOWNLOAD_CONCURRENCY = 10;
     
-    // ⚡ 效能大補丸 3：分批平行下載 JSON (解決 N+1 與防範 429 請求過多)
-    const CHUNK_SIZE = 20;
-    for (let i = 0; i < allItems.length; i += CHUNK_SIZE) {
-        const chunk = allItems.slice(i, i + CHUNK_SIZE);
-        const chunkPromises = chunk.map(async (file) => {
+    for (let i = 0; i < allItems.length; i += DOWNLOAD_CONCURRENCY) {
+        const chunk = allItems.slice(i, i + DOWNLOAD_CONCURRENCY);
+        const chunkResults = await Promise.all(chunk.map(async file => {
             try {
                 const downloadUrl = file['@microsoft.graph.downloadUrl'];
                 if (!downloadUrl) throw new Error('缺少下載網址');
                 const response = await fetch(downloadUrl);
                 if (!response.ok) throw new Error(`下載失敗 HTTP ${response.status}`);
-                return await response.json();
+                return { success: true, report: await response.json() };
             } catch (error) {
-                console.error(`統計資料讀取失敗：${file.name}`, error);
-                invalidFiles.push({ fileName: file.name, error: String(error.message || '未知錯誤') });
-                return null;
+                return { success: false, fileName: file.name, error: String(error.message || '未知錯誤') };
             }
-        });
+        }));
 
-        const chunkResults = await Promise.all(chunkPromises);
-        reports.push(...chunkResults.filter(r => r !== null));
+        for (const result of chunkResults) {
+            if (result.success) {
+                reports.push(result.report);
+            } else {
+                console.error(`統計資料讀取失敗：${result.fileName}`, result.error);
+                invalidFiles.push({ fileName: result.fileName, error: result.error });
+            }
+        }
     }
 
     const latestReportsMap = new Map();
@@ -351,16 +425,18 @@ async function generateProjectStats(project) {
             stats.totalManDays += Number(report.totalWorkerCount) || 0;
 
             if (Array.isArray(report.contractorItems)) {
-                report.contractorItems.forEach(item => {
-                    const name = String(item.contractorName || '未知廠商').trim();
-                    const count = Number(item.workerCount) || 0;
-                    
-                    if (!stats.contractorStats[name]) {
-                        stats.contractorStats[name] = { manDays: 0, workDays: 0 };
-                    }
+                const dailyContractors = new Map();
+                for (const item of report.contractorItems) {
+                    const name = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+                    const count = Number(item.workerCount);
+                    if (!name || !Number.isFinite(count) || count <= 0) continue;
+                    dailyContractors.set(name, (dailyContractors.get(name) || 0) + count);
+                }
+                for (const [name, count] of dailyContractors.entries()) {
+                    if (!stats.contractorStats[name]) stats.contractorStats[name] = { manDays: 0, workDays: 0 };
                     stats.contractorStats[name].manDays += count;
                     stats.contractorStats[name].workDays += 1;
-                });
+                }
             }
 
             if (Array.isArray(report.workItems)) {
@@ -381,9 +457,7 @@ async function generateProjectStats(project) {
                     const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
                     const baseUnit = String(item.baseUnit || '').trim();
                     const baseQuantity = Number(item.baseQuantity);
-
                     if (!materialName || !baseUnit || !Number.isFinite(baseQuantity) || baseQuantity <= 0) return;
-
                     const key = `${materialName} (${baseUnit})`;
                     stats.materialStats[key] = (stats.materialStats[key] || 0) + baseQuantity;
                 });
@@ -410,7 +484,6 @@ function verifyStatsApiKey(req, res, next) {
     next();
 }
 
-
 app.get('/api/projects', async (req, res) => {
     try {
         const config = await readProjectsFromOneDrive();
@@ -434,7 +507,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     try { body = JSON.parse(req.body.toString('utf8')); } 
     catch (error) { return res.status(400).send('Invalid JSON'); }
     
-    // LINE Webhook 逾時解耦：先回覆 OK，再慢慢算
     res.status(200).send('OK');
 
     for (const event of body.events || []) {
@@ -700,16 +772,31 @@ app.post('/api/submit-report', async (req, res) => {
         }
 
         const isNoWork = reportData.isNoWork === true;
+        
+        // 🛡️ 修正 4：新增後端重複廠商驗證機制
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
-
         if (!isNoWork) {
             if (contractorItems.length === 0) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_CONTRACTOR_ITEMS', error: '請至少填寫一組有效廠商' });
+            
+            const contractorNameSet = new Set();
+            const validContractorItems = [];
+            
             for (const item of contractorItems) {
-                const contractorName = String(item.contractorName || '').trim();
+                const contractorName = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
                 const workerCount = Number(item.workerCount);
+                
                 if (!contractorName) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_CONTRACTOR_NAME', error: '施工廠商名稱不可為空' });
-                if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_WORKER_COUNT', error: `廠商「${contractorName}」人數格式不正確` });
+                if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) {
+                    return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_WORKER_COUNT', error: `廠商「${contractorName}」人數格式不正確` });
+                }
+                if (contractorNameSet.has(contractorName)) {
+                    return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'DUPLICATE_CONTRACTOR', error: `施工廠商「${contractorName}」重複填寫` });
+                }
+                
+                contractorNameSet.add(contractorName);
+                validContractorItems.push({ contractorName, workerCount });
             }
+            contractorItems = validContractorItems; // 替換為驗證且正規化後的陣列
         } else {
             contractorItems = [];
         }
@@ -720,7 +807,6 @@ app.post('/api/submit-report', async (req, res) => {
         const graphClient = await getGraphClient();
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
 
-        // ⚡ 效能大補丸 2-2：同時建立兩個資料夾 (Promise.all 平行處理)
         await ensureProjectFolder(project.projectName);
         const [textFolderResult, dataFolderResult] = await Promise.all([
             ensureChildFolder(graphClient, projectFolderPath, '施工日報'),
@@ -737,7 +823,17 @@ app.post('/api/submit-report', async (req, res) => {
         if (!shortSubmissionId) throw new Error('無法產生日報識別碼');
 
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
-        const materialItems = Array.isArray(reportData.materialItems) ? reportData.materialItems : [];
+        
+        // 🛡️ 整合修正：使用更嚴謹的材料正規化函式處理
+        let materialItems;
+        try {
+            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork);
+        } catch (materialError) {
+            return res.status(400).json({
+                success: false, archived: false, pushed: false,
+                reason: 'INVALID_MATERIAL_ITEMS', error: materialError.message
+            });
+        }
 
         const structuredReport = {
             schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: dateStr,
@@ -746,7 +842,7 @@ app.post('/api/submit-report', async (req, res) => {
             weather: { temp: reportData.temp, humidity: reportData.humidity, wind: reportData.wind },
             contractorItems, totalWorkerCount: calculatedTotalWorkerCount, workItems: isNoWork ? [] : workItems,
             customWorkItem: isNoWork ? '' : String(reportData.customWorkItem || ''), workNotes: isNoWork ? '' : String(reportData.workNotes || ''),
-            materialItems: isNoWork ? [] : materialItems, remarks: String(reportData.remarks || '')
+            materialItems, remarks: String(reportData.remarks || '')
         };
 
         const baseFileName = `${dateStr}_${shortSubmissionId}`;
