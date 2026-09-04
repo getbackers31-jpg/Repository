@@ -13,8 +13,6 @@ const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
 const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
-
-// 🛑 必修一：移除硬編碼的密碼，強制使用環境變數
 const STATS_API_KEY = process.env.STATS_API_KEY;
 
 const msalConfig = {
@@ -340,7 +338,12 @@ async function generateProjectStats(project) {
                 report.contractorItems.forEach(item => {
                     const name = String(item.contractorName || '未知廠商').trim();
                     const count = Number(item.workerCount) || 0;
-                    stats.contractorStats[name] = (stats.contractorStats[name] || 0) + count;
+                    
+                    if (!stats.contractorStats[name]) {
+                        stats.contractorStats[name] = { manDays: 0, workDays: 0 };
+                    }
+                    stats.contractorStats[name].manDays += count;
+                    stats.contractorStats[name].workDays += 1;
                 });
             }
 
@@ -374,7 +377,7 @@ async function generateProjectStats(project) {
 
     const dataQuality = {
         sourceFileCount: allItems.length,
-        parsedFileCount: reports.length, // 修正命名
+        parsedFileCount: reports.length,
         invalidFileCount: invalidFiles.length,
         effectiveReportCount: validReports.length,
         supersededReportCount: supersededCount
@@ -512,15 +515,14 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         
                         let msg = `【${project.projectName}】累計統計表\n`;
                         msg += `━━━━━━━━━━━━\n`;
-                        msg += `已填報天數：${stats.totalDays} 天\n`;
-                        msg += `有出工天數：${stats.workDays} 天\n`;
-                        msg += `無出工天數：${stats.noWorkDays} 天\n`;
+                        msg += `實際工作天：${stats.workDays} 天\n`;
+                        msg += `免計工作天：${stats.noWorkDays} 天\n`;
                         msg += `全案總人天：${stats.totalManDays} 人天\n\n`;
 
-                        msg += `[ 廠商累計出工 ]\n`;
+                        msg += `[ 各廠商出工統計 ]\n`;
                         if (Object.keys(stats.contractorStats).length === 0) msg += ` • 無紀錄\n`;
-                        for (const [name, count] of Object.entries(stats.contractorStats)) {
-                            msg += ` • ${name}：${count} 人天\n`;
+                        for (const [name, data] of Object.entries(stats.contractorStats)) {
+                            msg += ` • ${name}：${data.workDays} 工作天 (${data.manDays} 人天)\n`;
                         }
 
                         msg += `\n[ 材料累計消耗 ]\n`;
@@ -532,7 +534,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         msg += `━━━━━━━━━━━━\n`;
                         msg += `* 資料計算至最新一份日報`;
 
-                        // 加入資料品質警告
                         if (result.dataQuality) {
                             if (result.dataQuality.invalidFileCount > 0) {
                                 msg += `\n⚠️ 注意：發現 ${result.dataQuality.invalidFileCount} 份資料異常，統計可能不完整`;
@@ -579,7 +580,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         
                         const closingProject = projects[projectIndex];
 
-                        // 🛑 必修二：阻斷式結案防護 🛑
                         let finalStatsResult;
                         try {
                             finalStatsResult = await generateProjectStats(closingProject);
@@ -612,13 +612,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             await replyLineMessage(event.replyToken, ['⚠️ 結案失敗', '', '系統無法完成最終統計或寫入統計檔。', '案場尚未下架，群組綁定也未解除。', '', '請稍後再試。'].join('\n'));
                             return;
                         }
-                        // 👆 阻斷式結案防護結束
 
-                        // 統計完美產出後，才准許下架與刪除
                         projects.splice(projectIndex, 1);
                         await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
-                        // 🛑 必修三：結案解除綁定改用 projectId 🛑
                         await withBindingWriteLock(async () => {
                             const latestBindingConfig = await readBindingsFromOneDrive();
                             const latestBindings = Array.isArray(latestBindingConfig.bindings) ? latestBindingConfig.bindings : [];
@@ -766,7 +763,6 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-// 🛑 請至 Render 後台設定 STATS_API_KEY 環境變數 (不要用 cyber-cloud-2026) 🛑
 const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET', 'STATS_API_KEY'];
 if (requiredVars.some(v => !process.env[v])) process.exit(1);
 
