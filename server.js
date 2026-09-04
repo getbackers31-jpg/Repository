@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const msal = require('@azure/msal-node');
 const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
+const ExcelJS = require('exceljs');
 
 const app = express();
 app.use(cors());
@@ -24,7 +25,6 @@ const msalConfig = {
 };
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
-// 🛡️ Token 請求鎖與邊界保護
 let cachedGraphClient = null;
 let tokenExpiresAt = 0;
 let graphClientPromise = null;
@@ -283,7 +283,6 @@ function validateReportData(reportData) {
     return { valid: missingFields.length === 0, missingFields };
 }
 
-// 🛡️ 新增：材料後端換算與驗證函式
 function normalizeMaterialItems(rawItems, isNoWork) {
     if (isNoWork) return [];
     if (!Array.isArray(rawItems)) return [];
@@ -319,9 +318,6 @@ function normalizeMaterialItems(rawItems, isNoWork) {
     });
 }
 
-// ==========================================
-// 👇 核心統計引擎 (可供 API 與結案指令共用) 👇
-// ==========================================
 async function generateProjectStats(project) {
     const safeProjectName = sanitizePathSegment(project.projectName);
     const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
@@ -340,7 +336,7 @@ async function generateProjectStats(project) {
         }
     } catch (error) {
         if (error.statusCode === 404 || error.code === 'itemNotFound') {
-            return { error: '尚無日報資料或資料夾不存在', dataQuality: null, stats: null };
+            return { error: '尚無日報資料或資料夾不存在', dataQuality: null, stats: null, reports: [] };
         }
         throw error;
     }
@@ -402,6 +398,7 @@ async function generateProjectStats(project) {
     }
 
     const validReports = Array.from(latestReportsMap.values());
+    validReports.sort((a, b) => a.reportDate.localeCompare(b.reportDate));
 
     const stats = {
         totalDays: validReports.length,
@@ -473,7 +470,7 @@ async function generateProjectStats(project) {
         supersededReportCount: supersededCount
     };
 
-    return { stats, dataQuality, warnings: invalidFiles };
+    return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
 function verifyStatsApiKey(req, res, next) {
@@ -680,24 +677,129 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             }
 
                             const { dateStr, timeStr } = getTaiwanDateParts();
-                            const statsFileName = `結案統計_${dateStr.replace(/-/g, '')}_${timeStr}.json`;
                             const safeProjectName = sanitizePathSegment(closingProject.projectName);
                             const graphClient = await getGraphClient();
-                            const statsFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}`;
                             
+                            // 1. 儲存 JSON 結案檔 (系統備份用)
+                            const statsFileName = `結案統計_${dateStr.replace(/-/g, '')}_${timeStr}.json`;
+                            const statsFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}`;
                             const statsBuffer = Buffer.from(JSON.stringify({
                                 schemaVersion: 1, projectId: closingProject.projectId, projectName: closingProject.projectName,
                                 generatedAt: new Date().toISOString(), ...finalStatsResult
                             }, null, 2), 'utf-8');
-                            
                             await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${statsFilePath}:/content`).put(statsBuffer);
 
+                            // ==========================================
+                            // 🚀 終極魔法：產出 Excel 結案報表
+                            // ==========================================
+                            const workbook = new ExcelJS.Workbook();
+                            workbook.creator = '云說工程小幫手';
+                            workbook.created = new Date();
+
+                            // 分頁 1：案場總表
+                            const summarySheet = workbook.addWorksheet('案場總表');
+                            summarySheet.columns = [
+                                { header: '統計項目', key: 'item', width: 25 },
+                                { header: '數據', key: 'value', width: 40 }
+                            ];
+                            summarySheet.addRow({ item: '案場名稱', value: closingProject.projectName });
+                            summarySheet.addRow({ item: '結案日期', value: dateStr });
+                            summarySheet.addRow({ item: '累計日曆天', value: `${finalStatsResult.stats.totalDays} 天` });
+                            summarySheet.addRow({ item: '實際工作天', value: `${finalStatsResult.stats.workDays} 天` });
+                            summarySheet.addRow({ item: '免計工作天', value: `${finalStatsResult.stats.noWorkDays} 天` });
+                            summarySheet.addRow({ item: '全案總人天', value: `${finalStatsResult.stats.totalManDays} 人天` });
+                            summarySheet.addRow({ item: '', value: '' });
+                            summarySheet.addRow({ item: '【各廠商出工統計】', value: '' });
+                            for (const [name, data] of Object.entries(finalStatsResult.stats.contractorStats)) {
+                                summarySheet.addRow({ item: ` • ${name}`, value: `${data.workDays} 工作天 (${data.manDays} 人天)` });
+                            }
+
+                            // 分頁 2：材料累計消耗 (純淨版)
+                            const inventorySheet = workbook.addWorksheet('材料累計消耗');
+                            inventorySheet.columns = [
+                                { header: '材料名稱', key: 'name', width: 25 },
+                                { header: '單位', key: 'unit', width: 15 },
+                                { header: '現場累計消耗', key: 'used', width: 20 },
+                                { header: '備註', key: 'remarks', width: 40 }
+                            ];
+                            for (const [key, qty] of Object.entries(finalStatsResult.stats.materialStats)) {
+                                const match = key.match(/(.+?)\s+\((.+)\)/);
+                                const name = match ? match[1] : key;
+                                const unit = match ? match[2] : '';
+                                inventorySheet.addRow({
+                                    name: name,
+                                    unit: unit,
+                                    used: qty,
+                                    remarks: ''
+                                });
+                            }
+
+                            // 分頁 3：材料進出紀錄
+                            const materialLogSheet = workbook.addWorksheet('材料進出紀錄');
+                            materialLogSheet.columns = [
+                                { header: '日期', key: 'date', width: 15 },
+                                { header: '材料名稱', key: 'name', width: 25 },
+                                { header: '單位', key: 'unit', width: 15 },
+                                { header: '使用數量', key: 'used_qty', width: 15 },
+                                { header: '日報備註', key: 'remarks', width: 50 }
+                            ];
+                            for (const r of finalStatsResult.reports) {
+                                if (!r.isNoWork && Array.isArray(r.materialItems)) {
+                                    for (const m of r.materialItems) {
+                                        materialLogSheet.addRow({
+                                            date: r.reportDate,
+                                            name: m.materialName,
+                                            unit: m.baseUnit,
+                                            used_qty: m.baseQuantity,
+                                            remarks: r.remarks || r.workNotes || ''
+                                        });
+                                    }
+                                }
+                            }
+
+                            // 分頁 4：施工日報明細
+                            const dailyLogSheet = workbook.addWorksheet('日報明細');
+                            dailyLogSheet.columns = [
+                                { header: '日期', key: 'date', width: 15 },
+                                { header: '出工狀態', key: 'status', width: 15 },
+                                { header: '出工人數', key: 'workers', width: 15 },
+                                { header: '施作項目', key: 'work_items', width: 40 },
+                                { header: '日報備註', key: 'remarks', width: 50 }
+                            ];
+                            for (const r of finalStatsResult.reports) {
+                                let itemsStr = Array.isArray(r.workItems) ? r.workItems.join('、') : '';
+                                if (r.customWorkItem) itemsStr += ` (${r.customWorkItem})`;
+                                dailyLogSheet.addRow({
+                                    date: r.reportDate,
+                                    status: r.isNoWork ? `停工 (${r.noWorkReason})` : '施工',
+                                    workers: r.totalWorkerCount || 0,
+                                    work_items: itemsStr,
+                                    remarks: r.remarks || ''
+                                });
+                            }
+
+                            // 表頭美化與樣式
+                            workbook.eachSheet((sheet) => {
+                                const headerRow = sheet.getRow(1);
+                                headerRow.font = { bold: true, color: { arg: 'FFFFFFFF' } };
+                                headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { arg: 'FF4F81BD' } };
+                                headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+                            });
+
+                            // 將 Excel 轉為 Buffer 並上傳到 OneDrive
+                            const excelBufferArray = await workbook.xlsx.writeBuffer();
+                            const excelBuffer = Buffer.from(excelBufferArray);
+                            const excelFileName = `結案總表_${safeProjectName}_${dateStr.replace(/-/g, '')}.xlsx`;
+                            const excelFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${excelFileName}`;
+                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${excelFilePath}:/content`).put(excelBuffer);
+
                         } catch (statErr) {
-                            console.error('結案統計產生或儲存失敗：', statErr);
-                            await replyLineMessage(event.replyToken, ['⚠️ 結案失敗', '', '系統無法完成最終統計或寫入統計檔。', '案場尚未下架，群組綁定也未解除。', '', '請稍後再試。'].join('\n'));
+                            console.error('結案報表產生或儲存失敗：', statErr);
+                            await replyLineMessage(event.replyToken, ['⚠️ 結案失敗', '', '系統無法完成最終統計或寫入報表檔。', '案場尚未下架，群組綁定也未解除。', '', '請稍後再試。'].join('\n'));
                             return;
                         }
 
+                        // 下架案場與解除綁定
                         projects.splice(projectIndex, 1);
                         await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
@@ -708,7 +810,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             await writeBindingsToOneDrive({ ...latestBindingConfig, bindings: filteredBindings, updatedAt: new Date().toISOString() });
                         });
 
-                        await replyLineMessage(event.replyToken, `✅ 案場「${targetProjectName}」已成功結案！\n\n系統已自動產生無異常之最終統計報表，並存入您的 OneDrive 資料夾中。`);
+                        await replyLineMessage(event.replyToken, `✅ 案場「${targetProjectName}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
                     });
                 }
                 else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
@@ -773,7 +875,6 @@ app.post('/api/submit-report', async (req, res) => {
 
         const isNoWork = reportData.isNoWork === true;
         
-        // 🛡️ 修正 4：新增後端重複廠商驗證機制
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
         if (!isNoWork) {
             if (contractorItems.length === 0) return res.status(400).json({ success: false, archived: false, pushed: false, reason: 'INVALID_CONTRACTOR_ITEMS', error: '請至少填寫一組有效廠商' });
@@ -796,7 +897,7 @@ app.post('/api/submit-report', async (req, res) => {
                 contractorNameSet.add(contractorName);
                 validContractorItems.push({ contractorName, workerCount });
             }
-            contractorItems = validContractorItems; // 替換為驗證且正規化後的陣列
+            contractorItems = validContractorItems;
         } else {
             contractorItems = [];
         }
@@ -824,7 +925,6 @@ app.post('/api/submit-report', async (req, res) => {
 
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
         
-        // 🛡️ 整合修正：使用更嚴謹的材料正規化函式處理
         let materialItems;
         try {
             materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork);
