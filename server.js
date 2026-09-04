@@ -31,27 +31,16 @@ let graphClientPromise = null;
 
 async function getGraphClient() {
     const now = Date.now();
-    if (cachedGraphClient && now < tokenExpiresAt) {
-        return cachedGraphClient;
-    }
-    if (graphClientPromise) {
-        return graphClientPromise;
-    }
+    if (cachedGraphClient && now < tokenExpiresAt) return cachedGraphClient;
+    if (graphClientPromise) return graphClientPromise;
 
     graphClientPromise = (async () => {
         try {
-            const response = await cca.acquireTokenByClientCredential({
-                scopes: ['https://graph.microsoft.com/.default']
-            });
-            if (!response || !response.accessToken) {
-                throw new Error('Microsoft Graph Token 取得失敗');
-            }
+            const response = await cca.acquireTokenByClientCredential({ scopes: ['https://graph.microsoft.com/.default'] });
+            if (!response || !response.accessToken) throw new Error('Microsoft Graph Token 取得失敗');
             const expiresAt = response.expiresOn ? response.expiresOn.getTime() : Date.now() + 50 * 60 * 1000;
             tokenExpiresAt = Math.max(Date.now() + 60 * 1000, expiresAt - 5 * 60 * 1000);
-            
-            cachedGraphClient = Client.init({
-                authProvider(done) { done(null, response.accessToken); }
-            });
+            cachedGraphClient = Client.init({ authProvider(done) { done(null, response.accessToken); } });
             return cachedGraphClient;
         } catch (error) {
             cachedGraphClient = null;
@@ -117,18 +106,19 @@ async function writeJsonToOneDrive(filePath, data) {
     await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
 }
 
-function cloneJsonData(data) {
-    return JSON.parse(JSON.stringify(data));
-}
+function cloneJsonData(data) { return JSON.parse(JSON.stringify(data)); }
 
 const CACHE_TTL = 30 * 1000;
-const configCache = { projects: { data: null, timestamp: 0 }, bindings: { data: null, timestamp: 0 } };
+const configCache = { 
+    projects: { data: null, timestamp: 0 }, 
+    bindings: { data: null, timestamp: 0 },
+    globalMaterials: { data: null, timestamp: 0 },
+    projMaterials: {}
+};
 
 async function readProjectsFromOneDrive() {
     const cache = configCache.projects;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
     configCache.projects = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
@@ -141,9 +131,7 @@ async function writeProjectsToOneDrive(config) {
 
 async function readBindingsFromOneDrive() {
     const cache = configCache.bindings;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
     configCache.bindings = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
@@ -152,6 +140,28 @@ async function readBindingsFromOneDrive() {
 async function writeBindingsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
     configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
+}
+
+async function readGlobalMaterials() {
+    const cache = configCache.globalMaterials;
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
+    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/materials.json', { materials: [] }, false);
+    configCache.globalMaterials = { data: cloneJsonData(data), timestamp: Date.now() };
+    return cloneJsonData(data);
+}
+
+async function readProjectMaterials(projectName) {
+    const safeName = sanitizePathSegment(projectName);
+    const cache = configCache.projMaterials[safeName];
+    if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
+    try {
+        const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
+        if (data && Array.isArray(data.materials)) {
+            configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
+            return cloneJsonData(data);
+        }
+    } catch (e) {}
+    return null;
 }
 
 async function ensureProjectFolder(projectName) {
@@ -409,7 +419,8 @@ async function generateProjectStats(project) {
         materialStats: {},
         workItemsStats: {},
         customWorkItemsStats: {},
-        noWorkReasons: {}
+        noWorkReasons: {},
+        reporterStats: {} // 💡 新增：紀錄填表人的出工天數
     };
 
     for (const report of validReports) {
@@ -420,6 +431,10 @@ async function generateProjectStats(project) {
         } else {
             stats.workDays++;
             stats.totalManDays += Number(report.totalWorkerCount) || 0;
+
+            // 💡 統計填表人 (帶班主管) 的出工天數
+            const reporter = String(report.reporterName || '未紀錄').trim();
+            stats.reporterStats[reporter] = (stats.reporterStats[reporter] || 0) + 1;
 
             if (Array.isArray(report.contractorItems)) {
                 const dailyContractors = new Map();
@@ -493,6 +508,27 @@ app.get('/api/projects', async (req, res) => {
     } catch (error) {
         console.error('讀取案場清單失敗：', error);
         return res.status(500).json({ success: false, error: '無法取得案場清單' });
+    }
+});
+
+app.get('/api/materials', async (req, res) => {
+    const projectId = req.query.projectId;
+    try {
+        if (projectId) {
+            const project = await findProjectById(projectId);
+            if (project) {
+                const customConfig = await readProjectMaterials(project.projectName);
+                if (customConfig && Array.isArray(customConfig.materials)) {
+                    return res.status(200).json({ success: true, materials: customConfig.materials, type: 'project' });
+                }
+            }
+        }
+        const globalConfig = await readGlobalMaterials();
+        const materials = Array.isArray(globalConfig.materials) ? globalConfig.materials : [];
+        return res.status(200).json({ success: true, materials, type: 'global' });
+    } catch (error) {
+        console.error('讀取材料清單失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得材料清單' });
     }
 });
 
@@ -680,7 +716,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             const safeProjectName = sanitizePathSegment(closingProject.projectName);
                             const graphClient = await getGraphClient();
                             
-                            // 1. 儲存 JSON 結案檔 (系統備份用)
                             const statsFileName = `結案統計_${dateStr.replace(/-/g, '')}_${timeStr}.json`;
                             const statsFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}`;
                             const statsBuffer = Buffer.from(JSON.stringify({
@@ -689,32 +724,38 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             }, null, 2), 'utf-8');
                             await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${statsFilePath}:/content`).put(statsBuffer);
 
-                            // ==========================================
-                            // 🚀 終極魔法：產出 Excel 結案報表
-                            // ==========================================
                             const workbook = new ExcelJS.Workbook();
                             workbook.creator = '云說工程小幫手';
                             workbook.created = new Date();
 
-                            // 分頁 1：案場總表
+                            // 💡 Excel 總表新增：開案日期 與 填表人出工統計
                             const summarySheet = workbook.addWorksheet('案場總表');
                             summarySheet.columns = [
                                 { header: '統計項目', key: 'item', width: 25 },
                                 { header: '數據', key: 'value', width: 40 }
                             ];
+                            const startDateStr = finalStatsResult.reports.length > 0 ? finalStatsResult.reports[0].reportDate : '無紀錄';
+                            
                             summarySheet.addRow({ item: '案場名稱', value: closingProject.projectName });
+                            summarySheet.addRow({ item: '開案日期', value: startDateStr });
                             summarySheet.addRow({ item: '結案日期', value: dateStr });
                             summarySheet.addRow({ item: '累計日曆天', value: `${finalStatsResult.stats.totalDays} 天` });
                             summarySheet.addRow({ item: '實際工作天', value: `${finalStatsResult.stats.workDays} 天` });
                             summarySheet.addRow({ item: '免計工作天', value: `${finalStatsResult.stats.noWorkDays} 天` });
                             summarySheet.addRow({ item: '全案總人天', value: `${finalStatsResult.stats.totalManDays} 人天` });
+                            
+                            summarySheet.addRow({ item: '', value: '' });
+                            summarySheet.addRow({ item: '【各人員填表(帶班)天數】', value: '' });
+                            for (const [name, days] of Object.entries(finalStatsResult.stats.reporterStats)) {
+                                summarySheet.addRow({ item: ` • ${name}`, value: `${days} 工作天` });
+                            }
+
                             summarySheet.addRow({ item: '', value: '' });
                             summarySheet.addRow({ item: '【各廠商出工統計】', value: '' });
                             for (const [name, data] of Object.entries(finalStatsResult.stats.contractorStats)) {
                                 summarySheet.addRow({ item: ` • ${name}`, value: `${data.workDays} 工作天 (${data.manDays} 人天)` });
                             }
 
-                            // 分頁 2：材料累計消耗 (純淨版)
                             const inventorySheet = workbook.addWorksheet('材料累計消耗');
                             inventorySheet.columns = [
                                 { header: '材料名稱', key: 'name', width: 25 },
@@ -726,15 +767,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 const match = key.match(/(.+?)\s+\((.+)\)/);
                                 const name = match ? match[1] : key;
                                 const unit = match ? match[2] : '';
-                                inventorySheet.addRow({
-                                    name: name,
-                                    unit: unit,
-                                    used: qty,
-                                    remarks: ''
-                                });
+                                inventorySheet.addRow({ name: name, unit: unit, used: qty, remarks: '' });
                             }
 
-                            // 分頁 3：材料進出紀錄
                             const materialLogSheet = workbook.addWorksheet('材料進出紀錄');
                             materialLogSheet.columns = [
                                 { header: '日期', key: 'date', width: 15 },
@@ -757,10 +792,11 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 }
                             }
 
-                            // 分頁 4：施工日報明細
+                            // 💡 Excel 日報明細新增：填表人 欄位
                             const dailyLogSheet = workbook.addWorksheet('日報明細');
                             dailyLogSheet.columns = [
                                 { header: '日期', key: 'date', width: 15 },
+                                { header: '填表人', key: 'reporter', width: 15 },
                                 { header: '出工狀態', key: 'status', width: 15 },
                                 { header: '出工人數', key: 'workers', width: 15 },
                                 { header: '施作項目', key: 'work_items', width: 40 },
@@ -771,6 +807,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 if (r.customWorkItem) itemsStr += ` (${r.customWorkItem})`;
                                 dailyLogSheet.addRow({
                                     date: r.reportDate,
+                                    reporter: r.reporterName || '未紀錄',
                                     status: r.isNoWork ? `停工 (${r.noWorkReason})` : '施工',
                                     workers: r.totalWorkerCount || 0,
                                     work_items: itemsStr,
@@ -778,7 +815,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 });
                             }
 
-                            // 表頭美化與樣式
                             workbook.eachSheet((sheet) => {
                                 const headerRow = sheet.getRow(1);
                                 headerRow.font = { bold: true, color: { arg: 'FFFFFFFF' } };
@@ -786,7 +822,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
                             });
 
-                            // 將 Excel 轉為 Buffer 並上傳到 OneDrive
                             const excelBufferArray = await workbook.xlsx.writeBuffer();
                             const excelBuffer = Buffer.from(excelBufferArray);
                             const excelFileName = `結案總表_${safeProjectName}_${dateStr.replace(/-/g, '')}.xlsx`;
@@ -799,7 +834,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             return;
                         }
 
-                        // 下架案場與解除綁定
                         projects.splice(projectIndex, 1);
                         await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
@@ -938,6 +972,7 @@ app.post('/api/submit-report', async (req, res) => {
         const structuredReport = {
             schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: dateStr,
             submissionId: fullSubmissionId, submittedAt: new Date().toISOString(), submittedDateLocal: dateStr, submittedTimeLocal: timeStr,
+            reporterName: String(reportData.reporterName || '未紀錄').trim(), // 💡 新增：紀錄填表人
             isNoWork, noWorkReason: isNoWork ? String(reportData.noWorkReason || '') : '',
             weather: { temp: reportData.temp, humidity: reportData.humidity, wind: reportData.wind },
             contractorItems, totalWorkerCount: calculatedTotalWorkerCount, workItems: isNoWork ? [] : workItems,
@@ -956,7 +991,9 @@ app.post('/api/submit-report', async (req, res) => {
             throw new Error('結構化日報寫入失敗');
         }
 
-        let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
+        // 💡 修改 LINE 回報文字，加入填表人
+        const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
+        let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
 
         const config = await readBindingsFromOneDrive();
