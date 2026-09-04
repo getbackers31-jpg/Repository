@@ -13,7 +13,9 @@ const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
 const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
-const STATS_API_KEY = process.env.STATS_API_KEY || 'cyber-cloud-2026';
+
+// 🛑 必修一：移除硬編碼的密碼，強制使用環境變數
+const STATS_API_KEY = process.env.STATS_API_KEY;
 
 const msalConfig = {
     auth: {
@@ -372,7 +374,7 @@ async function generateProjectStats(project) {
 
     const dataQuality = {
         sourceFileCount: allItems.length,
-        validFileCount: reports.length,
+        parsedFileCount: reports.length, // 修正命名
         invalidFileCount: invalidFiles.length,
         effectiveReportCount: validReports.length,
         supersededReportCount: supersededCount
@@ -475,7 +477,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
                     });
                 }
-                // 👇 加入無表情符號、乾淨排版的即時統計指令 👇
                 else if (text === '查詢統計' || text === '案場統計') {
                     if (!targetId) {
                         await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用「查詢統計」指令。');
@@ -531,6 +532,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         msg += `━━━━━━━━━━━━\n`;
                         msg += `* 資料計算至最新一份日報`;
 
+                        // 加入資料品質警告
+                        if (result.dataQuality) {
+                            if (result.dataQuality.invalidFileCount > 0) {
+                                msg += `\n⚠️ 注意：發現 ${result.dataQuality.invalidFileCount} 份資料異常，統計可能不完整`;
+                            }
+                            if (result.dataQuality.supersededReportCount > 0) {
+                                msg += `\n* 同日舊版已排除：${result.dataQuality.supersededReportCount} 份`;
+                            }
+                        }
+
                         await replyLineMessage(event.replyToken, msg);
 
                     } catch (err) {
@@ -568,28 +579,54 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         
                         const closingProject = projects[projectIndex];
 
+                        // 🛑 必修二：阻斷式結案防護 🛑
+                        let finalStatsResult;
                         try {
-                            const result = await generateProjectStats(closingProject);
-                            if (result.stats) {
-                                const statsBuffer = Buffer.from(JSON.stringify(result, null, 2), 'utf-8');
-                                const statsFileName = `結案統計_${getTaiwanDateParts().dateStr.replace(/-/g, '')}.json`;
-                                const safeProjectName = sanitizePathSegment(closingProject.projectName);
-                                const graphClient = await getGraphClient();
-                                await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}:/content`).put(statsBuffer);
+                            finalStatsResult = await generateProjectStats(closingProject);
+                            
+                            if (finalStatsResult.error || !finalStatsResult.stats) {
+                                await replyLineMessage(event.replyToken, ['⚠️ 結案暫停', '', finalStatsResult.error || '目前無法產生結案統計。', '', '案場尚未下架，群組綁定也未解除。'].join('\n'));
+                                return;
                             }
-                        } catch (statErr) {
-                            console.error('結案統計自動存檔失敗，但繼續執行結案：', statErr);
-                        }
 
+                            if (Array.isArray(finalStatsResult.warnings) && finalStatsResult.warnings.length > 0) {
+                                await replyLineMessage(event.replyToken, ['⚠️ 結案暫停', '', `發現 ${finalStatsResult.warnings.length} 份異常結構化資料。`, '為避免統計漏算，本次尚未完成結案。', '', '請先檢查 OneDrive 資料或 Render Logs。'].join('\n'));
+                                return;
+                            }
+
+                            const { dateStr, timeStr } = getTaiwanDateParts();
+                            const statsFileName = `結案統計_${dateStr.replace(/-/g, '')}_${timeStr}.json`;
+                            const safeProjectName = sanitizePathSegment(closingProject.projectName);
+                            const graphClient = await getGraphClient();
+                            const statsFilePath = `工程專案管理/2026_工程專案/${safeProjectName}/${statsFileName}`;
+                            
+                            const statsBuffer = Buffer.from(JSON.stringify({
+                                schemaVersion: 1, projectId: closingProject.projectId, projectName: closingProject.projectName,
+                                generatedAt: new Date().toISOString(), ...finalStatsResult
+                            }, null, 2), 'utf-8');
+                            
+                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${statsFilePath}:/content`).put(statsBuffer);
+
+                        } catch (statErr) {
+                            console.error('結案統計產生或儲存失敗：', statErr);
+                            await replyLineMessage(event.replyToken, ['⚠️ 結案失敗', '', '系統無法完成最終統計或寫入統計檔。', '案場尚未下架，群組綁定也未解除。', '', '請稍後再試。'].join('\n'));
+                            return;
+                        }
+                        // 👆 阻斷式結案防護結束
+
+                        // 統計完美產出後，才准許下架與刪除
                         projects.splice(projectIndex, 1);
                         await writeProjectsToOneDrive({ ...config, projects, updatedAt: new Date().toISOString() });
 
+                        // 🛑 必修三：結案解除綁定改用 projectId 🛑
                         await withBindingWriteLock(async () => {
-                            const filteredBindings = bindings.filter(b => b.projectName !== targetProjectName);
-                            await writeBindingsToOneDrive({ ...bindingConfig, bindings: filteredBindings, updatedAt: new Date().toISOString() });
+                            const latestBindingConfig = await readBindingsFromOneDrive();
+                            const latestBindings = Array.isArray(latestBindingConfig.bindings) ? latestBindingConfig.bindings : [];
+                            const filteredBindings = latestBindings.filter(binding => binding.projectId !== closingProject.projectId);
+                            await writeBindingsToOneDrive({ ...latestBindingConfig, bindings: filteredBindings, updatedAt: new Date().toISOString() });
                         });
 
-                        await replyLineMessage(event.replyToken, `✅ 案場「${targetProjectName}」已成功結案！\n\n系統已自動產生最終統計報表並存入您的 OneDrive 資料夾中。`);
+                        await replyLineMessage(event.replyToken, `✅ 案場「${targetProjectName}」已成功結案！\n\n系統已自動產生無異常之最終統計報表，並存入您的 OneDrive 資料夾中。`);
                     });
                 }
                 else if (['指令', '說明', '功能', '小幫手', '【點此查看指令說明】'].includes(text)) {
@@ -600,7 +637,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         '🔹 查詢案場',
                         '🔹 查詢統計',
                         '🔹 解除案場',
-                        '🔹 結案 案場名稱 (徹底下架選單)'
+                        '🔹 結案 案場名稱 (自動結算並下架)'
                     ].join('\n');
                     await replyLineMessage(event.replyToken, helpText);
                 }
@@ -729,7 +766,8 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET'];
+// 🛑 請至 Render 後台設定 STATS_API_KEY 環境變數 (不要用 cyber-cloud-2026) 🛑
+const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET', 'STATS_API_KEY'];
 if (requiredVars.some(v => !process.env[v])) process.exit(1);
 
 const PORT = process.env.PORT || 3000;
