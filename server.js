@@ -1024,47 +1024,129 @@ const ExcelJS = require('exceljs');
 
 // 1. [API 路由] 讓前端呼叫下載結案 Excel
 // 備註：請確保你的 server.js 裡面代表 Express 的變數是 app (如果不是請自行更改)
+// 1. [API 路由] 從 OneDrive 抓取真實資料並下載結案 Excel
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
         const projectId = req.params.projectId;
         console.log(`開始產生專案 ${projectId} 的結案 Excel...`);
 
-        // ----------------------------------------------------------------------
-        // ⚠️ 這裡預留給你之後串接 OneDrive 的 Graph API 讀取程式碼
-        // 目前先放入預設的空資料格式，之後把資料換成你真實從 OneDrive 讀下來的 JSON 即可
-        // ----------------------------------------------------------------------
+        // 確保你有取得 Graph API 客戶端
+        const graphClient = getGraphClient();
+
+        // ==========================================
+        // 步驟 A: 抓取 projects.json 來確認案場名稱
+        // ==========================================
+        const projectsData = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json');
+        const projectList = projectsData?.projects || [];
+        const projectInfo = projectList.find(p => p.projectId === projectId);
         
-        // A. 讀取 inventory.json
-        const inventoryMap = {}; 
+        if (!projectInfo) {
+            return res.status(404).json({ success: false, message: '在總表中找不到此專案' });
+        }
         
-        // B. 讀取該案場的 project-material-transactions.json
-        const transactionData = { transactions: [] }; 
-        
-        // C. 讀取並過濾出「每日最新版」的結構化日報陣列
-        const dailyReports = []; 
-        
-        // D. 組合案場基本資料
+        const projectName = projectInfo.projectName;
+        const projectBasePath = `工程專案管理/2026_工程專案/${projectName}`;
+
+        // ==========================================
+        // 步驟 B: 讀取 inventory.json (材料主檔)
+        // ==========================================
+        const inventoryData = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json');
+        const inventoryMap = {};
+        (inventoryData?.materials || []).forEach(m => {
+            inventoryMap[m.materialId] = m;
+        });
+
+        // ==========================================
+        // 步驟 C: 讀取 project-material-transactions.json (案場專屬領入紀錄)
+        // ==========================================
+        const txPath = `${projectBasePath}/project-material-transactions.json`;
+        let transactionData = await readJsonFromOneDrive(txPath);
+        if (!transactionData) {
+            console.warn(`找不到 ${projectName} 的領料紀錄，以空資料計算。`);
+            transactionData = { transactions: [] };
+        }
+
+        // ==========================================
+        // 步驟 D: 掃描資料夾，讀取並過濾所有「結構化日報」
+        // ==========================================
+        const reportsFolderPath = `${projectBasePath}/施工日報/結構化資料`;
+        let dailyReports = [];
+        let sourceFileCount = 0;
+        let supersededReportCount = 0;
+        let invalidFiles = [];
+        const dailyMap = {};
+
+        try {
+            // 透過 Graph API 列出資料夾內的所有 JSON 檔案
+            const folderRes = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${reportsFolderPath}:/children`).get();
+            const files = (folderRes.value || []).filter(f => f.name.endsWith('.json'));
+            sourceFileCount = files.length;
+
+            // 使用 Promise.all 平行下載並解析所有日報 (大幅加快速度)
+            await Promise.all(files.map(async (file) => {
+                try {
+                    const reportPath = `${reportsFolderPath}/${file.name}`;
+                    const reportContent = await readJsonFromOneDrive(reportPath);
+                    
+                    if (!reportContent || !reportContent.reportDate) {
+                        invalidFiles.push({ fileName: file.name, reason: '檔案內容為空或無 reportDate' });
+                        return;
+                    }
+
+                    const dateKey = reportContent.reportDate;
+                    
+                    // 過濾同日最新版邏輯
+                    if (!dailyMap[dateKey]) {
+                        dailyMap[dateKey] = reportContent;
+                    } else {
+                        const currentLatestTime = new Date(dailyMap[dateKey].submittedAt || 0).getTime();
+                        const newTime = new Date(reportContent.submittedAt || 0).getTime();
+                        
+                        if (newTime > currentLatestTime) {
+                            dailyMap[dateKey] = reportContent;
+                            supersededReportCount++; // 舊的被刷掉
+                        } else {
+                            supersededReportCount++; // 新的是舊版，直接丟棄
+                        }
+                    }
+                } catch (err) {
+                    invalidFiles.push({ fileName: file.name, reason: 'JSON讀取或解析失敗' });
+                }
+            }));
+
+            // 轉成陣列並按照日期排序
+            dailyReports = Object.values(dailyMap).sort((a, b) => new Date(a.reportDate) - new Date(b.reportDate));
+
+        } catch (folderErr) {
+            console.warn(`讀取日報資料夾失敗 (可能是還沒有日報): ${folderErr.message}`);
+        }
+
+        // ==========================================
+        // 步驟 E: 組合傳給 Excel 引擎的專案摘要資料
+        // ==========================================
         const projectData = {
-            projectName: '測試案場',
-            startDate: '2026-09-05',
-            endDate: '2026-09-08',
-            workDays: 0,
-            noWorkDays: 0,
-            totalManDays: 0,
+            projectName: projectName,
+            startDate: dailyReports.length > 0 ? dailyReports[0].reportDate : (projectInfo.startDate || '未定'),
+            endDate: dailyReports.length > 0 ? dailyReports[dailyReports.length - 1].reportDate : (projectInfo.endDate || '未定'),
+            workDays: dailyReports.filter(r => r.workStatus === '施工').length,
+            noWorkDays: dailyReports.filter(r => r.workStatus === '無出工').length,
+            // 兼容舊版可能叫 workerCount 或新版的 totalWorkerCount
+            totalManDays: dailyReports.reduce((sum, r) => sum + Number(r.totalWorkerCount || r.workerCount || 0), 0),
             quality: {
-                sourceFileCount: 0,
-                supersededReportCount: 0,
-                invalidFileCount: 0,
-                invalidFiles: []
+                sourceFileCount,
+                supersededReportCount,
+                invalidFileCount: invalidFiles.length,
+                invalidFiles
             }
         };
-        // ----------------------------------------------------------------------
 
-        // 呼叫下方的 Excel 產檔引擎
+        // ==========================================
+        // 步驟 F: 呼叫引擎，產生檔案並回傳
+        // ==========================================
+        console.log(`資料撈取完畢！有效日報數: ${dailyReports.length}。開始產出 Excel...`);
         const excelBuffer = await generateProjectClosureExcel(projectData, dailyReports, inventoryMap, transactionData);
 
-        // 設定 Header，回傳 Excel 檔案給瀏覽器下載
-        const safeProjectName = encodeURIComponent(projectData.projectName || '未知案場');
+        const safeProjectName = encodeURIComponent(projectName);
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         res.setHeader('Content-Disposition', `attachment; filename="結案總表_${safeProjectName}.xlsx"`);
         res.send(excelBuffer);
