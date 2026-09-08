@@ -1024,13 +1024,14 @@ app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:$
 // 1. [API 路由] 讓前端呼叫下載結案 Excel
 // 備註：請確保你的 server.js 裡面代表 Express 的變數是 app (如果不是請自行更改)
 // 1. [API 路由] 從 OneDrive 抓取真實資料並下載結案 Excel
+// 1. [API 路由] 從 OneDrive 抓取真實資料並下載結案 Excel
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
         const projectId = req.params.projectId;
         console.log(`開始產生專案 ${projectId} 的結案 Excel...`);
 
-        // 確保你有取得 Graph API 客戶端
-        const graphClient = getGraphClient();
+        // 【修正1】加上 await，確保取得 Graph API 客戶端
+        const graphClient = await getGraphClient();
 
         // ==========================================
         // 步驟 A: 抓取 projects.json 來確認案場名稱
@@ -1081,7 +1082,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             const files = (folderRes.value || []).filter(f => f.name.endsWith('.json'));
             sourceFileCount = files.length;
 
-            // 使用 Promise.all 平行下載並解析所有日報 (大幅加快速度)
+            // 使用 Promise.all 平行下載並解析所有日報
             await Promise.all(files.map(async (file) => {
                 try {
                     const reportPath = `${reportsFolderPath}/${file.name}`;
@@ -1094,7 +1095,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
 
                     const dateKey = reportContent.reportDate;
                     
-                    // 過濾同日最新版邏輯
                     if (!dailyMap[dateKey]) {
                         dailyMap[dateKey] = reportContent;
                     } else {
@@ -1103,9 +1103,9 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
                         
                         if (newTime > currentLatestTime) {
                             dailyMap[dateKey] = reportContent;
-                            supersededReportCount++; // 舊的被刷掉
+                            supersededReportCount++; 
                         } else {
-                            supersededReportCount++; // 新的是舊版，直接丟棄
+                            supersededReportCount++; 
                         }
                     }
                 } catch (err) {
@@ -1119,6 +1119,42 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         } catch (folderErr) {
             console.warn(`讀取日報資料夾失敗 (可能是還沒有日報): ${folderErr.message}`);
         }
+
+        // ==========================================
+        // 步驟 E: 組合傳給 Excel 引擎的專案摘要資料
+        // ==========================================
+        const projectData = {
+            projectName: projectName,
+            startDate: dailyReports.length > 0 ? dailyReports[0].reportDate : (projectInfo.startDate || '未定'),
+            endDate: dailyReports.length > 0 ? dailyReports[dailyReports.length - 1].reportDate : (projectInfo.endDate || '未定'),
+            workDays: dailyReports.filter(r => r.workStatus === '施工').length,
+            noWorkDays: dailyReports.filter(r => r.workStatus === '無出工').length,
+            totalManDays: dailyReports.reduce((sum, r) => sum + Number(r.totalWorkerCount || r.workerCount || 0), 0),
+            quality: {
+                sourceFileCount,
+                supersededReportCount,
+                invalidFileCount: invalidFiles.length,
+                invalidFiles
+            }
+        };
+
+        // ==========================================
+        // 步驟 F: 呼叫引擎，產生檔案並回傳
+        // ==========================================
+        console.log(`資料撈取完畢！有效日報數: ${dailyReports.length}。開始產出 Excel...`);
+        const excelBuffer = await generateProjectClosureExcel(projectData, dailyReports, inventoryMap, transactionData);
+
+        // 【修正2】將整個檔名進行編碼，符合 Node.js 與瀏覽器的 UTF-8 規範
+        const encodedFileName = encodeURIComponent(`結案總表_${projectName}.xlsx`);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedFileName}`);
+        res.send(excelBuffer);
+
+    } catch (error) {
+        console.error('產出 Excel 發生錯誤:', error);
+        res.status(500).json({ success: false, message: '產出 Excel 失敗', error: error.message });
+    }
+});
 
         // ==========================================
         // 步驟 E: 組合傳給 Excel 引擎的專案摘要資料
