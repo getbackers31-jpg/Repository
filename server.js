@@ -1013,3 +1013,270 @@ if (requiredVars.some(v => !process.env[v])) process.exit(1);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+
+
+
+
+// ==============================================================================
+// 結案報表自動產生模組 (包含 API 路由與 ExcelJS 產檔引擎)
+// ==============================================================================
+const ExcelJS = require('exceljs');
+
+// 1. [API 路由] 讓前端呼叫下載結案 Excel
+// 備註：請確保你的 server.js 裡面代表 Express 的變數是 app (如果不是請自行更改)
+app.get('/api/projects/:projectId/export-excel', async (req, res) => {
+    try {
+        const projectId = req.params.projectId;
+        console.log(`開始產生專案 ${projectId} 的結案 Excel...`);
+
+        // ----------------------------------------------------------------------
+        // ⚠️ 這裡預留給你之後串接 OneDrive 的 Graph API 讀取程式碼
+        // 目前先放入預設的空資料格式，之後把資料換成你真實從 OneDrive 讀下來的 JSON 即可
+        // ----------------------------------------------------------------------
+        
+        // A. 讀取 inventory.json
+        const inventoryMap = {}; 
+        
+        // B. 讀取該案場的 project-material-transactions.json
+        const transactionData = { transactions: [] }; 
+        
+        // C. 讀取並過濾出「每日最新版」的結構化日報陣列
+        const dailyReports = []; 
+        
+        // D. 組合案場基本資料
+        const projectData = {
+            projectName: '測試案場',
+            startDate: '2026-09-05',
+            endDate: '2026-09-08',
+            workDays: 0,
+            noWorkDays: 0,
+            totalManDays: 0,
+            quality: {
+                sourceFileCount: 0,
+                supersededReportCount: 0,
+                invalidFileCount: 0,
+                invalidFiles: []
+            }
+        };
+        // ----------------------------------------------------------------------
+
+        // 呼叫下方的 Excel 產檔引擎
+        const excelBuffer = await generateProjectClosureExcel(projectData, dailyReports, inventoryMap, transactionData);
+
+        // 設定 Header，回傳 Excel 檔案給瀏覽器下載
+        const safeProjectName = encodeURIComponent(projectData.projectName || '未知案場');
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="結案總表_${safeProjectName}.xlsx"`);
+        res.send(excelBuffer);
+
+    } catch (error) {
+        console.error('產出 Excel 發生錯誤:', error);
+        res.status(500).json({ success: false, message: '產出 Excel 失敗', error: error.message });
+    }
+});
+
+
+// 2. [核心產檔引擎] 負責畫出 5 大工作表的 Excel
+async function generateProjectClosureExcel(projectData, dailyReports, inventoryMap, transactionData) {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = '工程專案自動化系統';
+    workbook.created = new Date();
+
+    // --- 工作表 1：案場總表 ---
+    const wsSummary = workbook.addWorksheet('案場總表');
+    wsSummary.views = [{ showGridLines: true }];
+
+    wsSummary.addRow(['案場名稱', projectData.projectName]);
+    wsSummary.addRow(['開案日期', projectData.startDate]);
+    wsSummary.addRow(['結案日期', projectData.endDate]);
+    wsSummary.addRow(['累計日曆天', { formula: `=B3-B2+1`, result: 0 }]);
+    wsSummary.addRow(['實際工作天', projectData.workDays || 0]);
+    wsSummary.addRow(['免計工作天', projectData.noWorkDays || 0]);
+    wsSummary.addRow(['全案總人天', projectData.totalManDays || 0]);
+    
+    wsSummary.addRow([]);
+    wsSummary.addRow(['【各廠商出工統計】']);
+    wsSummary.addRow(['廠商名稱', '出工工作天', '累計人天', '平均每日人數', '占全案人天比例']);
+
+    wsSummary.addRow([]);
+    wsSummary.addRow(['【各填表人填報統計】']);
+    wsSummary.addRow(['填表人', '出工天數']);
+
+
+    // --- 工作表 2：材料結案總表 ---
+    const wsMaterials = workbook.addWorksheet('材料結案總表');
+    wsMaterials.views = [{ showGridLines: true }];
+
+    wsMaterials.addRow([
+        '材料分類編碼', '材料名稱', '包裝規格', '庫存單位', 
+        '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位'
+    ]);
+
+    const materialSummaryMap = {};
+    const transactions = transactionData.transactions || [];
+    
+    // 領入統計
+    transactions.forEach(tx => {
+        if (!materialSummaryMap[tx.materialId]) {
+            materialSummaryMap[tx.materialId] = {
+                materialCode: tx.materialCode,
+                materialName: tx.materialName,
+                packageSpec: formatPackageSpec(tx),
+                stockUnit: tx.stockUnit,
+                issuedQty: 0,
+                baseIssuedQty: 0,
+                consumedBaseQty: 0,
+                baseUnit: tx.baseUnit
+            };
+        }
+        materialSummaryMap[tx.materialId].issuedQty += Number(tx.quantity || 0);
+        materialSummaryMap[tx.materialId].baseIssuedQty += Number(tx.baseQuantity || 0);
+    });
+
+    // 日報耗用統計
+    dailyReports.forEach(report => {
+        const items = report.materialItems || [];
+        items.forEach(item => {
+            if (materialSummaryMap[item.materialId]) {
+                materialSummaryMap[item.materialId].consumedBaseQty += Number(item.baseQuantity || 0);
+            } else {
+                materialSummaryMap[item.materialId] = {
+                    materialCode: item.materialCode,
+                    materialName: item.materialName,
+                    packageSpec: formatPackageSpec(item),
+                    stockUnit: item.stockUnit,
+                    issuedQty: 0,
+                    baseIssuedQty: 0,
+                    consumedBaseQty: Number(item.baseQuantity || 0),
+                    baseUnit: item.baseUnit
+                };
+            }
+        });
+    });
+
+    let matRowIdx = 2;
+    Object.values(materialSummaryMap).forEach(m => {
+        wsMaterials.addRow([
+            m.materialCode,
+            m.materialName,
+            m.packageSpec,
+            m.stockUnit,
+            m.issuedQty,
+            m.baseIssuedQty,
+            m.consumedBaseQty,
+            { formula: `=F${matRowIdx}-G${matRowIdx}`, result: m.baseIssuedQty - m.consumedBaseQty },
+            m.baseUnit
+        ]);
+        matRowIdx++;
+    });
+
+    // --- 工作表 3：材料進出紀錄 ---
+    const wsTxLog = workbook.addWorksheet('材料進出紀錄');
+    wsTxLog.views = [{ showGridLines: true }];
+
+    wsTxLog.addRow([
+        '日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', 
+        '原始數量', '庫存單位', '換算後數量', '基準單位', '備註'
+    ]);
+
+    const typeMap = { 'OPENING_ISSUE': '開工領入', 'ADDITIONAL_ISSUE': '追加領入' };
+
+    transactions.forEach(tx => {
+        wsTxLog.addRow([
+            tx.transactionDate,
+            typeMap[tx.transactionType] || tx.transactionType,
+            tx.materialCode,
+            tx.materialName,
+            formatPackageSpec(tx),
+            tx.quantity,
+            tx.stockUnit,
+            tx.baseQuantity,
+            tx.baseUnit,
+            tx.remarks || ''
+        ]);
+    });
+
+    dailyReports.forEach(report => {
+        const items = report.materialItems || [];
+        items.forEach(item => {
+            wsTxLog.addRow([
+                report.reportDate,
+                '施工耗用',
+                item.materialCode,
+                item.materialName,
+                formatPackageSpec(item),
+                item.quantity,
+                item.stockUnit,
+                item.baseQuantity,
+                item.baseUnit,
+                item.remarks || '日報自動記錄'
+            ]);
+        });
+    });
+
+    // --- 工作表 4：日報明細 ---
+    const wsDaily = workbook.addWorksheet('日報明細');
+    wsDaily.views = [{ showGridLines: true }];
+
+    wsDaily.addRow([
+        '日期', '填表時間', '填表人', '出工狀態', '無出工原因', 
+        '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', 
+        '氣溫', '濕度', '風速', '日報備註'
+    ]);
+
+    dailyReports.forEach(report => {
+        wsDaily.addRow([
+            report.reportDate,
+            report.submittedAt || '',
+            (report.submittedBy && report.submittedBy.displayName) ? report.submittedBy.displayName : '未紀錄',
+            report.workStatus || '施工',
+            report.noWorkReason || '',
+            (report.contractorItems || []).map(c => c.contractorName).join(', ') || '',
+            report.totalWorkerCount || 0,
+            (report.workItems || []).map(w => w.workName).join(', ') || '',
+            report.workNotes || '',
+            (report.materialItems || []).map(m => `${m.materialName} ${m.quantity}${m.stockUnit}`).join(', ') || '',
+            report.weather?.temp || '',
+            report.weather?.humidity || '',
+            report.weather?.wind || '',
+            report.remarks || ''
+        ]);
+    });
+
+    // --- 工作表 5：資料品質 ---
+    const wsQuality = workbook.addWorksheet('資料品質');
+    wsQuality.views = [{ showGridLines: true }];
+
+    wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
+    wsQuality.addRow(['統計項目', '數量／內容']);
+    wsQuality.addRow(['原始 JSON 總數', projectData.quality?.sourceFileCount || dailyReports.length]);
+    wsQuality.addRow(['成功解析並納入日報數', dailyReports.length]);
+    wsQuality.addRow(['同日重複舊版排除數', projectData.quality?.supersededReportCount || 0]);
+    wsQuality.addRow(['異常資料數量', projectData.quality?.invalidFileCount || 0]);
+    wsQuality.addRow(['報表產生時間', new Date().toISOString().replace('T', ' ').substring(0, 19)]);
+    wsQuality.addRow(['統計規則版本', '1.0']);
+
+    wsQuality.addRow([]);
+    wsQuality.addRow(['【異常資料明細】']);
+    wsQuality.addRow(['檔案名稱／識別碼', '異常原因說明']);
+    
+    if (!projectData.quality?.invalidFiles || projectData.quality.invalidFiles.length === 0) {
+        wsQuality.addRow(['(無)', '目前系統掃描正常，無異常資料。']);
+    } else {
+        projectData.quality.invalidFiles.forEach(err => {
+            wsQuality.addRow([err.fileName, err.reason]);
+        });
+    }
+
+    return await workbook.xlsx.writeBuffer();
+}
+
+// 3. [輔助函式] 組合包裝規格
+function formatPackageSpec(material) {
+    const pkgQty = Number(material.packageQuantity || 1);
+    const pkgUnit = String(material.packageUnit || '').trim();
+    const stockUnit = String(material.stockUnit || '').trim();
+    if (!pkgUnit || pkgUnit === stockUnit) return stockUnit;
+    return `${pkgQty}${pkgUnit}/${stockUnit}`;
+}
+// ==============================================================================
