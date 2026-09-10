@@ -1057,7 +1057,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         }
 
         // 步驟 D: 掃描資料夾，讀取並過濾所有「結構化日報」
-        const reportsFolderPath = `${projectBasePath}/施工日報/結構化資料`;
+        const reportsFolderPath = `${projectBasePath}/結構化資料`;
         let dailyReports = [];
         let sourceFileCount = 0;
         let supersededReportCount = 0;
