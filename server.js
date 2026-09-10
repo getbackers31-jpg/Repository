@@ -854,7 +854,7 @@ app.post('/api/submit-report', async (req, res) => {
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
             materialItems.forEach(m => {
-                msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit} (${m.packageUnit || ''})\n`;
+                msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
             });
             if (reportData.remarks) msg += `\n備註：${reportData.remarks}`;
 
