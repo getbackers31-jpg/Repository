@@ -711,7 +711,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                 return;
                             }
 
-                            // 呼叫內部 API 取代原本的產生邏輯，確保一致性
                             const excelResponse = await fetch(`http://localhost:${PORT}/api/projects/${closingProject.projectId}/export-excel`);
                             if (!excelResponse.ok) {
                                 throw new Error('結案 Excel 產生失敗');
@@ -798,7 +797,7 @@ app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
 app.post('/api/submit-report', async (req, res) => {
     try {
         const reportData = req.body || {}; 
-        const formType = reportData.formType || 'daily_report'; // 預設為日報模式
+        const formType = reportData.formType || 'daily_report';
 
         const submittedProjectId = String(reportData.projectId || '').trim();
         let project = submittedProjectId ? await findProjectById(submittedProjectId) : await findProjectByName(reportData.projectName);
@@ -830,9 +829,7 @@ app.post('/api/submit-report', async (req, res) => {
             let txData = { transactions: [] };
             try {
                 txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false);
-            } catch (e) {
-                // 若檔案尚未建立，維持空陣列
-            }
+            } catch (e) {}
 
             const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
             const issueTypeLabel = issueType === 'ADDITIONAL_ISSUE' ? '追加進場' : '開工首批進場';
@@ -860,7 +857,7 @@ app.post('/api/submit-report', async (req, res) => {
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
             materialItems.forEach(m => {
-                msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
+                msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit} (${m.packageUnit || ''})\n`;
             });
             if (reportData.remarks) msg += `\n備註：${reportData.remarks}`;
 
@@ -924,7 +921,7 @@ app.post('/api/submit-report', async (req, res) => {
         }
 
         const structuredReport = {
-            schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: submitDate,
+            schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: dateStr,
             submissionId: fullSubmissionId, submittedAt: new Date().toISOString(), submittedDateLocal: dateStr, submittedTimeLocal: timeStr,
             reporterName: String(reportData.reporterName || '未紀錄').trim(),
             isNoWork, noWorkReason: isNoWork ? String(reportData.noWorkReason || '') : '',
@@ -934,14 +931,14 @@ app.post('/api/submit-report', async (req, res) => {
             materialItems, remarks: String(reportData.remarks || '')
         };
 
-        const baseFileName = `${submitDate}_${shortSubmissionId}`;
+        const baseFileName = `${dateStr}_${shortSubmissionId}`;
         const jsonFilePath = `${dataFolderResult.folderPath}/${baseFileName}.json`;
         const txtFilePath = `${textFolderResult.folderPath}/${baseFileName}_施工日報.txt`;
 
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8'));
 
         const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
-        let reportText = `📋 施工日報\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
+        let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
 
         const config = await readBindingsFromOneDrive();
@@ -959,7 +956,7 @@ app.post('/api/submit-report', async (req, res) => {
 
 
 // ==============================================================================
-// 結案報表自動產生模組
+// 結案報表自動產生模組 (修正：包裝規格獨立分行、修復進出紀錄換算、移除填表時間)
 // ==============================================================================
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
@@ -1105,6 +1102,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         return found ? found.materialCode : '無編碼';
     };
 
+    // --- 工作表 1：案場總表 ---
     const wsSummary = workbook.addWorksheet('案場總表');
     wsSummary.views = [{ showGridLines: true }];
 
@@ -1140,6 +1138,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         }
     }
 
+    // --- 工作表 2：材料結案總表 (修正：以 名稱+規格 作為唯一 Key 獨立分行) ---
     const wsMaterials = workbook.addWorksheet('材料結案總表');
     wsMaterials.views = [{ showGridLines: true }];
 
@@ -1152,11 +1151,14 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     const transactions = transactionData.transactions || [];
     
     transactions.forEach(tx => {
-        if (!materialSummaryMap[tx.materialId]) {
-            materialSummaryMap[tx.materialId] = {
-                materialCode: tx.materialCode,
+        const pkgSpec = formatPackageSpec(tx);
+        const uniqueKey = `${tx.materialName}_${pkgSpec}`;
+        
+        if (!materialSummaryMap[uniqueKey]) {
+            materialSummaryMap[uniqueKey] = {
+                materialCode: tx.materialCode || getMaterialCode(tx.materialName, tx.materialId),
                 materialName: tx.materialName,
-                packageSpec: formatPackageSpec(tx),
+                packageSpec: pkgSpec,
                 stockUnit: tx.stockUnit,
                 issuedQty: 0,
                 baseIssuedQty: 0,
@@ -1164,26 +1166,27 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
                 baseUnit: tx.baseUnit
             };
         }
-        materialSummaryMap[tx.materialId].issuedQty += Number(tx.quantity || 0);
-        materialSummaryMap[tx.materialId].baseIssuedQty += Number(tx.baseQuantity || 0);
+        materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0);
+        materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
     });
 
     dailyReports.forEach(report => {
         const items = report.materialItems || [];
         items.forEach(item => {
-            const matchKey = item.materialId || item.materialName;
+            const pkgSpec = formatPackageSpec(item);
+            const uniqueKey = `${item.materialName}_${pkgSpec}`;
             const autoCode = item.materialCode || getMaterialCode(item.materialName, item.materialId);
 
-            if (materialSummaryMap[matchKey]) {
-                materialSummaryMap[matchKey].consumedBaseQty += Number(item.baseQuantity || 0);
-                if (materialSummaryMap[matchKey].materialCode === '無編碼' && autoCode !== '無編碼') {
-                    materialSummaryMap[matchKey].materialCode = autoCode;
+            if (materialSummaryMap[uniqueKey]) {
+                materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
+                if (materialSummaryMap[uniqueKey].materialCode === '無編碼' && autoCode !== '無編碼') {
+                    materialSummaryMap[uniqueKey].materialCode = autoCode;
                 }
             } else {
-                materialSummaryMap[matchKey] = {
+                materialSummaryMap[uniqueKey] = {
                     materialCode: autoCode,
                     materialName: item.materialName,
-                    packageSpec: formatPackageSpec(item),
+                    packageSpec: pkgSpec,
                     stockUnit: item.stockUnit,
                     issuedQty: 0, 
                     baseIssuedQty: 0,
@@ -1210,6 +1213,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         matRowIdx++;
     });
 
+    // --- 工作表 3：材料進出紀錄 (修正：正確對應原始數量與換算後數量) ---
     const wsTxLog = workbook.addWorksheet('材料進出紀錄');
     wsTxLog.views = [{ showGridLines: true }];
 
@@ -1224,7 +1228,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         wsTxLog.addRow([
             tx.transactionDate,
             typeMap[tx.transactionType] || tx.transactionType,
-            tx.materialCode,
+            tx.materialCode || getMaterialCode(tx.materialName, tx.materialId),
             tx.materialName,
             formatPackageSpec(tx),
             tx.quantity,
@@ -1254,11 +1258,12 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         });
     });
 
+    // --- 工作表 4：日報明細 (修正：移除填表時間欄位) ---
     const wsDaily = workbook.addWorksheet('日報明細');
     wsDaily.views = [{ showGridLines: true }];
 
     wsDaily.addRow([
-        '日期', '填表時間', '填表人', '出工狀態', '無出工原因', 
+        '日期', '填表人', '出工狀態', '無出工原因', 
         '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', 
         '氣溫', '濕度', '風速', '日報備註'
     ]);
@@ -1266,7 +1271,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     dailyReports.forEach(report => {
         wsDaily.addRow([
             report.reportDate,
-            report.submittedAt || '',
             (report.reporterName) ? report.reporterName : '未紀錄',
             report.isNoWork ? '無出工' : '施工', 
             report.noWorkReason || '',
@@ -1282,6 +1286,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         ]);
     });
 
+    // --- 工作表 5：資料品質 ---
     const wsQuality = workbook.addWorksheet('資料品質');
     wsQuality.views = [{ showGridLines: true }];
 
@@ -1293,18 +1298,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     wsQuality.addRow(['異常資料數量', projectData.quality?.invalidFileCount || 0]);
     wsQuality.addRow(['報表產生時間', new Date().toISOString().replace('T', ' ').substring(0, 19)]);
     wsQuality.addRow(['統計規則版本', '1.0']);
-
-    wsQuality.addRow([]);
-    wsQuality.addRow(['【異常資料明細】']);
-    wsQuality.addRow(['檔案名稱／識別碼', '異常原因說明']);
-    
-    if (!projectData.quality?.invalidFiles || projectData.quality.invalidFiles.length === 0) {
-        wsQuality.addRow(['(無)', '目前系統掃描正常，無異常資料。']);
-    } else {
-        projectData.quality.invalidFiles.forEach(err => {
-            wsQuality.addRow([err.fileName, err.reason]);
-        });
-    }
 
     workbook.eachSheet((worksheet) => {
         for (let i = 1; i <= 15; i++) {
