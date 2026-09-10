@@ -112,7 +112,7 @@ const CACHE_TTL = 30 * 1000;
 const configCache = { 
     projects: { data: null, timestamp: 0 }, 
     bindings: { data: null, timestamp: 0 },
-    globalMaterials: { data: null, timestamp: 0 },
+    globalInventory: { data: null, timestamp: 0 },
     projMaterials: {}
 };
 
@@ -142,11 +142,11 @@ async function writeBindingsToOneDrive(config) {
     configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
 }
 
-async function readGlobalMaterials() {
-    const cache = configCache.globalMaterials;
+async function readGlobalInventory() {
+    const cache = configCache.globalInventory;
     if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/materials.json', { materials: [] }, false);
-    configCache.globalMaterials = { data: cloneJsonData(data), timestamp: Date.now() };
+    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json', { items: [] }, false);
+    configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
 
@@ -156,7 +156,7 @@ async function readProjectMaterials(projectName) {
     if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     try {
         const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
-        if (data && Array.isArray(data.materials)) {
+        if (data && Array.isArray(data.items)) {
             configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
             return cloneJsonData(data);
         }
@@ -297,32 +297,29 @@ function normalizeMaterialItems(rawItems, isNoWork) {
     if (isNoWork) return [];
     if (!Array.isArray(rawItems)) return [];
     
-    const allowedStockUnits = new Set(['桶', '組', '支', '公斤', '公升', '個', '捲']);
+    const allowedStockUnits = new Set(['桶', '組', '支', '公斤', '公升', '個', '捲', '塊']);
     
     return rawItems.map((item, index) => {
         const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
         const quantity = Number(item.quantity);
         const stockUnit = String(item.stockUnit || '').trim();
+        const materialId = item.materialId || null;
+        const materialCode = item.materialCode || null;
         const packageQuantity = item.packageQuantity == null ? null : Number(item.packageQuantity);
         const packageUnit = item.packageUnit == null ? null : String(item.packageUnit).trim();
+        const baseUnit = item.baseUnit || stockUnit;
         
         if (!materialName) throw new Error(`第 ${index + 1} 筆材料名稱不可為空`);
         if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`第 ${index + 1} 筆材料數量不正確`);
         if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
         
         let baseQuantity = quantity;
-        let baseUnit = stockUnit;
-        
-        if (stockUnit === '桶' && packageUnit === '加侖') {
-            if (packageQuantity !== 1 && packageQuantity !== 5) {
-                throw new Error(`第 ${index + 1} 筆桶裝容量不正確`);
-            }
+        if (packageQuantity && packageQuantity > 0) {
             baseQuantity = quantity * packageQuantity;
-            baseUnit = '加侖';
         }
         
         return {
-            materialId: item.materialId || null, materialCode: item.materialCode || null, materialName, quantity, stockUnit,
+            materialId, materialCode, materialName, quantity, stockUnit,
             packageQuantity, packageUnit, baseQuantity, baseUnit
         };
     });
@@ -517,13 +514,13 @@ app.get('/api/materials', async (req, res) => {
             const project = await findProjectById(projectId);
             if (project) {
                 const customConfig = await readProjectMaterials(project.projectName);
-                if (customConfig && Array.isArray(customConfig.materials)) {
-                    return res.status(200).json({ success: true, materials: customConfig.materials, type: 'project' });
+                if (customConfig && Array.isArray(customConfig.items)) {
+                    return res.status(200).json({ success: true, materials: customConfig.items, type: 'project' });
                 }
             }
         }
-        const globalConfig = await readGlobalMaterials();
-        const materials = Array.isArray(globalConfig.materials) ? globalConfig.materials : [];
+        const globalConfig = await readGlobalInventory();
+        const materials = Array.isArray(globalConfig.items) ? globalConfig.items : (Array.isArray(globalConfig.materials) ? globalConfig.materials : []);
         return res.status(200).json({ success: true, materials, type: 'global' });
     } catch (error) {
         console.error('讀取材料清單失敗：', error);
@@ -792,7 +789,7 @@ app.get('/api/projects/:projectId', async (req, res) => {
 app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
 
 // ==============================================================================
-// 💡 核心 API：接收前端表單資料 (支援「施工日報」與「材料進場單」雙模式)
+// 💡 核心 API：接收前端表單資料 (對應 inventory.json 唯一編號)
 // ==============================================================================
 app.post('/api/submit-report', async (req, res) => {
     try {
@@ -954,9 +951,8 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-
 // ==============================================================================
-// 結案報表自動產生模組 (包含日曆天數值修正)
+// 結案報表自動產生模組 (對應 inventory.json 唯一編號與編碼)
 // ==============================================================================
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
@@ -976,16 +972,15 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         const projectName = projectInfo.projectName;
         const projectBasePath = `工程專案管理/2026_工程專案/${projectName}`;
 
-        const inventoryData = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json');
+        const inventoryData = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json', { items: [] });
         const inventoryMap = {};
-        (inventoryData?.materials || []).forEach(m => {
+        (inventoryData?.items || []).forEach(m => {
             inventoryMap[m.materialId] = m;
         });
 
         const txPath = `${projectBasePath}/project-material-transactions.json`;
         let transactionData = await readJsonFromOneDrive(txPath);
         if (!transactionData) {
-            console.warn(`找不到 ${projectName} 的領料紀錄，以空資料計算。`);
             transactionData = { transactions: [] };
         }
 
@@ -1012,7 +1007,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
                     }
 
                     const dateKey = reportContent.reportDate;
-                    
                     if (!dailyMap[dateKey]) {
                         dailyMap[dateKey] = reportContent;
                     } else {
@@ -1034,7 +1028,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             dailyReports = Object.values(dailyMap).sort((a, b) => new Date(a.reportDate) - new Date(b.reportDate));
 
         } catch (folderErr) {
-            console.warn(`讀取日報資料夾失敗 (可能是還沒有日報): ${folderErr.message}`);
+            console.warn(`讀取日報資料夾失敗: ${folderErr.message}`);
         }
 
         const contractorStats = {};
@@ -1077,7 +1071,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             }
         };
 
-        console.log(`資料撈取完畢！有效日報數: ${dailyReports.length}。開始產出 Excel...`);
         const excelBuffer = await generateProjectClosureExcel(projectData, dailyReports, inventoryMap, transactionData);
 
         const encodedFileName = encodeURIComponent(`結案總表_${projectName}.xlsx`);
@@ -1096,9 +1089,14 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     workbook.creator = '工程專案自動化系統';
     workbook.created = new Date();
 
-    const getMaterialCode = (name, id) => {
-        if (id && inventoryMap[id]) return inventoryMap[id].materialCode;
-        const found = Object.values(inventoryMap).find(inv => inv.materialName === name);
+    const resolveMaterialCode = (item) => {
+        if (item.materialId && inventoryMap[item.materialId]) {
+            return inventoryMap[item.materialId].materialCode;
+        }
+        if (item.materialCode && item.materialCode !== '無編碼') {
+            return item.materialCode;
+        }
+        const found = Object.values(inventoryMap).find(inv => inv.materialName === item.materialName);
         return found ? found.materialCode : '無編碼';
     };
 
@@ -1160,10 +1158,11 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     transactions.forEach(tx => {
         const pkgSpec = formatPackageSpec(tx);
         const uniqueKey = `${tx.materialName}_${pkgSpec}`;
+        const code = resolveMaterialCode(tx);
         
         if (!materialSummaryMap[uniqueKey]) {
             materialSummaryMap[uniqueKey] = {
-                materialCode: tx.materialCode || getMaterialCode(tx.materialName, tx.materialId),
+                materialCode: code,
                 materialName: tx.materialName,
                 packageSpec: pkgSpec,
                 stockUnit: tx.stockUnit,
@@ -1175,6 +1174,9 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         }
         materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0);
         materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
+        if (materialSummaryMap[uniqueKey].materialCode === '無編碼' && code !== '無編碼') {
+            materialSummaryMap[uniqueKey].materialCode = code;
+        }
     });
 
     dailyReports.forEach(report => {
@@ -1182,7 +1184,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         items.forEach(item => {
             const pkgSpec = formatPackageSpec(item);
             const uniqueKey = `${item.materialName}_${pkgSpec}`;
-            const autoCode = item.materialCode || getMaterialCode(item.materialName, item.materialId);
+            const autoCode = resolveMaterialCode(item);
 
             if (materialSummaryMap[uniqueKey]) {
                 materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
@@ -1235,7 +1237,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         wsTxLog.addRow([
             tx.transactionDate,
             typeMap[tx.transactionType] || tx.transactionType,
-            tx.materialCode || getMaterialCode(tx.materialName, tx.materialId),
+            resolveMaterialCode(tx),
             tx.materialName,
             formatPackageSpec(tx),
             tx.quantity,
@@ -1249,11 +1251,10 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     dailyReports.forEach(report => {
         const items = report.materialItems || [];
         items.forEach(item => {
-            const autoCode = item.materialCode || getMaterialCode(item.materialName, item.materialId);
             wsTxLog.addRow([
                 report.reportDate,
                 '施工耗用',
-                autoCode,
+                resolveMaterialCode(item),
                 item.materialName,
                 formatPackageSpec(item),
                 item.quantity,
