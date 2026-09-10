@@ -956,7 +956,7 @@ app.post('/api/submit-report', async (req, res) => {
 
 
 // ==============================================================================
-// 結案報表自動產生模組 (修正：包裝規格獨立分行、修復進出紀錄換算、移除填表時間)
+// 結案報表自動產生模組 (包含日曆天數值修正)
 // ==============================================================================
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
@@ -1106,10 +1106,17 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
     const wsSummary = workbook.addWorksheet('案場總表');
     wsSummary.views = [{ showGridLines: true }];
 
+    function calculateCalendarDays(startDate, endDate) {
+        const start = Date.parse(`${startDate}T00:00:00+08:00`);
+        const end = Date.parse(`${endDate}T00:00:00+08:00`);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+        return Math.floor((end - start) / 86400000) + 1;
+    }
+
     wsSummary.addRow(['案場名稱', projectData.projectName]);
     wsSummary.addRow(['開案日期', projectData.startDate]);
     wsSummary.addRow(['結案日期', projectData.endDate]);
-    wsSummary.addRow(['累計日曆天', { formula: `=B3-B2+1`, result: 0 }]);
+    wsSummary.addRow(['累計日曆天', calculateCalendarDays(projectData.startDate, projectData.endDate)]);
     wsSummary.addRow(['實際工作天', projectData.workDays || 0]);
     wsSummary.addRow(['免計工作天', projectData.noWorkDays || 0]);
     wsSummary.addRow(['全案總人天', projectData.totalManDays || 0]);
@@ -1138,7 +1145,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         }
     }
 
-    // --- 工作表 2：材料結案總表 (修正：以 名稱+規格 作為唯一 Key 獨立分行) ---
+    // --- 工作表 2：材料結案總表 ---
     const wsMaterials = workbook.addWorksheet('材料結案總表');
     wsMaterials.views = [{ showGridLines: true }];
 
@@ -1213,7 +1220,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         matRowIdx++;
     });
 
-    // --- 工作表 3：材料進出紀錄 (修正：正確對應原始數量與換算後數量) ---
+    // --- 工作表 3：材料進出紀錄 ---
     const wsTxLog = workbook.addWorksheet('材料進出紀錄');
     wsTxLog.views = [{ showGridLines: true }];
 
@@ -1258,7 +1265,7 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         });
     });
 
-    // --- 工作表 4：日報明細 (修正：移除填表時間欄位) ---
+    // --- 工作表 4：日報明細 ---
     const wsDaily = workbook.addWorksheet('日報明細');
     wsDaily.views = [{ showGridLines: true }];
 
