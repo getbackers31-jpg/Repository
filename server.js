@@ -293,26 +293,45 @@ function validateReportData(reportData) {
     return { valid: missingFields.length === 0, missingFields };
 }
 
-function normalizeMaterialItems(rawItems, isNoWork) {
+// ==============================================================================
+// 🛡️ 後端防護網機制：只相信 ID 與數量，強制透過主檔 (inventoryMap) 複寫規格
+// ==============================================================================
+function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
     if (isNoWork) return [];
     if (!Array.isArray(rawItems)) return [];
     
     const allowedStockUnits = new Set(['桶', '組', '支', '公斤', '公升', '個', '捲', '塊']);
     
     return rawItems.map((item, index) => {
-        const materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
         const quantity = Number(item.quantity);
-        const stockUnit = String(item.stockUnit || '').trim();
-        const materialId = item.materialId || null;
-        const materialCode = item.materialCode || null;
-        const packageQuantity = item.packageQuantity == null ? null : Number(item.packageQuantity);
-        const packageUnit = item.packageUnit == null ? null : String(item.packageUnit).trim();
-        const baseUnit = item.baseUnit || stockUnit;
-        
-        if (!materialName) throw new Error(`第 ${index + 1} 筆材料名稱不可為空`);
         if (!Number.isFinite(quantity) || quantity <= 0) throw new Error(`第 ${index + 1} 筆材料數量不正確`);
-        if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
         
+        const materialId = item.materialId || null;
+        let materialCode, materialName, stockUnit, packageQuantity, packageUnit, baseUnit;
+        
+        // 核心防護：如果有 materialId 且主檔找得到，一律強制複寫，忽視前端亂傳的規格
+        if (materialId && inventoryMap[materialId]) {
+            const dbItem = inventoryMap[materialId];
+            materialCode = dbItem.materialCode || '無編碼';
+            materialName = dbItem.materialName;
+            stockUnit = dbItem.stockUnit;
+            packageQuantity = dbItem.packageQuantity == null ? null : Number(dbItem.packageQuantity);
+            packageUnit = dbItem.packageUnit || null;
+            baseUnit = dbItem.baseUnit || dbItem.stockUnit;
+        } else {
+            // 例外情況：自訂材料("其他")，才退而求其次接收前端的自訂資料
+            materialCode = item.materialCode || null;
+            materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+            stockUnit = String(item.stockUnit || '').trim();
+            packageQuantity = item.packageQuantity == null ? null : Number(item.packageQuantity);
+            packageUnit = item.packageUnit == null ? null : String(item.packageUnit).trim();
+            baseUnit = item.baseUnit || stockUnit;
+            
+            if (!materialName) throw new Error(`第 ${index + 1} 筆材料名稱不可為空`);
+            if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
+        }
+        
+        // 計算 baseQuantity (強制根據複寫後的正確 packageQuantity 運算)
         let baseQuantity = quantity;
         if (packageQuantity && packageQuantity > 0) {
             baseQuantity = quantity * packageQuantity;
@@ -809,6 +828,15 @@ app.post('/api/submit-report', async (req, res) => {
         const { dateStr, timeStr } = getTaiwanDateParts();
         const submitDate = reportData.date || dateStr;
 
+        // 🛡️ 擷取主檔清單建立對照表 (供「後端權威性」防呆機制使用)
+        const globalInventory = await readGlobalInventory();
+        const customConfig = await readProjectMaterials(project.projectName);
+        const inventoryMap = {};
+        
+        (globalInventory?.items || []).forEach(m => inventoryMap[m.materialId] = m);
+        (globalInventory?.materials || []).forEach(m => inventoryMap[m.materialId] = m); // 相容舊檔
+        (customConfig?.items || []).forEach(m => inventoryMap[m.materialId] = m);
+
         // 🟢 模式 A：處理【材料進場單 (領料)】
         if (formType === 'material_issue') {
             if (!reportData.materialItems || reportData.materialItems.length === 0) {
@@ -817,7 +845,8 @@ app.post('/api/submit-report', async (req, res) => {
 
             let materialItems;
             try {
-                materialItems = normalizeMaterialItems(reportData.materialItems, false);
+                // 將 inventoryMap 傳入，啟動強制複寫防護
+                materialItems = normalizeMaterialItems(reportData.materialItems, false, inventoryMap);
             } catch (materialError) {
                 return res.status(400).json({ success: false, error: materialError.message });
             }
@@ -836,7 +865,7 @@ app.post('/api/submit-report', async (req, res) => {
                     transactionDate: submitDate,
                     transactionType: issueType,
                     materialId: m.materialId,
-                    materialCode: m.materialCode || '無編碼',
+                    materialCode: m.materialCode,
                     materialName: m.materialName,
                     quantity: m.quantity,
                     stockUnit: m.stockUnit,
@@ -854,6 +883,7 @@ app.post('/api/submit-report', async (req, res) => {
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
             materialItems.forEach(m => {
+                // LINE 通知已移除多餘括號
                 msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
             });
             if (reportData.remarks) msg += `\n備註：${reportData.remarks}`;
@@ -910,9 +940,11 @@ app.post('/api/submit-report', async (req, res) => {
         const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
 
         const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
+        
         let materialItems;
         try {
-            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork);
+            // 將 inventoryMap 傳入，啟動強制複寫防護
+            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork, inventoryMap);
         } catch (materialError) {
             return res.status(400).json({ success: false, error: materialError.message });
         }
@@ -947,6 +979,7 @@ app.post('/api/submit-report', async (req, res) => {
         return res.status(200).json({ success: true, message: '日報已歸檔並發布' });
 
     } catch (error) {
+        console.error(error);
         return res.status(500).json({ success: false, error: '系統處理失敗' });
     }
 });
