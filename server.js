@@ -1326,21 +1326,20 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
             wsQuality.addRow([err.fileName, err.reason]);
         });
     }
+
     // ==========================================
     // 💡 新增：統一調整所有工作表的欄寬與排版
     // ==========================================
     workbook.eachSheet((worksheet) => {
         // 把第 1 到第 15 欄都設定成適合中文的寬度，並且加上自動換行
         for (let i = 1; i <= 15; i++) {
-            worksheet.getColumn(i).width = 22; // 寬度 22 大約能舒舒服服放下 10 幾個中文字
+            worksheet.getColumn(i).width = 22; 
             worksheet.getColumn(i).alignment = { vertical: 'middle', wrapText: true }; 
         }
     });
 
-    // 👇 原本程式碼的最後一行，放在上面那段的下面
     return await workbook.xlsx.writeBuffer();
-    }
-   
+}
 
 // 3. [輔助函式] 組合包裝規格
 function formatPackageSpec(material) {
