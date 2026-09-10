@@ -1339,9 +1339,8 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
 
     // 👇 原本程式碼的最後一行，放在上面那段的下面
     return await workbook.xlsx.writeBuffer();
-}
-    return await workbook.xlsx.writeBuffer();
-}
+    }
+   
 
 // 3. [輔助函式] 組合包裝規格
 function formatPackageSpec(material) {
