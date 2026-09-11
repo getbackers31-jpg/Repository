@@ -293,9 +293,6 @@ function validateReportData(reportData) {
     return { valid: missingFields.length === 0, missingFields };
 }
 
-// ==============================================================================
-// 🛡️ 後端防護網機制：只相信 ID 與數量，強制透過主檔 (inventoryMap) 複寫規格
-// ==============================================================================
 function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
     if (isNoWork) return [];
     if (!Array.isArray(rawItems)) return [];
@@ -309,7 +306,6 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
         const materialId = item.materialId || null;
         let materialCode, materialName, stockUnit, packageQuantity, packageUnit, baseUnit;
         
-        // 核心防護：如果有 materialId 且主檔找得到，一律強制複寫，忽視前端亂傳的規格
         if (materialId && inventoryMap[materialId]) {
             const dbItem = inventoryMap[materialId];
             materialCode = dbItem.materialCode || '無編碼';
@@ -319,7 +315,6 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
             packageUnit = dbItem.packageUnit || null;
             baseUnit = dbItem.baseUnit || dbItem.stockUnit;
         } else {
-            // 例外情況：自訂材料("其他")，才退而求其次接收前端的自訂資料
             materialCode = item.materialCode || null;
             materialName = String(item.materialName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
             stockUnit = String(item.stockUnit || '').trim();
@@ -331,7 +326,6 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
             if (!allowedStockUnits.has(stockUnit)) throw new Error(`第 ${index + 1} 筆材料單位不正確`);
         }
         
-        // 計算 baseQuantity (強制根據複寫後的正確 packageQuantity 運算)
         let baseQuantity = quantity;
         if (packageQuantity && packageQuantity > 0) {
             baseQuantity = quantity * packageQuantity;
@@ -807,9 +801,6 @@ app.get('/api/projects/:projectId', async (req, res) => {
 
 app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
 
-// ==============================================================================
-// 💡 核心 API：接收前端表單資料 (對應 inventory.json 唯一編號)
-// ==============================================================================
 app.post('/api/submit-report', async (req, res) => {
     try {
         const reportData = req.body || {}; 
@@ -828,16 +819,14 @@ app.post('/api/submit-report', async (req, res) => {
         const { dateStr, timeStr } = getTaiwanDateParts();
         const submitDate = reportData.date || dateStr;
 
-        // 🛡️ 擷取主檔清單建立對照表 (供「後端權威性」防呆機制使用)
         const globalInventory = await readGlobalInventory();
         const customConfig = await readProjectMaterials(project.projectName);
         const inventoryMap = {};
         
         (globalInventory?.items || []).forEach(m => inventoryMap[m.materialId] = m);
-        (globalInventory?.materials || []).forEach(m => inventoryMap[m.materialId] = m); // 相容舊檔
+        (globalInventory?.materials || []).forEach(m => inventoryMap[m.materialId] = m); 
         (customConfig?.items || []).forEach(m => inventoryMap[m.materialId] = m);
 
-        // 🟢 模式 A：處理【材料進場單 (領料)】
         if (formType === 'material_issue') {
             if (!reportData.materialItems || reportData.materialItems.length === 0) {
                 return res.status(400).json({ success: false, error: '請至少選擇一項進場材料' });
@@ -845,7 +834,6 @@ app.post('/api/submit-report', async (req, res) => {
 
             let materialItems;
             try {
-                // 將 inventoryMap 傳入，啟動強制複寫防護
                 materialItems = normalizeMaterialItems(reportData.materialItems, false, inventoryMap);
             } catch (materialError) {
                 return res.status(400).json({ success: false, error: materialError.message });
@@ -883,7 +871,6 @@ app.post('/api/submit-report', async (req, res) => {
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
             materialItems.forEach(m => {
-                // LINE 通知已移除多餘括號
                 msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
             });
             if (reportData.remarks) msg += `\n備註：${reportData.remarks}`;
@@ -897,7 +884,6 @@ app.post('/api/submit-report', async (req, res) => {
             return res.status(200).json({ success: true, message: '材料進場紀錄已成功歸檔' });
         }
 
-        // 🔵 模式 B：處理【一般施工日報】
         const validation = validateReportData(reportData);
         if (!validation.valid) return res.status(400).json({ success: false, reason: 'INVALID_REPORT_DATA', error: `缺少必要欄位：${validation.missingFields.join(', ')}` });
 
@@ -943,7 +929,6 @@ app.post('/api/submit-report', async (req, res) => {
         
         let materialItems;
         try {
-            // 將 inventoryMap 傳入，啟動強制複寫防護
             materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork, inventoryMap);
         } catch (materialError) {
             return res.status(400).json({ success: false, error: materialError.message });
@@ -966,8 +951,44 @@ app.post('/api/submit-report', async (req, res) => {
 
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8'));
 
+        let alertMessages = [];
+        try {
+            if (!isNoWork && materialItems.length > 0) {
+                const txPath = `${projectFolderPath}/project-material-transactions.json`;
+                const txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false);
+                const issuedStats = {};
+                (txData.transactions || []).forEach(tx => {
+                    const key = `${tx.materialName} (${tx.baseUnit})`;
+                    issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
+                });
+
+                const statsResult = await generateProjectStats(project);
+                if (statsResult.stats) {
+                    const consumedStats = statsResult.stats.materialStats; 
+
+                    materialItems.forEach(m => {
+                        const key = `${m.materialName} (${m.baseUnit})`;
+                        const totalConsumed = consumedStats[key] || 0;
+                        const totalIssued = issuedStats[key] || 0;
+                        const balance = totalIssued - totalConsumed;
+
+                        if (balance < 0) {
+                            alertMessages.push(`⚠️ ${m.materialName}\n • 累計領入: ${totalIssued} ${m.baseUnit}\n • 累計耗用: ${totalConsumed} ${m.baseUnit}\n • 理論剩餘: ${balance} ${m.baseUnit}`);
+                        }
+                    });
+                }
+            }
+        } catch (err) {
+            console.error('負數檢查失敗', err);
+        }
+
         const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
         let reportText = `📋 施工日報\n\n日期：${dateStr.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n施工人數：${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日作業進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
+        
+        if (alertMessages.length > 0) {
+            reportText += `\n\n🚨 【系統異常警示：材料帳庫存不足】\n\n` + alertMessages.join('\n\n') + `\n\n💡 請協助確認是否漏登材料進場`;
+        }
+
         await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
 
         const config = await readBindingsFromOneDrive();
@@ -984,9 +1005,6 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-// ==============================================================================
-// 結案報表自動產生模組 (對應 inventory.json 唯一編號與編碼)
-// ==============================================================================
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
         const projectId = req.params.projectId;
@@ -1133,7 +1151,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         return found ? found.materialCode : '無編碼';
     };
 
-    // --- 工作表 1：案場總表 ---
     const wsSummary = workbook.addWorksheet('案場總表');
     wsSummary.views = [{ showGridLines: true }];
 
@@ -1176,7 +1193,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         }
     }
 
-    // --- 工作表 2：材料結案總表 ---
     const wsMaterials = workbook.addWorksheet('材料結案總表');
     wsMaterials.views = [{ showGridLines: true }];
 
@@ -1255,7 +1271,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         matRowIdx++;
     });
 
-    // --- 工作表 3：材料進出紀錄 ---
     const wsTxLog = workbook.addWorksheet('材料進出紀錄');
     wsTxLog.views = [{ showGridLines: true }];
 
@@ -1299,7 +1314,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         });
     });
 
-    // --- 工作表 4：日報明細 ---
     const wsDaily = workbook.addWorksheet('日報明細');
     wsDaily.views = [{ showGridLines: true }];
 
@@ -1327,7 +1341,6 @@ async function generateProjectClosureExcel(projectData, dailyReports, inventoryM
         ]);
     });
 
-    // --- 工作表 5：資料品質 ---
     const wsQuality = workbook.addWorksheet('資料品質');
     wsQuality.views = [{ showGridLines: true }];
 
