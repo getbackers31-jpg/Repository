@@ -180,7 +180,6 @@ async function readProjectMaterials(projectName) {
     return null;
 }
 
-// ⭐ [關鍵補回] 建立全域與專屬材料映射表
 async function buildInventoryMap(project) {
     const globalInventory = await readGlobalInventory();
     const customInventory = project ? await readProjectMaterials(project.projectName) : null;
@@ -195,7 +194,6 @@ async function buildInventoryMap(project) {
     return inventoryMap;
 }
 
-// ⭐ [關鍵補回] 原汁原味的專案資料夾建立功能
 async function ensureProjectFolder(projectName) {
     const graphClient = await getGraphClient();
     const safeProjectName = sanitizePathSegment(projectName);
@@ -218,7 +216,6 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
-// ⭐ [關鍵補回] 原汁原味的子資料夾建立功能
 async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
@@ -334,6 +331,15 @@ function getTaiwanDateParts() {
     }).formatToParts(new Date());
     const values = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
     return { dateStr: `${values.year}-${values.month}-${values.day}`, timeStr: `${values.hour}${values.minute}${values.second}` };
+}
+
+function validateIssueDate(value, today) {
+    const dateValue = String(value || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) throw new Error('材料進場日期格式不正確');
+    const parsedTime = Date.parse(`${dateValue}T00:00:00+08:00`);
+    if (!Number.isFinite(parsedTime)) throw new Error('材料進場日期無效');
+    if (dateValue > today) throw new Error('材料進場日期不可晚於今天');
+    return dateValue;
 }
 
 function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
@@ -508,7 +514,6 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
-// Webhook 必須使用 express.raw，維持獨立
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -666,7 +671,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 });
 
-// ⭐ API 路由前必須套用 express.json()
 app.use('/api', express.json());
 
 app.get('/api/projects', async (req, res) => {
@@ -926,7 +930,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     }
 });
 
-// ⭐ 單一案場查詢 API 補回
 app.get('/api/projects/:projectId', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId);
@@ -963,18 +966,17 @@ app.post('/api/submit-report', async (req, res) => {
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         
-        // ⭐ 日期宣告邏輯
         const { dateStr, timeStr } = getTaiwanDateParts();
-        const reportDate = formType === 'material_issue' ? (reportData.date || dateStr) : dateStr;
+        let reportDate = dateStr;
+        if (formType === 'material_issue') {
+            try { reportDate = validateIssueDate(reportData.date, dateStr); }
+            catch (dateError) { return res.status(400).json({ success: false, error: dateError.message }); }
+        }
         const submitDate = reportDate;
 
         const inventoryMap = await buildInventoryMap(project);
 
-        // ============================
-        // 處理材料進場模式
-        // ============================
         if (formType === 'material_issue') {
-            // ⭐ 後端進場類型驗證
             if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
                 return res.status(400).json({ success: false, error: '進場類型不正確' });
             }
@@ -983,6 +985,9 @@ app.post('/api/submit-report', async (req, res) => {
                 return res.status(400).json({ success: false, error: '請至少選擇一項進場材料' });
             }
 
+            const submissionId = String(reportData.submissionId || '').trim();
+            if (!submissionId) return res.status(400).json({ success: false, error: '材料進場缺少 submissionId' });
+
             let materialItems;
             try {
                 materialItems = normalizeMaterialItems(reportData.materialItems, false, inventoryMap);
@@ -990,17 +995,22 @@ app.post('/api/submit-report', async (req, res) => {
                 return res.status(400).json({ success: false, error: materialError.message });
             }
 
+            let isDuplicateSubmission = false;
             await withMaterialWriteLock(project.projectId, async () => {
                 const txPath = `${projectFolderPath}/project-material-transactions.json`;
                 let txData = { transactions: [] };
                 try {
                     txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false);
                 } catch (e) {}
+                if (!Array.isArray(txData.transactions)) txData.transactions = [];
+                isDuplicateSubmission = txData.transactions.some(tx => tx.submissionId === submissionId);
+                if (isDuplicateSubmission) return;
 
                 const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
                 
                 materialItems.forEach(m => {
                     txData.transactions.push({
+                        submissionId,
                         transactionDate: submitDate,
                         transactionType: issueType,
                         materialId: m.materialId,
@@ -1019,6 +1029,9 @@ app.post('/api/submit-report', async (req, res) => {
                 await ensureProjectFolder(project.projectName);
                 await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txPath}:/content`).put(Buffer.from(JSON.stringify(txData, null, 2), 'utf-8'));
             });
+            if (isDuplicateSubmission) {
+                return res.status(200).json({ success: true, duplicate: true, pushed: false, message: '此筆材料進場先前已完成歸檔，未重複入帳' });
+            }
 
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             const issueTypeLabel = reportData.issueType === 'ADDITIONAL' ? '追加進場' : '開工首批進場';
@@ -1045,16 +1058,24 @@ app.post('/api/submit-report', async (req, res) => {
             return res.status(200).json({ success: true, pushed: pushed, message: '材料進場紀錄已成功歸檔' });
         }
 
-        // ============================
-        // 處理施工日報模式
-        // ============================
         const isNoWork = reportData.isNoWork === true;
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
-        if (!isNoWork && contractorItems.length === 0) {
-             return res.status(400).json({ success: false, error: '請填寫施工廠商' });
-        }
-
-        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
+        if (!isNoWork) {
+            if (contractorItems.length === 0) return res.status(400).json({ success: false, error: '請至少填寫一組施工廠商' });
+            const contractorNames = new Set();
+            const normalizedContractors = [];
+            for (const item of contractorItems) {
+                const contractorName = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+                const workerCount = Number(item.workerCount);
+                if (!contractorName) return res.status(400).json({ success: false, error: '施工廠商名稱不可為空' });
+                if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) return res.status(400).json({ success: false, error: `廠商「${contractorName}」施工人數不正確` });
+                if (contractorNames.has(contractorName)) return res.status(400).json({ success: false, error: `施工廠商「${contractorName}」重複填寫` });
+                contractorNames.add(contractorName);
+                normalizedContractors.push({ contractorName, workerCount });
+            }
+            contractorItems = normalizedContractors;
+        } else contractorItems = [];
+        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + item.workerCount, 0);
 
         await ensureProjectFolder(project.projectName);
         const [textFolderResult, dataFolderResult] = await Promise.all([
@@ -1150,5 +1171,12 @@ app.post('/api/submit-report', async (req, res) => {
         return res.status(500).json({ success: false, error: error.message || '系統內部處理失敗' });
     }
 });
+
+const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET'];
+const missingVars = requiredVars.filter(name => !process.env[name]);
+if (missingVars.length > 0) {
+    console.error('缺少必要環境變數：', missingVars.join(', '));
+    process.exit(1);
+}
 
 app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
