@@ -10,9 +10,7 @@ const ExcelJS = require('exceljs');
 const app = express();
 app.use(cors());
 
-// ==========================================
-// 系統參數與環境變數設定
-// ==========================================
+const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
@@ -28,42 +26,22 @@ const msalConfig = {
 };
 const cca = new msal.ConfidentialClientApplication(msalConfig);
 
-// ==========================================
-// Microsoft Graph API 客戶端與 Token 管理
-// ==========================================
 let cachedGraphClient = null;
 let tokenExpiresAt = 0;
 let graphClientPromise = null;
 
 async function getGraphClient() {
     const now = Date.now();
-    if (cachedGraphClient && now < tokenExpiresAt) {
-        return cachedGraphClient;
-    }
-    
-    if (graphClientPromise) {
-        return graphClientPromise;
-    }
+    if (cachedGraphClient && now < tokenExpiresAt) return cachedGraphClient;
+    if (graphClientPromise) return graphClientPromise;
 
     graphClientPromise = (async () => {
         try {
-            const response = await cca.acquireTokenByClientCredential({ 
-                scopes: ['https://graph.microsoft.com/.default'] 
-            });
-            
-            if (!response || !response.accessToken) {
-                throw new Error('Microsoft Graph Token 取得失敗');
-            }
-            
+            const response = await cca.acquireTokenByClientCredential({ scopes: ['https://graph.microsoft.com/.default'] });
+            if (!response || !response.accessToken) throw new Error('Microsoft Graph Token 取得失敗');
             const expiresAt = response.expiresOn ? response.expiresOn.getTime() : Date.now() + 50 * 60 * 1000;
             tokenExpiresAt = Math.max(Date.now() + 60 * 1000, expiresAt - 5 * 60 * 1000);
-            
-            cachedGraphClient = Client.init({ 
-                authProvider(done) { 
-                    done(null, response.accessToken); 
-                } 
-            });
-            
+            cachedGraphClient = Client.init({ authProvider(done) { done(null, response.accessToken); } });
             return cachedGraphClient;
         } catch (error) {
             cachedGraphClient = null;
@@ -76,41 +54,23 @@ async function getGraphClient() {
     return graphClientPromise;
 }
 
-// ==========================================
-// 共用工具與驗證函式
-// ==========================================
-function sanitizePathSegment(value) { 
-    return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); 
-}
-
-function normalizeProjectName(value) { 
-    return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim(); 
-}
+function sanitizePathSegment(value) { return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); }
+function normalizeProjectName(value) { return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim(); }
 
 function validateProjectName(projectName) {
     const normalizedName = normalizeProjectName(projectName);
-    if (!normalizedName) {
-        throw new Error('案場名稱不可為空');
-    }
-    if (normalizedName.length > 80) {
-        throw new Error('案場名稱不可超過 80 個字');
-    }
-    if (/[<>:"/\\|?*#%]/.test(normalizedName)) {
-        throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
-    }
+    if (!normalizedName) throw new Error('案場名稱不可為空');
+    if (normalizedName.length > 80) throw new Error('案場名稱不可超過 80 個字');
+    if (/[<>:"/\\|?*#%]/.test(normalizedName)) throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
     return normalizedName;
 }
 
-// ⭐ 補回的函式：處理註冊錯誤訊息
 function getProjectRegistrationErrorMessage(error) {
     const message = String(error?.message || '');
     const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
     return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
 }
 
-// ==========================================
-// 寫入鎖機制 (防範併發寫入覆蓋)
-// ==========================================
 let projectWriteQueue = Promise.resolve();
 function withProjectWriteLock(task) {
     const result = projectWriteQueue.then(task, task);
@@ -133,30 +93,19 @@ function withMaterialWriteLock(projectId, task) {
     return current;
 }
 
-// ==========================================
-// OneDrive JSON 讀寫與快取機制
-// ==========================================
 async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = false) {
     try {
         const graphClient = await getGraphClient();
         const meta = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}`).get();
         const downloadUrl = meta['@microsoft.graph.downloadUrl'];
-        
-        if (!downloadUrl) {
-            throw new Error('Graph 未回傳檔案下載網址');
-        }
-        
+        if (!downloadUrl) throw new Error('Graph 未回傳檔案下載網址');
         const response = await fetch(downloadUrl);
-        if (!response.ok) {
-            throw new Error(`下載設定檔失敗 ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`下載設定檔失敗 ${response.status}`);
         return await response.json();
     } catch (error) {
         const statusCode = error?.statusCode || error?.status || error?.code;
         if (statusCode === 404 || statusCode === 'itemNotFound') {
-            if (throwOnNotFound) {
-                throw new Error(`找不到必要設定檔: ${filePath}`);
-            }
+            if (throwOnNotFound) throw new Error(`找不到必要設定檔: ${filePath}`);
             return defaultData;
         }
         throw error;
@@ -165,13 +114,10 @@ async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = fal
 
 async function writeJsonToOneDrive(filePath, data) {
     const graphClient = await getGraphClient();
-    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`)
-        .put(JSON.stringify(data, null, 2));
+    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
 }
 
-function cloneJsonData(data) { 
-    return JSON.parse(JSON.stringify(data)); 
-}
+function cloneJsonData(data) { return JSON.parse(JSON.stringify(data)); }
 
 const CACHE_TTL = 30 * 1000;
 const configCache = { 
@@ -183,15 +129,12 @@ const configCache = {
 
 async function readProjectsFromOneDrive() {
     const cache = configCache.projects;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
     configCache.projects = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
 
-// ⭐ 補回的函式
 async function writeProjectsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
     configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
@@ -199,15 +142,12 @@ async function writeProjectsToOneDrive(config) {
 
 async function readBindingsFromOneDrive() {
     const cache = configCache.bindings;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
+    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
     configCache.bindings = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
 
-// ⭐ 補回的函式
 async function writeBindingsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
     configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
@@ -229,12 +169,10 @@ async function readGlobalInventory() {
 async function readProjectMaterials(projectName) {
     const safeName = sanitizePathSegment(projectName);
     const cache = configCache.projMaterials[safeName];
-    if (cache && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
+    if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     try {
         const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
-        if (data && Array.isArray(data.items)) {
+        if (data && (Array.isArray(data.items) || Array.isArray(data.materials))) {
             configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
             return cloneJsonData(data);
         }
@@ -242,6 +180,7 @@ async function readProjectMaterials(projectName) {
     return null;
 }
 
+// ⭐ [關鍵補回] 建立全域與專屬材料映射表
 async function buildInventoryMap(project) {
     const globalInventory = await readGlobalInventory();
     const customInventory = project ? await readProjectMaterials(project.projectName) : null;
@@ -250,27 +189,54 @@ async function buildInventoryMap(project) {
     for (const item of globalInventory?.items || []) {
         inventoryMap[item.materialId] = item;
     }
-    for (const item of customInventory?.items || []) {
+    for (const item of customInventory?.items || customInventory?.materials || []) {
         inventoryMap[item.materialId] = item;
     }
     return inventoryMap;
 }
 
-// 整合的資料夾建立函式
-async function ensureFolder(graphClient, parentPath, childFolderName = null) {
-    const fullPath = childFolderName ? `${parentPath}/${sanitizePathSegment(childFolderName)}` : parentPath;
+// ⭐ [關鍵補回] 原汁原味的專案資料夾建立功能
+async function ensureProjectFolder(projectName) {
+    const graphClient = await getGraphClient();
+    const safeProjectName = sanitizePathSegment(projectName);
+    if (!safeProjectName) throw new Error('案場資料夾名稱不可為空');
+    const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
     try {
-        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${fullPath}`).get();
-        return { folderId: item.id, folderPath: fullPath };
+        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
+        if (!item.folder) throw new Error(`同名項目不是資料夾：${safeProjectName}`);
+        return { created: false, folderId: item.id, folderPath };
     } catch (error) {
-        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') {
-            throw error;
-        }
-        const parent = childFolderName ? parentPath : '工程專案管理/2026_工程專案';
-        const name = childFolderName ? sanitizePathSegment(childFolderName) : parentPath.split('/').pop();
-        const created = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parent}:/children`)
-            .post({ name: name, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
-        return { folderId: created.id, folderPath: fullPath };
+        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
+    }
+    try {
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({ name: safeProjectName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
+        return { created: true, folderId: createdFolder.id, folderPath };
+    } catch (error) {
+        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
+        if (!item.folder) throw error;
+        return { created: false, folderId: item.id, folderPath };
+    }
+}
+
+// ⭐ [關鍵補回] 原汁原味的子資料夾建立功能
+async function ensureChildFolder(graphClient, parentPath, childFolderName) {
+    const safeChildName = sanitizePathSegment(childFolderName);
+    if (!safeChildName) throw new Error('子資料夾名稱不可為空');
+    const childPath = `${parentPath}/${safeChildName}`;
+    try {
+        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
+        if (!existingItem.folder) throw new Error(`同名項目不是資料夾：${childPath}`);
+        return { created: false, folderId: existingItem.id, folderPath: childPath };
+    } catch (error) {
+        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
+    }
+    try {
+        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({ name: safeChildName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
+        return { created: true, folderId: createdFolder.id, folderPath: childPath };
+    } catch (createError) {
+        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
+        if (!existingItem.folder) throw createError;
+        return { created: false, folderId: existingItem.id, folderPath: childPath };
     }
 }
 
@@ -289,12 +255,10 @@ async function findProjectById(projectId) {
     return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
 }
 
-// ⭐ 補回的函式
 function createProjectId() {
     return `PRJ-${crypto.randomUUID()}`;
 }
 
-// ⭐ 補回的函式
 async function registerProjectByName(projectName) {
     return withProjectWriteLock(async () => {
         const normalizedName = validateProjectName(projectName);
@@ -303,7 +267,7 @@ async function registerProjectByName(projectName) {
         const existingProject = projects.find(project => project.active === true && normalizeProjectName(project.projectName) === normalizedName);
 
         if (existingProject) {
-            await ensureFolder(await getGraphClient(), `工程專案管理/2026_工程專案/${existingProject.projectName}`);
+            await ensureProjectFolder(existingProject.projectName);
             return { project: existingProject, created: false };
         }
 
@@ -314,7 +278,7 @@ async function registerProjectByName(projectName) {
             createdAt: new Date().toISOString()
         };
 
-        await ensureFolder(await getGraphClient(), `工程專案管理/2026_工程專案/${project.projectName}`);
+        await ensureProjectFolder(project.projectName);
         projects.push(project);
         
         await writeProjectsToOneDrive({
@@ -327,9 +291,6 @@ async function registerProjectByName(projectName) {
     });
 }
 
-// ==========================================
-// LINE Messaging API 相關
-// ==========================================
 async function replyLineMessage(replyToken, text) {
     if (!replyToken) return;
     await fetch('https://api.line.me/v2/bot/message/reply', {
@@ -356,9 +317,7 @@ function verifyLineSignature(rawBody, signature) {
     
     const actualBuffer = Buffer.from(signature);
     const expectedBuffer = Buffer.from(expectedSignature);
-    if (actualBuffer.length !== expectedBuffer.length) {
-        return false;
-    }
+    if (actualBuffer.length !== expectedBuffer.length) return false;
     return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
@@ -368,9 +327,6 @@ function getLineTargetId(event) {
     return null;
 }
 
-// ==========================================
-// 日期與材料處理邏輯
-// ==========================================
 function getTaiwanDateParts() {
     const parts = new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -415,9 +371,6 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
     });
 }
 
-// ==========================================
-// 專案統計生成核心邏輯
-// ==========================================
 async function generateProjectStats(project) {
     const safeProjectName = sanitizePathSegment(project.projectName);
     const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
@@ -555,9 +508,7 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
-// ==========================================
-// LINE Webhook 路由 (必須在 express.json 之前，以保留 raw body)
-// ==========================================
+// Webhook 必須使用 express.raw，維持獨立
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -686,9 +637,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             
                             const buf = Buffer.from(await resExcel.arrayBuffer());
                             const { dateStr } = getTaiwanDateParts();
-                            const graphClient = await getGraphClient();
+                            const gClient = await getGraphClient();
                             
-                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
+                            await gClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
                                 
                         } catch(e) { 
                             console.error('結案失敗', e);
@@ -715,13 +666,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 });
 
-// ==========================================
-// API 路由 (必須套用 JSON 解析)
-// ==========================================
-// ⭐ 關鍵修正 1：確保所有 /api 路由都能正確解析 JSON Body
+// ⭐ API 路由前必須套用 express.json()
 app.use('/api', express.json());
-
-app.get('/', (req, res) => res.send('✅ 伺服器運作中！'));
 
 app.get('/api/projects', async (req, res) => {
     try {
@@ -738,8 +684,8 @@ app.get('/api/projects', async (req, res) => {
 });
 
 app.get('/api/materials', async (req, res) => {
+    const projectId = req.query.projectId;
     try {
-        const projectId = req.query.projectId;
         let project = null;
         if (projectId) {
             project = await findProjectById(projectId);
@@ -795,7 +741,6 @@ app.get('/api/projects/:projectId/material-balances', async (req, res) => {
         
         return res.status(200).json({ success: true, projectId: project.projectId, balances });
     } catch (error) { 
-        console.error('取得餘額失敗', error);
         return res.status(500).json({ success: false, error: '取得餘額失敗' }); 
     }
 });
@@ -821,7 +766,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         workbook.creator = '工程專案自動化系統';
         const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
 
-        // 第一張表：案場總表
         const wsSummary = workbook.addWorksheet('案場總表');
         wsSummary.views = [{ showGridLines: true }];
         
@@ -855,7 +799,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
-        // 第二張表：材料結案總表
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
         wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
@@ -913,7 +856,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             matRowIdx++;
         });
 
-        // 第三張表：材料進出紀錄
         const wsTxLog = workbook.addWorksheet('材料進出紀錄');
         wsTxLog.views = [{ showGridLines: true }];
         wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
@@ -943,7 +885,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             });
         });
 
-        // 第四張表：日報明細
         const wsDaily = workbook.addWorksheet('日報明細');
         wsDaily.views = [{ showGridLines: true }];
         wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
@@ -958,7 +899,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             ]);
         });
 
-        // 第五張表：資料品質
         const wsQuality = workbook.addWorksheet('資料品質');
         wsQuality.views = [{ showGridLines: true }];
         wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
@@ -986,34 +926,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     }
 });
 
-function verifyStatsApiKey(req, res, next) {
-    const apiKey = req.get('x-api-key');
-    if (!STATS_API_KEY || apiKey !== STATS_API_KEY) {
-        return res.status(401).json({ success: false, error: '未授權存取' });
-    }
-    next();
-}
-
-app.get('/api/project-stats/:projectId', verifyStatsApiKey, async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) {
-            return res.status(404).json({ success: false, error: '找不到該案場' });
-        }
-        
-        const result = await generateProjectStats(project);
-        if (result.error) {
-            return res.status(200).json({ success: true, message: result.error });
-        }
-
-        return res.status(200).json({ success: true, projectName: project.projectName, ...result });
-    } catch (error) {
-        console.error('統計產生失敗：', error);
-        return res.status(500).json({ success: false, error: '統計產生失敗' });
-    }
-});
-
-// ⭐ 關鍵修正 2：補回單一案場查詢，讓前端 loadLockedProject 可以運作
+// ⭐ 單一案場查詢 API 補回
 app.get('/api/projects/:projectId', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId);
@@ -1050,7 +963,7 @@ app.post('/api/submit-report', async (req, res) => {
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         
-        // ⭐ 關鍵修正 3：明確宣告 reportDate 並針對模式處理
+        // ⭐ 日期宣告邏輯
         const { dateStr, timeStr } = getTaiwanDateParts();
         const reportDate = formType === 'material_issue' ? (reportData.date || dateStr) : dateStr;
         const submitDate = reportDate;
@@ -1061,7 +974,7 @@ app.post('/api/submit-report', async (req, res) => {
         // 處理材料進場模式
         // ============================
         if (formType === 'material_issue') {
-            // ⭐ 雙重防呆：確保有進場類型
+            // ⭐ 後端進場類型驗證
             if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
                 return res.status(400).json({ success: false, error: '進場類型不正確' });
             }
@@ -1238,11 +1151,9 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET'];
 if (requiredVars.some(v => !process.env[v])) {
     console.error('缺少必要環境變數');
     process.exit(1);
 }
 
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
