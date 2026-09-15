@@ -63,6 +63,13 @@ function validateProjectName(projectName) {
     return normalizedName;
 }
 
+// ⭐ 補回的函式
+function getProjectRegistrationErrorMessage(error) {
+    const message = String(error?.message || '');
+    const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
+    return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
+}
+
 let projectWriteQueue = Promise.resolve();
 function withProjectWriteLock(task) {
     const result = projectWriteQueue.then(task, task);
@@ -111,7 +118,6 @@ async function writeJsonToOneDrive(filePath, data) {
 
 function cloneJsonData(data) { return JSON.parse(JSON.stringify(data)); }
 
-// ⭐ Cache 統一校正為 globalInventory
 const CACHE_TTL = 30 * 1000;
 const configCache = { 
     projects: { data: null, timestamp: 0 }, 
@@ -128,6 +134,12 @@ async function readProjectsFromOneDrive() {
     return cloneJsonData(data);
 }
 
+// ⭐ 補回的函式
+async function writeProjectsToOneDrive(config) {
+    await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
+    configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
+}
+
 async function readBindingsFromOneDrive() {
     const cache = configCache.bindings;
     if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
@@ -136,19 +148,21 @@ async function readBindingsFromOneDrive() {
     return cloneJsonData(data);
 }
 
-// ⭐ 回歸強大的 readGlobalInventory
+// ⭐ 補回的函式
+async function writeBindingsToOneDrive(config) {
+    await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
+    configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
+}
+
 async function readGlobalInventory() {
     const cache = configCache.globalInventory;
     if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
         return cloneJsonData(cache.data);
     }
-    
     const data = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json', { items: [] }, true);
-    
     if (!data || !Array.isArray(data.items)) {
-        throw new Error('inventory.json 格式不正確，找不到 items 陣列');
+        throw new Error('inventory.json 格式不正確');
     }
-    
     configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
@@ -159,7 +173,6 @@ async function readProjectMaterials(projectName) {
     if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
     try {
         const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
-        // 支援 items 陣列
         if (data && Array.isArray(data.items)) {
             configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
             return cloneJsonData(data);
@@ -168,7 +181,6 @@ async function readProjectMaterials(projectName) {
     return null;
 }
 
-// ⭐ 抽出共用建立 inventoryMap 的函式
 async function buildInventoryMap(project) {
     const globalInventory = await readGlobalInventory();
     const customInventory = project ? await readProjectMaterials(project.projectName) : null;
@@ -235,6 +247,44 @@ async function findProjectById(projectId) {
     return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
 }
 
+// ⭐ 補回的函式
+function createProjectId() {
+    return `PRJ-${crypto.randomUUID()}`;
+}
+
+// ⭐ 補回的函式
+async function registerProjectByName(projectName) {
+    return withProjectWriteLock(async () => {
+        const normalizedName = validateProjectName(projectName);
+        const config = await readProjectsFromOneDrive();
+        const projects = Array.isArray(config.projects) ? config.projects : [];
+        const existingProject = projects.find(project => project.active === true && normalizeProjectName(project.projectName) === normalizedName);
+
+        if (existingProject) {
+            await ensureProjectFolder(existingProject.projectName);
+            return { project: existingProject, created: false };
+        }
+
+        const project = {
+            projectId: createProjectId(),
+            projectName: normalizedName,
+            active: true,
+            createdAt: new Date().toISOString()
+        };
+
+        await ensureProjectFolder(project.projectName);
+        projects.push(project);
+        
+        await writeProjectsToOneDrive({
+            ...config,
+            projects,
+            updatedAt: new Date().toISOString()
+        });
+
+        return { project, created: true };
+    });
+}
+
 async function replyLineMessage(replyToken, text) {
     if (!replyToken) return;
     await fetch('https://api.line.me/v2/bot/message/reply', {
@@ -282,7 +332,6 @@ function getTaiwanDateParts() {
     return { dateStr: `${values.year}-${values.month}-${values.day}`, timeStr: `${values.hour}${values.minute}${values.second}` };
 }
 
-// ⭐ 絕對相信 inventoryMap，移除寫死的單位限制
 function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
     if (isNoWork) return [];
     if (!Array.isArray(rawItems)) return [];
@@ -455,9 +504,6 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
-// ==========================================
-// API 路由
-// ==========================================
 app.get('/api/projects', async (req, res) => {
     try {
         const config = await readProjectsFromOneDrive();
@@ -549,8 +595,11 @@ app.post('/api/submit-report', async (req, res) => {
         const graphClient = await getGraphClient();
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
+        
+        // ⭐ 修正 1：明確宣告並對齊 reportDate
         const { dateStr, timeStr } = getTaiwanDateParts();
-        const submitDate = reportData.date || dateStr;
+        const reportDate = (reportData.date && /^\d{4}-\d{2}-\d{2}$/.test(reportData.date)) ? reportData.date : dateStr;
+        const submitDate = reportDate;
 
         const inventoryMap = await buildInventoryMap(project);
 
@@ -577,8 +626,7 @@ app.post('/api/submit-report', async (req, res) => {
                 } catch (e) {}
 
                 const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
-                const issueTypeLabel = issueType === 'ADDITIONAL_ISSUE' ? '追加進場' : '開工首批進場';
-
+                
                 materialItems.forEach(m => {
                     txData.transactions.push({
                         transactionDate: submitDate,
@@ -718,7 +766,9 @@ app.post('/api/submit-report', async (req, res) => {
             try { 
                 await pushLineMessage(binding.groupId, reportText); 
                 pushed = true;
-            } catch (e) {}
+            } catch (e) {
+                console.error('LINE推播失敗', e);
+            }
         }
         
         return res.status(200).json({ success: true, pushed: pushed, message: '日報已歸檔' });
@@ -907,7 +957,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         workbook.creator = '工程專案自動化系統';
         const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
 
-        // 第一張表：案場總表
         const wsSummary = workbook.addWorksheet('案場總表');
         wsSummary.views = [{ showGridLines: true }];
         
@@ -941,7 +990,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
-        // 第二張表：材料結案總表
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
         wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
@@ -999,7 +1047,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             matRowIdx++;
         });
 
-        // 第三張表：材料進出紀錄
         const wsTxLog = workbook.addWorksheet('材料進出紀錄');
         wsTxLog.views = [{ showGridLines: true }];
         wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
@@ -1029,7 +1076,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             });
         });
 
-        // 第四張表：日報明細
         const wsDaily = workbook.addWorksheet('日報明細');
         wsDaily.views = [{ showGridLines: true }];
         wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
@@ -1044,7 +1090,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             ]);
         });
 
-        // 第五張表：資料品質
         const wsQuality = workbook.addWorksheet('資料品質');
         wsQuality.views = [{ showGridLines: true }];
         wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
