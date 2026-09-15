@@ -1,1161 +1,965 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const msal = require('@azure/msal-node');
-const { Client } = require('@microsoft/microsoft-graph-client');
-require('isomorphic-fetch');
-const ExcelJS = require('exceljs');
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>云說工程 - 施工日報與材料進場表</title>
+  <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    body { font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; background:#f4f7f6; padding:15px; color:#333; margin:0; }
+    .container { background:white; padding:20px; border-radius:10px; box-shadow:0 4px 8px rgba(0,0,0,.1); max-width:500px; margin:auto; position: relative; }
+    h2 { text-align:center; color:#00B900; margin-top:0; font-size:22px; position: relative; }
+    .version-tag { font-size: 10px; color: #ccc; position: absolute; right: 0; bottom: 0; font-weight: normal; }
+    label { font-weight:bold; display:block; margin-top:15px; margin-bottom:5px; color:#444; }
+    select, textarea, input[type="text"], input[type="number"], input[type="date"] { width:100%; padding:10px; border:1px solid #ccc; border-radius:5px; box-sizing:border-box; font-size:16px; background:#fafafa; margin-bottom:5px; }
+    .flex-row { display:flex; gap:10px; margin-bottom:5px; }
+    .flex-row > * { flex:1; min-width:0; }
+    .btn-weather { background:#17a2b8; color:white; border:0; padding:9px; border-radius:5px; cursor:pointer; font-size:14px; width:100%; margin-bottom:10px; }
+    .btn-weather:disabled, .btn-add:disabled, .submit-btn:disabled { background:#ccc; cursor:not-allowed; }
+    .checkbox-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; background:#f9f9f9; padding:10px; border-radius:5px; border:1px solid #eee; }
+    .checkbox-label { display:flex; align-items:center; font-weight:normal; margin:0; font-size:15px; }
+    .checkbox-label input { margin-right:8px; transform:scale(1.2); }
+    .material-group { background:#f9f9f9; padding:10px; border-radius:5px; border:1px solid #eee; margin-bottom:10px; }
+    .material-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:5px; }
+    .material-title { font-size:14px; font-weight:bold; color:#666; }
+    .remove-material-button { color:#d9534f; border:0; background:none; font-weight:bold; cursor:pointer; }
+    .btn-add { background:#6c757d; color:white; border:0; padding:9px; border-radius:5px; cursor:pointer; font-size:14px; width:100%; margin-bottom:10px; }
+    .submit-btn { width:100%; background:#00B900; color:white; border:0; padding:12px; font-size:18px; border-radius:5px; margin-top:20px; cursor:pointer; font-weight:bold; }
+    .section-divider { border-bottom:2px dashed #ddd; margin:20px 0; }
+    .hidden { display:none !important; }
+    .no-material-option { display:flex; align-items:center; font-weight:bold; color:#d9534f; margin-bottom:15px; background:#fdf5f5; padding:10px; border-radius:5px; border:1px solid #f5c6c6; }
+    .no-material-option input { width:auto; margin-right:10px; transform:scale(1.3); }
+    .field-help { margin-top: 4px; color: #777; font-size: 13px; line-height: 1.5; }
+    .readonly-input { background-color: #e9ecef; color: #495057; cursor: not-allowed; }
+    @media (max-width:380px) { .checkbox-grid { grid-template-columns:1fr; } .flex-row { flex-direction:column; gap:4px; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2 id="formTitle">👷 施工日報表 <span class="version-tag">v5.4</span></h2>
 
-const app = express();
-app.use(cors());
+    <div style="display:flex; gap:10px; margin-bottom:15px;">
+        <button type="button" id="btnDailyMode" class="btn btn-primary" style="flex:1; padding:10px; border:none; border-radius:5px; background:#00B900; color:white; font-weight:bold; cursor:pointer;" onclick="switchMode('daily_report')">📝 填寫施工日報</button>
+        <button type="button" id="btnIssueMode" class="btn btn-outline-secondary" style="flex:1; padding:10px; border:1px solid #ccc; border-radius:5px; background:#e9ecef; color:#333; font-weight:bold; cursor:pointer;" onclick="switchMode('material_issue')">📦 登記材料進場</button>
+    </div>
 
-const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
-const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
-const STATS_API_KEY = process.env.STATS_API_KEY;
+    <form id="dailyReportForm">
+      <input type="hidden" id="formType" value="daily_report">
 
-const msalConfig = {
-    auth: {
-        clientId: process.env.AZURE_CLIENT_ID,
-        authority: `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}`,
-        clientSecret: process.env.AZURE_CLIENT_SECRET
-    }
-};
-const cca = new msal.ConfidentialClientApplication(msalConfig);
+      <div id="issueExtraSection" class="hidden" style="background:#f8f9fa; padding:12px; border-radius:5px; border-left:4px solid #28a745; margin-bottom:15px;">
+        <label for="issueType" style="margin-top:0;">🚚 進場類型 <span style="color:red">*</span></label>
+        <select id="issueType" onchange="updateAllBalances(); saveDraft()" style="margin-bottom:10px;">
+          <option value="" selected disabled>請選擇進場類型</option>
+          <option value="OPENING">🏢 開工首批進場</option>
+          <option value="ADDITIONAL">🚚 後續追加進場</option>
+        </select>
 
-let cachedGraphClient = null;
-let tokenExpiresAt = 0;
-let graphClientPromise = null;
+        <label for="reportDate" style="margin-top:0;">📅 實際進場日期 (可往回補登) <span style="color:red">*</span></label>
+        <input type="date" id="reportDate" onchange="saveDraft()">
+      </div>
+      
+      <label for="reporterName">👤 填表人姓名</label>
+      <input type="text" id="reporterName" placeholder="請輸入您的姓名 (系統將自動記憶)" oninput="saveDraft()" required>
 
-async function getGraphClient() {
-    const now = Date.now();
-    if (cachedGraphClient && now < tokenExpiresAt) return cachedGraphClient;
-    if (graphClientPromise) return graphClientPromise;
+      <div id="lockedProjectSection" class="hidden">
+        <label for="lockedProjectName">📍 案場名稱</label>
+        <input type="text" id="lockedProjectName" class="readonly-input" readonly>
+      </div>
 
-    graphClientPromise = (async () => {
-        try {
-            const response = await cca.acquireTokenByClientCredential({ scopes: ['https://graph.microsoft.com/.default'] });
-            if (!response || !response.accessToken) throw new Error('Microsoft Graph Token 取得失敗');
-            const expiresAt = response.expiresOn ? response.expiresOn.getTime() : Date.now() + 50 * 60 * 1000;
-            tokenExpiresAt = Math.max(Date.now() + 60 * 1000, expiresAt - 5 * 60 * 1000);
-            cachedGraphClient = Client.init({ authProvider(done) { done(null, response.accessToken); } });
-            return cachedGraphClient;
-        } catch (error) {
-            cachedGraphClient = null;
-            tokenExpiresAt = 0;
-            throw error;
-        } finally {
-            graphClientPromise = null;
-        }
-    })();
-    return graphClientPromise;
-}
+      <div id="compatibleProjectSection">
+        <label for="projectName">📍 案場名稱</label>
+        <select id="projectName" onchange="saveDraft()" required disabled>
+          <option value="" disabled selected>正在載入案場清單...</option>
+        </select>
+      </div>
 
-function sanitizePathSegment(value) { return String(value).replace(/[<>:"/\\|?*#%]/g, '_').replace(/\s+/g, ' ').trim(); }
-function normalizeProjectName(value) { return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim(); }
-function validateProjectName(projectName) {
-    const normalizedName = normalizeProjectName(projectName);
-    if (!normalizedName) throw new Error('案場名稱不可為空');
-    if (normalizedName.length > 80) throw new Error('案場名稱不可超過 80 個字');
-    if (/[<>:"/\\|?*#%]/.test(normalizedName)) throw new Error('案場名稱不可包含以下字元：< > : " / \\ | ? * # %');
-    return normalizedName;
-}
+      <input type="hidden" id="projectId" value="">
 
-function getProjectRegistrationErrorMessage(error) {
-    const message = String(error?.message || '');
-    const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
-    return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
-}
+      <div class="daily-only">
+        <label class="no-material-option" style="margin-top:15px; background:#fff3f3; border-color:#ffcccc; color:#cc0000;">
+          <input type="checkbox" id="noWorkToday" onchange="handleNoWorkChange(); saveDraft()">今日無出工 (停工/休息)
+        </label>
+      </div>
 
-let projectWriteQueue = Promise.resolve();
-function withProjectWriteLock(task) {
-    const result = projectWriteQueue.then(task, task);
-    projectWriteQueue = result.catch(() => undefined);
-    return result;
-}
+      <div id="noWorkReasonSection" class="hidden">
+        <select id="noWorkReason" onchange="saveDraft()" style="border-color:#ffcccc; background:#fffcfc;">
+          <option value="" disabled selected>請選擇無出工原因</option>
+          <option value="天候因素 (下雨/颱風等)">天候因素 (下雨/颱風等)</option>
+          <option value="例假日休息">例假日休息</option>
+          <option value="現場無施工安排">現場無施工安排</option>
+          <option value="停工/待料">停工/待料</option>
+          <option value="其他">其他 (請於最下方備註說明)</option>
+        </select>
+        <div class="section-divider"></div>
+      </div>
 
-let bindingWriteQueue = Promise.resolve();
-function withBindingWriteLock(task) {
-    const result = bindingWriteQueue.then(task, task);
-    bindingWriteQueue = result.catch(() => undefined);
-    return result;
-}
+      <div id="contractorSection" class="daily-only">
+        <label>🤝 施工廠商與人數</label>
+        <div id="contractorsContainer"></div>
+        <button type="button" class="btn-add" onclick="addContractorRow()" style="background:#5bc0de;">➕ 新增一組廠商</button>
+        <div class="section-divider"></div>
+      </div>
 
-const materialWriteQueues = new Map();
-function withMaterialWriteLock(projectId, task) {
-    const previous = materialWriteQueues.get(projectId) || Promise.resolve();
-    const current = previous.then(task, task);
-    materialWriteQueues.set(projectId, current.catch(() => undefined));
-    return current;
-}
+      <div class="daily-only">
+        <label>🌤️ 氣象資訊</label>
+        <button type="button" class="btn-weather" onclick="getWeather()">一鍵獲取當地天氣</button>
+        <div class="flex-row">
+          <input type="number" id="temp" placeholder="溫度(度)" step="0.1" oninput="saveDraft()">
+          <input type="number" id="humidity" placeholder="濕度(%)" min="0" max="100" step="1" oninput="saveDraft()">
+          <input type="number" id="wind" placeholder="風速(m/s)" min="0" step="0.1" oninput="saveDraft()">
+        </div>
+        <div class="section-divider"></div>
+      </div>
 
-async function readJsonFromOneDrive(filePath, defaultData, throwOnNotFound = false) {
-    try {
-        const graphClient = await getGraphClient();
-        const meta = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}`).get();
-        const downloadUrl = meta['@microsoft.graph.downloadUrl'];
-        if (!downloadUrl) throw new Error('Graph 未回傳檔案下載網址');
-        const response = await fetch(downloadUrl);
-        if (!response.ok) throw new Error(`下載設定檔失敗 ${response.status}`);
-        return await response.json();
-    } catch (error) {
-        const statusCode = error?.statusCode || error?.status || error?.code;
-        if (statusCode === 404 || statusCode === 'itemNotFound') {
-            if (throwOnNotFound) throw new Error(`找不到必要設定檔: ${filePath}`);
-            return defaultData;
-        }
-        throw error;
-    }
-}
+      <div id="workAndMaterialSection" class="daily-only">
+        <label>🛠️ 今日作業</label>
+        <div class="checkbox-grid" id="workItemsGrid"></div>
+        <input type="text" id="customWorkItem" class="hidden" placeholder="請輸入其他作業項目" maxlength="100" oninput="saveDraft()" style="margin-top:10px">
+        <textarea id="workNotes" rows="2" placeholder="作業補充（選填）" oninput="saveDraft()" style="margin-top:10px"></textarea>
+        <div class="section-divider"></div>
+      </div>
 
-async function writeJsonToOneDrive(filePath, data) {
-    const graphClient = await getGraphClient();
-    await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${filePath}:/content`).put(JSON.stringify(data, null, 2));
-}
+      <div id="materialSectionContainer">
+        <label id="materialLabel">📦 今日用料</label>
+        <div id="noMaterialWrapper" class="daily-only">
+          <label class="no-material-option">
+            <input type="checkbox" id="noMaterial" onchange="handleNoMaterialChange(); saveDraft()">今日無用料
+          </label>
+        </div>
+        <div id="materialsContainer"></div>
+        <button type="button" id="addMaterialButton" class="btn-add" onclick="addMaterialRow()">新增一項用料</button>
+        <div class="section-divider"></div>
+      </div>
 
-function cloneJsonData(data) { return JSON.parse(JSON.stringify(data)); }
+      <label for="remarks">📝 備註（選填）</label>
+      <textarea id="remarks" rows="2" placeholder="天候影響、材料短缺、人員異動等狀況" oninput="saveDraft()"></textarea>
 
-const CACHE_TTL = 30 * 1000;
-const configCache = { 
-    projects: { data: null, timestamp: 0 }, 
-    bindings: { data: null, timestamp: 0 },
-    globalInventory: { data: null, timestamp: 0 },
-    projMaterials: {}
-};
+      <button type="button" id="submitButton" class="submit-btn" onclick="submitForm()">確認送出施工日報</button>
+    </form>
+  </div>
 
-async function readProjectsFromOneDrive() {
-    const cache = configCache.projects;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/projects.json', { projects: [] }, true);
-    configCache.projects = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function writeProjectsToOneDrive(config) {
-    await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
-    configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
-}
-
-async function readBindingsFromOneDrive() {
-    const cache = configCache.bindings;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/line-bindings.json', { bindings: [] });
-    configCache.bindings = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function writeBindingsToOneDrive(config) {
-    await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
-    configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
-}
-
-async function readGlobalInventory() {
-    const cache = configCache.globalInventory;
-    if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
-        return cloneJsonData(cache.data);
-    }
-    const data = await readJsonFromOneDrive('工程專案管理/_系統設定/inventory.json', { items: [] }, true);
-    if (!data || !Array.isArray(data.items)) {
-        throw new Error('inventory.json 格式不正確');
-    }
-    configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
-    return cloneJsonData(data);
-}
-
-async function readProjectMaterials(projectName) {
-    const safeName = sanitizePathSegment(projectName);
-    const cache = configCache.projMaterials[safeName];
-    if (cache && Date.now() - cache.timestamp < CACHE_TTL) return cloneJsonData(cache.data);
-    try {
-        const data = await readJsonFromOneDrive(`工程專案管理/2026_工程專案/${safeName}/專屬材料.json`, null, false);
-        if (data && Array.isArray(data.items)) {
-            configCache.projMaterials[safeName] = { data: cloneJsonData(data), timestamp: Date.now() };
-            return cloneJsonData(data);
-        }
-    } catch (e) {}
-    return null;
-}
-
-async function buildInventoryMap(project) {
-    const globalInventory = await readGlobalInventory();
-    const customInventory = project ? await readProjectMaterials(project.projectName) : null;
-    const inventoryMap = {};
-
-    for (const item of globalInventory?.items || []) {
-        inventoryMap[item.materialId] = item;
-    }
-    for (const item of customInventory?.items || []) {
-        inventoryMap[item.materialId] = item;
-    }
-    return inventoryMap;
-}
-
-async function ensureProjectFolder(projectName) {
-    const graphClient = await getGraphClient();
-    const safeProjectName = sanitizePathSegment(projectName);
-    const folderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-    try {
-        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
-        return { created: false, folderId: item.id, folderPath };
-    } catch (error) {
-        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
-    }
-    try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案:/children`).post({ name: safeProjectName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
-        return { created: true, folderId: createdFolder.id, folderPath };
-    } catch (error) {
-        const item = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}`).get();
-        return { created: false, folderId: item.id, folderPath };
-    }
-}
-
-async function ensureChildFolder(graphClient, parentPath, childFolderName) {
-    const safeChildName = sanitizePathSegment(childFolderName);
-    const childPath = `${parentPath}/${safeChildName}`;
-    try {
-        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
-        return { created: false, folderId: existingItem.id, folderPath: childPath };
-    } catch (error) {
-        if (error?.statusCode !== 404 && error?.code !== 'itemNotFound') throw error;
-    }
-    try {
-        const createdFolder = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${parentPath}:/children`).post({ name: safeChildName, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' });
-        return { created: true, folderId: createdFolder.id, folderPath: childPath };
-    } catch (createError) {
-        const existingItem = await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${childPath}`).get();
-        return { created: false, folderId: existingItem.id, folderPath: childPath };
-    }
-}
-
-async function findProjectByName(projectName) {
-    const config = await readProjectsFromOneDrive();
-    const projects = Array.isArray(config.projects) ? config.projects : [];
-    const normalizedName = normalizeProjectName(projectName);
-    return projects.find(p => p.active === true && normalizeProjectName(p.projectName) === normalizedName) || null;
-}
-
-async function findProjectById(projectId) {
-    const config = await readProjectsFromOneDrive();
-    const projects = Array.isArray(config.projects) ? config.projects : [];
-    const normalizedProjectId = String(projectId || '').trim();
-    if (!normalizedProjectId) return null;
-    return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
-}
-
-function createProjectId() {
-    return `PRJ-${crypto.randomUUID()}`;
-}
-
-async function registerProjectByName(projectName) {
-    return withProjectWriteLock(async () => {
-        const normalizedName = validateProjectName(projectName);
-        const config = await readProjectsFromOneDrive();
-        const projects = Array.isArray(config.projects) ? config.projects : [];
-        const existingProject = projects.find(project => project.active === true && normalizeProjectName(project.projectName) === normalizedName);
-
-        if (existingProject) {
-            await ensureProjectFolder(existingProject.projectName);
-            return { project: existingProject, created: false };
-        }
-
-        const project = {
-            projectId: createProjectId(),
-            projectName: normalizedName,
-            active: true,
-            createdAt: new Date().toISOString()
-        };
-
-        await ensureProjectFolder(project.projectName);
-        projects.push(project);
-        
-        await writeProjectsToOneDrive({
-            ...config,
-            projects,
-            updatedAt: new Date().toISOString()
-        });
-
-        return { project, created: true };
-    });
-}
-
-async function replyLineMessage(replyToken, text) {
-    if (!replyToken) return;
-    await fetch('https://api.line.me/v2/bot/message/reply', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
-        body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] })
-    });
-}
-
-async function pushLineMessage(targetId, text) {
-    const response = await fetch('https://api.line.me/v2/bot/message/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
-        body: JSON.stringify({ to: targetId, messages: [{ type: 'text', text }] })
-    });
-    if (!response.ok) {
-        throw new Error(`LINE Push失敗：${response.status}`);
-    }
-}
-
-function verifyLineSignature(rawBody, signature) {
-    if (!LINE_CHANNEL_SECRET || !signature) return false;
-    const expectedSignature = crypto.createHmac('sha256', LINE_CHANNEL_SECRET).update(rawBody).digest('base64');
+  <script>
+    const LIFF_ID = '2011289657-vQgMb0eI';
+    const API_BASE_URL = 'https://bot.cyber-cloud.info';
     
-    const actualBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expectedSignature);
-    if (actualBuffer.length !== expectedBuffer.length) {
-        return false;
-    }
-    return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
-}
-
-function getLineTargetId(event) {
-    if (event.source?.type === 'group') return event.source.groupId;
-    if (event.source?.type === 'room') return event.source.roomId;
-    return null;
-}
-
-function getTaiwanDateParts() {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-    }).formatToParts(new Date());
-    const values = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
-    return { dateStr: `${values.year}-${values.month}-${values.day}`, timeStr: `${values.hour}${values.minute}${values.second}` };
-}
-
-function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
-    if (isNoWork) return [];
-    if (!Array.isArray(rawItems)) return [];
+    const API_URL = `${API_BASE_URL}/api/submit-report`;
+    const PROJECTS_API_URL = `${API_BASE_URL}/api/projects`;
+    const MATERIALS_API_URL = `${API_BASE_URL}/api/materials`;
+    const MATERIAL_BALANCES_API_URL = `${API_BASE_URL}/api/projects`;
     
-    return rawItems.map((item, index) => {
-        if (!item.materialId) {
-            throw new Error(`第 ${index + 1} 筆材料缺少 materialId`);
-        }
-        
-        const dbItem = inventoryMap[item.materialId];
-        if (!dbItem) {
-            throw new Error(`第 ${index + 1} 筆找不到指定材料主檔 (ID: ${item.materialId})`);
-        }
+    const MAX_MATERIAL_ROWS = 10;
+    const MAX_CONTRACTOR_ROWS = 10;
+    const CONTRACTORS_KEY = 'savedContractors';
 
-        const quantity = Number(item.quantity);
-        if (!Number.isFinite(quantity) || quantity <= 0) {
-            throw new Error(`「${dbItem.materialName}」數量不正確`);
-        }
-        
-        const packageQty = dbItem.packageQuantity ? Number(dbItem.packageQuantity) : 1;
-        
-        return {
-            materialId: dbItem.materialId,
-            materialCode: dbItem.materialCode || '無編碼',
-            materialName: dbItem.materialName,
-            quantity: quantity,
-            stockUnit: dbItem.stockUnit,
-            packageQuantity: packageQty,
-            packageUnit: dbItem.packageUnit || null,
-            baseQuantity: quantity * packageQty,
-            baseUnit: dbItem.baseUnit || dbItem.stockUnit
-        };
-    });
-}
+    const workItemsList = [
+      '材料進場', '現場放樣', '鷹架搭設', '鷹架拆除', '水刀除鏽',
+      '手動工具除鏽', '底漆施工', '中塗漆施工', '面漆施工', '底漆修補',
+      '中塗漆修補', '面漆修補', '底漆膜厚檢測', '中塗漆膜厚檢測',
+      '面漆膜厚檢測', '缺失改善', '現場清潔', '等待驗收', '完成驗收', '其他'
+    ];
 
-async function generateProjectStats(project) {
-    const safeProjectName = sanitizePathSegment(project.projectName);
-    const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
-    const graphClient = await getGraphClient();
+    let MATERIAL_ITEMS_MAP = new Map(); 
+    let MATERIAL_OPTIONS = []; 
+    let projectMaterialBalances = {}; 
 
-    let requestUrl = `/users/${TARGET_USER_EMAIL}/drive/root:/${dataFolderPath}:/children`;
-    const allItems = [];
-    
-    try {
-        while (requestUrl) {
-            const result = await graphClient.api(requestUrl).get();
-            if (Array.isArray(result.value)) {
-                allItems.push(...result.value.filter(f => f.name.endsWith('.json')));
-            }
-            requestUrl = result['@odata.nextLink'] || null;
-        }
-    } catch (error) {
-        if (error.statusCode === 404 || error.code === 'itemNotFound') {
-            return { error: '尚無日報資料或資料夾不存在', dataQuality: null, stats: null, reports: [] };
-        }
-        throw error;
+    let isSubmitting = false;
+    let isRestoringDraft = false;
+    let reportArchived = false;
+    let projectMode = 'LOADING';
+    let currentSubmissionId = '';
+
+    function getTaiwanDateString() {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Taipei',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(new Date());
     }
 
-    const reports = [];
-    const invalidFiles = [];
-    const DOWNLOAD_CONCURRENCY = 10;
-    
-    for (let i = 0; i < allItems.length; i += DOWNLOAD_CONCURRENCY) {
-        const chunk = allItems.slice(i, i + DOWNLOAD_CONCURRENCY);
-        const chunkResults = await Promise.all(chunk.map(async file => {
-            try {
-                const downloadUrl = file['@microsoft.graph.downloadUrl'];
-                if (!downloadUrl) throw new Error('缺少下載網址');
-                const response = await fetch(downloadUrl);
-                if (!response.ok) throw new Error(`下載失敗 HTTP ${response.status}`);
-                return { success: true, report: await response.json() };
-            } catch (error) {
-                return { success: false, fileName: file.name, error: String(error.message || '未知錯誤') };
-            }
-        }));
+    function switchMode(mode) {
+        document.getElementById('formType').value = mode;
+        const btnDaily = document.getElementById('btnDailyMode');
+        const btnIssue = document.getElementById('btnIssueMode');
+        const dailyOnlyElements = document.querySelectorAll('.daily-only');
+        const issueExtraSection = document.getElementById('issueExtraSection');
+        const formTitle = document.getElementById('formTitle');
+        const submitButton = document.getElementById('submitButton');
+        const materialLabel = document.getElementById('materialLabel');
 
-        for (const result of chunkResults) {
-            if (result.success) {
-                reports.push(result.report);
-            } else {
-                invalidFiles.push({ fileName: result.fileName, error: result.error });
-            }
-        }
-    }
-
-    const latestReportsMap = new Map();
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    let supersededCount = 0;
-
-    for (const report of reports) {
-        const date = String(report.reportDate || '').trim();
-        const submittedAtTime = Date.parse(report.submittedAt || '');
-
-        if (!dateRegex.test(date) || !Number.isFinite(submittedAtTime)) {
-            invalidFiles.push({ fileName: `SubmissionId: ${report.submissionId}`, error: '時間格式錯誤' });
-            continue;
-        }
-
-        const existing = latestReportsMap.get(date);
-        if (!existing) {
-            latestReportsMap.set(date, report);
-            continue;
-        }
-
-        const existingTime = Date.parse(existing.submittedAt || '');
-        if (!Number.isFinite(existingTime) || submittedAtTime > existingTime) {
-            latestReportsMap.set(date, report);
-            supersededCount++;
-        } else {
-            supersededCount++;
-        }
-    }
-
-    const validReports = Array.from(latestReportsMap.values()).sort((a, b) => a.reportDate.localeCompare(b.reportDate));
-
-    const stats = {
-        totalDays: validReports.length,
-        workDays: 0,
-        noWorkDays: 0,
-        totalManDays: 0,
-        contractorStats: {},
-        materialStats: {},
-        materialDetails: {}, 
-        reporterStats: {}
-    };
-
-    for (const report of validReports) {
-        if (report.isNoWork) {
-            stats.noWorkDays++;
-        } else {
-            stats.workDays++;
-            stats.totalManDays += Number(report.totalWorkerCount) || 0;
-
-            const reporter = String(report.reporterName || '未紀錄').trim();
-            stats.reporterStats[reporter] = (stats.reporterStats[reporter] || 0) + 1;
-
-            if (Array.isArray(report.contractorItems)) {
-                const dailyContractors = new Map();
-                for (const item of report.contractorItems) {
-                    const name = String(item.contractorName || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-                    const count = Number(item.workerCount);
-                    if (!name || !Number.isFinite(count) || count <= 0) continue;
-                    dailyContractors.set(name, (dailyContractors.get(name) || 0) + count);
-                }
-                for (const [name, count] of dailyContractors.entries()) {
-                    if (!stats.contractorStats[name]) stats.contractorStats[name] = { manDays: 0, workDays: 0 };
-                    stats.contractorStats[name].manDays += count;
-                    stats.contractorStats[name].workDays += 1;
-                }
-            }
-
-            if (Array.isArray(report.materialItems)) {
-                report.materialItems.forEach(item => {
-                    const key = item.materialId || `${item.materialName} (${item.baseUnit})`;
-                    stats.materialStats[key] = (stats.materialStats[key] || 0) + Number(item.baseQuantity || 0);
-                    stats.materialDetails[key] = { name: item.materialName, unit: item.baseUnit || '' };
-                });
-            }
-        }
-    }
-
-    const dataQuality = {
-        sourceFileCount: allItems.length,
-        parsedFileCount: reports.length,
-        invalidFileCount: invalidFiles.length,
-        effectiveReportCount: validReports.length,
-        supersededReportCount: supersededCount
-    };
-
-    return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
-}
-
-// ==========================================
-// API 路由
-// ==========================================
-
-// Webhook 必須使用 express.raw，維持獨立
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const signature = req.get('x-line-signature');
-    if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
-    
-    let body;
-    try { body = JSON.parse(req.body.toString('utf8')); } 
-    catch (error) { return res.status(400).send('Invalid JSON'); }
-    
-    res.status(200).send('OK');
-
-    for (const event of body.events || []) {
-        try {
-            const targetId = getLineTargetId(event);
+        if (mode === 'daily_report') {
+            btnDaily.style.background = '#00B900';
+            btnDaily.style.color = 'white';
+            btnDaily.style.border = 'none';
+            btnIssue.style.background = '#e9ecef';
+            btnIssue.style.color = '#333';
+            btnIssue.style.border = '1px solid #ccc';
             
-            if (event.type === 'message' && event.message.type === 'text') {
-                const text = event.message.text.trim();
-                
-                if (text.startsWith('設定案場')) {
-                    if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用。'); continue; }
-                    const match = text.match(/^設定案場\s+(.+)$/);
-                    if (!match) { await replyLineMessage(event.replyToken, '⚠️ 格式錯誤\n正確格式：設定案場 大安區'); continue; }
-                    
-                    try {
-                        const reg = await registerProjectByName(match[1]);
-                        await withBindingWriteLock(async () => {
-                            const config = await readBindingsFromOneDrive();
-                            const bindings = (config.bindings || []).filter(b => b.projectId !== reg.project.projectId && b.groupId !== targetId);
-                            bindings.push({ 
-                                projectId: reg.project.projectId, projectName: reg.project.projectName, 
-                                groupId: targetId, active: true 
-                            });
-                            await writeBindingsToOneDrive({ ...config, bindings });
-                        });
-                        await replyLineMessage(event.replyToken, `✅ 案場設定完成\n\n網址：https://liff.line.me/${LIFF_ID}/?projectId=${encodeURIComponent(reg.project.projectId)}`);
-                    } catch (error) {
-                        await replyLineMessage(event.replyToken, `⚠️ 無法建立案場\n${getProjectRegistrationErrorMessage(error)}`);
-                    }
-                }
-                else if (text === '查詢案場' || text === '案場查詢') {
-                    if (!targetId) continue;
-                    const config = await readBindingsFromOneDrive();
-                    const binding = (config.bindings || []).find(b => b.groupId === targetId && b.active);
-                    await replyLineMessage(event.replyToken, binding ? `📍 本群組綁定案場：\n${binding.projectName}` : '⚠️ 尚未設定案場');
-                }
-                else if (text === '解除案場') {
-                    if (!targetId) continue;
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const filtered = (config.bindings || []).filter(b => b.groupId !== targetId);
-                        if (filtered.length === (config.bindings || []).length) { await replyLineMessage(event.replyToken, '無綁定紀錄。'); return; }
-                        await writeBindingsToOneDrive({ ...config, bindings: filtered });
-                        await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
-                    });
-                }
-                else if (text === '查詢統計' || text === '案場統計') {
-                    if (!targetId) continue;
-                    const bindingConfig = await readBindingsFromOneDrive();
-                    const currentBinding = (bindingConfig.bindings || []).find(b => b.groupId === targetId && b.active);
-                    if (!currentBinding) { 
-                        await replyLineMessage(event.replyToken, '⚠️ 本群組目前沒有綁定案場'); continue; 
-                    }
+            formTitle.innerHTML = '👷 施工日報表 <span class="version-tag">v5.4</span>';
+            submitButton.textContent = '確認送出並發布至群組';
+            submitButton.style.background = '#00B900';
+            materialLabel.textContent = '📦 今日用料';
 
-                    const config = await readProjectsFromOneDrive();
-                    const project = (config.projects || []).find(p => p.projectId === currentBinding.projectId);
-                    if (!project) continue;
+            issueExtraSection.classList.add('hidden');
+            dailyOnlyElements.forEach(el => el.classList.remove('hidden'));
+        } else {
+            btnDaily.style.background = '#e9ecef';
+            btnDaily.style.color = '#333';
+            btnDaily.style.border = '1px solid #ccc';
+            btnIssue.style.background = '#28a745';
+            btnIssue.style.color = 'white';
+            btnIssue.style.border = 'none';
 
-                    try {
-                        const result = await generateProjectStats(project);
-                        if (result.error || !result.stats) { 
-                            await replyLineMessage(event.replyToken, '⚠️ 查詢失敗'); continue; 
-                        }
-                        
-                        const stats = result.stats;
-                        let msg = `【${project.projectName}】累計統計表\n━━━━━━━━━━━━\n實際工作天：${stats.workDays} 天\n免計工作天：${stats.noWorkDays} 天\n全案總人天：${stats.totalManDays} 人天\n\n[ 各廠商出工統計 ]\n`;
-                        
-                        for (const [name, data] of Object.entries(stats.contractorStats)) {
-                            msg += ` • ${name}：${data.workDays}天 (${data.manDays}人天)\n`;
-                        }
-                        
-                        msg += `\n[ 材料累計消耗 ]\n`;
-                        for (const [key, qty] of Object.entries(stats.materialStats)) {
-                            const detail = stats.materialDetails[key] || { name: key, unit: '' };
-                            msg += ` • ${detail.name}：共 ${qty} ${detail.unit}\n`;
-                        }
-                        
-                        await replyLineMessage(event.replyToken, msg);
-                    } catch (err) {
-                        await replyLineMessage(event.replyToken, '⚠️ 統計發生錯誤，請稍後再試。');
-                    }
-                }
-                else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
-                    await replyLineMessage(event.replyToken, '📖 「云說工程小幫手」指令：\n\n🔹 設定案場 案場名稱\n🔹 查詢案場\n🔹 查詢統計\n🔹 解除案場\n🔹 結案 案場名稱');
-                }
-                else if (text.startsWith('結案')) {
-                    if (!targetId) continue;
-                    const match = text.match(/^結案\s+(.+)$/);
-                    if (!match) continue;
-                    
-                    const bindings = await readBindingsFromOneDrive();
-                    const b = (bindings.bindings || []).find(x => x.groupId === targetId && x.active);
-                    if (!b || normalizeProjectName(b.projectName) !== normalizeProjectName(match[1])) {
-                        await replyLineMessage(event.replyToken, `⚠️ 名稱不符或無綁定`); 
-                        continue;
-                    }
+            formTitle.innerHTML = '📦 材料進場登記表 <span class="version-tag">v5.4</span>';
+            submitButton.textContent = '確認送出材料進場紀錄';
+            submitButton.style.background = '#28a745';
+            materialLabel.textContent = '📦 進場材料清單';
 
-                    await withProjectWriteLock(async () => {
-                        const config = await readProjectsFromOneDrive();
-                        const pIdx = (config.projects || []).findIndex(p => p.projectId === b.projectId);
-                        if (pIdx === -1) {
-                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。'); return;
-                        }
-                        
-                        const closingProject = config.projects[pIdx];
-
-                        try {
-                            const resExcel = await fetch(`http://localhost:${PORT}/api/projects/${b.projectId}/export-excel`);
-                            if (!resExcel.ok) {
-                                const errorText = await resExcel.text();
-                                throw new Error(`HTTP ${resExcel.status} ${errorText}`);
-                            }
-                            
-                            const contentType = resExcel.headers.get('content-type') || '';
-                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
-                                throw new Error('結案 API 未回傳 Excel 檔案');
-                            }
-                            
-                            const buf = Buffer.from(await resExcel.arrayBuffer());
-                            const { dateStr } = getTaiwanDateParts();
-                            const gClient = await getGraphClient();
-                            
-                            await gClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
-                                
-                        } catch(e) { 
-                            console.error('結案失敗', e);
-                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${e.message})\n案場尚未下架。`); 
-                            return; 
-                        }
-                        
-                        config.projects.splice(pIdx, 1);
-                        await writeProjectsToOneDrive(config);
-                        
-                        await withBindingWriteLock(async () => {
-                            const latestB = await readBindingsFromOneDrive();
-                            await writeBindingsToOneDrive({ 
-                                ...latestB, 
-                                bindings: (latestB.bindings || []).filter(x => x.projectId !== b.projectId) 
-                            });
-                        });
-                        
-                        await replyLineMessage(event.replyToken, `✅ 案場「${match[1]}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
-                    });
-                }
-            }
-        } catch (e) { console.error('Webhook Error', e); }
-    }
-});
-
-// ⭐ 關鍵修正 1：所有的 API 路由前套用 express.json()
-app.use('/api', express.json());
-
-app.get('/api/projects', async (req, res) => {
-    try {
-        const config = await readProjectsFromOneDrive();
-        const activeProjects = (config.projects || [])
-            .filter(p => p.active === true)
-            .map(p => ({ projectId: p.projectId, projectName: p.projectName }))
-            .sort((a, b) => a.projectName.localeCompare(b.projectName, 'zh-Hant'));
-        return res.status(200).json({ success: true, projects: activeProjects });
-    } catch (error) {
-        console.error('讀取案場清單失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得案場清單' });
-    }
-});
-
-app.get('/api/materials', async (req, res) => {
-    const projectId = req.query.projectId;
-    try {
-        let project = null;
-        if (projectId) {
-            project = await findProjectById(projectId);
+            issueExtraSection.classList.remove('hidden');
+            dailyOnlyElements.forEach(el => el.classList.add('hidden'));
         }
-        
-        const inventoryMap = await buildInventoryMap(project);
-        const materials = Object.values(inventoryMap);
-        
-        return res.status(200).json({ success: true, materials });
-    } catch (error) {
-        console.error('讀取材料清單失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得材料清單' });
+        updateAllBalances();
+        saveDraft();
     }
-});
 
-app.get('/api/projects/:projectId/material-balances', async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
-
-        const safeProjectName = sanitizePathSegment(project.projectName);
-        const txPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
-        let txData = { transactions: [] };
-        try { txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false); } catch(e){}
-
-        const issuedStats = {};
-        (txData.transactions || []).forEach(tx => {
-            const key = tx.materialId || `${tx.materialName} (${tx.baseUnit})`;
-            issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
+    function updateAllBalances() {
+        document.querySelectorAll('#materialsContainer .material-group').forEach(group => {
+            updateBalanceDisplay(group);
         });
-
-        const statsResult = await generateProjectStats(project);
-        const consumedStats = statsResult.stats?.materialStats || {};
-
-        const inventoryMap = await buildInventoryMap(project);
-
-        const balances = Object.values(inventoryMap).map(m => {
-            const key = m.materialId;
-            const issued = issuedStats[key] || 0;
-            const consumed = consumedStats[key] || 0;
-            return {
-                materialId: m.materialId,
-                materialName: m.materialName,
-                packageQuantity: m.packageQuantity || 1,
-                packageUnit: m.packageUnit || '',
-                stockUnit: m.stockUnit,
-                baseUnit: m.baseUnit || m.stockUnit,
-                issuedBaseQuantity: issued,
-                consumedBaseQuantity: consumed,
-                remainingBaseQuantity: issued - consumed
-            };
-        });
-        
-        return res.status(200).json({ success: true, projectId: project.projectId, balances });
-    } catch (error) { 
-        return res.status(500).json({ success: false, error: '取得餘額失敗' }); 
     }
-});
 
-app.get('/api/projects/:projectId/export-excel', async (req, res) => {
-    try {
-        const projectId = req.params.projectId;
-        const project = await findProjectById(projectId);
-        
-        if (!project) {
-            return res.status(404).json({ success: false, message: '找不到此專案' });
-        }
-        
-        const projectName = project.projectName;
-        const projectBasePath = `工程專案管理/2026_工程專案/${projectName}`;
+    function createSubmissionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    }
 
-        const inventoryMap = await buildInventoryMap(project);
+    function ensureSubmissionId() {
+      if (!currentSubmissionId) currentSubmissionId = createSubmissionId();
+      return currentSubmissionId;
+    }
 
-        let transactionData = await readJsonFromOneDrive(`${projectBasePath}/project-material-transactions.json`, { transactions: [] }, false);
-        const { stats, reports, dataQuality } = await generateProjectStats(project);
+    function getSelectedProjectName() {
+      if (projectMode === 'LOCKED') return document.getElementById('lockedProjectName').value.trim();
+      return document.getElementById('projectName').value.trim();
+    }
 
-        const workbook = new ExcelJS.Workbook();
-        workbook.creator = '工程專案自動化系統';
-        const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
+    function getDraftKey() {
+      const projectId = document.getElementById('projectId').value.trim();
+      if (projectId) return `dailyReportDraft:${projectId}`;
+      return 'dailyReportDraft';
+    }
 
-        // 第一張表：案場總表
-        const wsSummary = workbook.addWorksheet('案場總表');
-        wsSummary.views = [{ showGridLines: true }];
-        
-        const startDate = reports.length > 0 ? reports[0].reportDate : '未定';
-        const endDate = reports.length > 0 ? reports[reports.length - 1].reportDate : '未定';
-        let calDays = 0;
-        if(startDate !== '未定' && endDate !== '未定') {
-            calDays = Math.floor((Date.parse(`${endDate}T00:00:00+08:00`) - Date.parse(`${startDate}T00:00:00+08:00`)) / 86400000) + 1;
-        }
-        
-        wsSummary.addRow(['案場名稱', projectName]);
-        wsSummary.addRow(['開案日期', startDate]);
-        wsSummary.addRow(['結案日期', endDate]);
-        wsSummary.addRow(['累計日曆天', calDays]);
-        wsSummary.addRow(['實際工作天', stats.workDays]);
-        wsSummary.addRow(['免計工作天', stats.noWorkDays]);
-        wsSummary.addRow(['全案總人天', stats.totalManDays]);
-        wsSummary.addRow([]);
-        
-        wsSummary.addRow(['【各廠商出工統計】']);
-        wsSummary.addRow(['廠商名稱', '出工工作天', '累計人天', '平均每日人數', '占全案人天比例']);
-        for (const [name, data] of Object.entries(stats.contractorStats)) {
-            const ratio = stats.totalManDays > 0 ? ((data.manDays / stats.totalManDays) * 100).toFixed(1) + '%' : '0%';
-            wsSummary.addRow([name, data.workDays, data.manDays, (data.manDays / data.workDays).toFixed(1), ratio]);
-        }
-        wsSummary.addRow([]);
-        
-        wsSummary.addRow(['【各填表人填報統計】']);
-        wsSummary.addRow(['填表人', '出工天數']);
-        for (const [name, days] of Object.entries(stats.reporterStats)) {
-            wsSummary.addRow([name, days]);
-        }
+    function getProjectIdFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      return String(params.get('projectId') || '').trim();
+    }
 
-        // 第二張表：材料結案總表
-        const wsMaterials = workbook.addWorksheet('材料結案總表');
-        wsMaterials.views = [{ showGridLines: true }];
-        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
-        
-        const materialSummaryMap = {};
-        (transactionData.transactions || []).forEach(tx => {
-            const pkgSpec = `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`;
-            const uniqueKey = tx.materialId || `${tx.materialName}_${pkgSpec}`;
-            
-            if (!materialSummaryMap[uniqueKey]) {
-                materialSummaryMap[uniqueKey] = { 
-                    materialCode: resolveMaterialCode(tx), 
-                    materialName: tx.materialName, 
-                    packageSpec: pkgSpec, 
-                    stockUnit: tx.stockUnit, 
-                    issuedQty: 0, 
-                    baseIssuedQty: 0, 
-                    consumedBaseQty: 0, 
-                    baseUnit: tx.baseUnit 
-                };
-            }
-            materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0); 
-            materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
-        });
-        
-        reports.forEach(report => {
-            (report.materialItems || []).forEach(item => {
-                const pkgSpec = `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`;
-                const uniqueKey = item.materialId || `${item.materialName}_${pkgSpec}`;
-                
-                if (!materialSummaryMap[uniqueKey]) {
-                    materialSummaryMap[uniqueKey] = { 
-                        materialCode: resolveMaterialCode(item), 
-                        materialName: item.materialName, 
-                        packageSpec: pkgSpec, 
-                        stockUnit: item.stockUnit, 
-                        issuedQty: 0, 
-                        baseIssuedQty: 0, 
-                        consumedBaseQty: 0, 
-                        baseUnit: item.baseUnit 
-                    };
-                }
-                materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
+    async function fetchMaterials(projectId = '') {
+      try {
+        const url = projectId ? `${MATERIALS_API_URL}?projectId=${projectId}` : MATERIALS_API_URL;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.success && Array.isArray(data.materials) && data.materials.length > 0) {
+            MATERIAL_OPTIONS = data.materials;
+            MATERIAL_ITEMS_MAP.clear();
+            MATERIAL_OPTIONS.forEach(m => {
+                if (m.materialId) MATERIAL_ITEMS_MAP.set(m.materialId, m);
             });
-        });
-        
-        let matRowIdx = 2;
-        Object.values(materialSummaryMap).forEach(m => {
-            wsMaterials.addRow([
-                m.materialCode, m.materialName, m.packageSpec, m.stockUnit, 
-                m.issuedQty, m.baseIssuedQty, m.consumedBaseQty, 
-                { formula: `=F${matRowIdx}-G${matRowIdx}`, result: m.baseIssuedQty - m.consumedBaseQty }, 
-                m.baseUnit
-            ]);
-            matRowIdx++;
-        });
-
-        // 第三張表：材料進出紀錄
-        const wsTxLog = workbook.addWorksheet('材料進出紀錄');
-        wsTxLog.views = [{ showGridLines: true }];
-        wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
-        
-        const typeMap = { 'OPENING_ISSUE': '開工領入', 'ADDITIONAL_ISSUE': '追加領入' };
-        
-        (transactionData.transactions || []).forEach(tx => {
-            wsTxLog.addRow([
-                tx.transactionDate, 
-                typeMap[tx.transactionType] || tx.transactionType, 
-                resolveMaterialCode(tx), 
-                tx.materialName, 
-                `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`, 
-                tx.quantity, tx.stockUnit, tx.baseQuantity, tx.baseUnit, tx.remarks || ''
-            ]);
-        });
-        
-        reports.forEach(r => {
-            (r.materialItems || []).forEach(item => {
-                wsTxLog.addRow([
-                    r.reportDate, '施工耗用', 
-                    resolveMaterialCode(item), 
-                    item.materialName, 
-                    `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`, 
-                    item.quantity, item.stockUnit, item.baseQuantity, item.baseUnit, item.remarks || '日報自動記錄'
-                ]);
-            });
-        });
-
-        // 第四張表：日報明細
-        const wsDaily = workbook.addWorksheet('日報明細');
-        wsDaily.views = [{ showGridLines: true }];
-        wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
-        
-        reports.forEach(r => {
-            wsDaily.addRow([
-                r.reportDate, r.reporterName || '未紀錄', r.isNoWork ? '無出工' : '施工', r.noWorkReason || '',
-                (r.contractorItems || []).map(c => c.contractorName).join(', ') || '', r.totalWorkerCount || 0,
-                (r.workItems || []).join(', ') || '', r.workNotes || '',
-                (r.materialItems || []).map(m => `${m.materialName} ${m.quantity}${m.stockUnit}`).join(', ') || '',
-                r.weather?.temp || '', r.weather?.humidity || '', r.weather?.wind || '', r.remarks || ''
-            ]);
-        });
-
-        // 第五張表：資料品質
-        const wsQuality = workbook.addWorksheet('資料品質');
-        wsQuality.views = [{ showGridLines: true }];
-        wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
-        wsQuality.addRow(['統計項目', '數量／內容']);
-        wsQuality.addRow(['原始 JSON 總數', dataQuality?.sourceFileCount || reports.length]);
-        wsQuality.addRow(['成功解析並納入日報數', dataQuality?.effectiveReportCount || reports.length]);
-        wsQuality.addRow(['異常資料數量 (解析失敗等)', dataQuality?.invalidFileCount || 0]);
-        wsQuality.addRow(['同日重複舊版排除數', dataQuality?.supersededReportCount || 0]);
-        wsQuality.addRow(['報表產生時間', new Date().toISOString().replace('T', ' ').substring(0, 19)]);
-        
-        workbook.eachSheet(worksheet => { 
-            for (let i = 1; i <= 15; i++) { 
-                worksheet.getColumn(i).width = 22; 
-                worksheet.getColumn(i).alignment = { vertical: 'middle', wrapText: true }; 
-            } 
-        });
-
-        const excelBuffer = await workbook.xlsx.writeBuffer();
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`結案總表_${projectName}.xlsx`)}`);
-        res.send(excelBuffer);
-    } catch (error) { 
-        console.error('產出 Excel 發生錯誤', error);
-        res.status(500).json({ success: false, message: '產出 Excel 失敗', error: error.message }); 
-    }
-});
-
-// ⭐ 關鍵修正 2：補回單一案場查詢 API
-app.get('/api/projects/:projectId', async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) {
-            return res.status(404).json({ success: false, error: '找不到指定案場' });
         }
-        
-        return res.status(200).json({
-            success: true,
-            project: {
-                projectId: project.projectId,
-                projectName: project.projectName
-            }
-        });
-    } catch (error) {
-        console.error('取得案場資料失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得案場資料' });
+      } catch (err) { console.warn('材料清單讀取失敗', err); }
     }
-});
 
-app.post('/api/submit-report', async (req, res) => {
-    try {
-        const reportData = req.body || {}; 
-        const formType = reportData.formType || 'daily_report';
+    async function fetchMaterialBalances(projectId) {
+      try {
+        const url = `${MATERIAL_BALANCES_API_URL}/${encodeURIComponent(projectId)}/material-balances`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.success && data.balances) {
+            data.balances.forEach(b => projectMaterialBalances[b.materialId] = b);
+        }
+      } catch (err) { console.warn('餘額讀取失敗', err); }
+    }
 
-        const submittedProjectId = String(reportData.projectId || '').trim();
-        let project = submittedProjectId ? await findProjectById(submittedProjectId) : await findProjectByName(reportData.projectName);
-        
-        if (!project) {
-            return res.status(400).json({ success: false, error: '找不到指定案場' });
+    window.addEventListener('load', async () => {
+      initializeStaticForm();
+      const todayStr = getTaiwanDateString();
+      document.getElementById('reportDate').value = todayStr;
+
+      try {
+        await liff.init({ liffId: LIFF_ID });
+        const profile = await liff.getProfile();
+        if (profile) document.getElementById('reporterName').value = profile.displayName;
+      } catch (error) { console.warn('LIFF 初始化跳過：', error); }
+
+      const projectIdFromUrl = getProjectIdFromUrl();
+      try {
+        if (projectIdFromUrl) {
+          await loadLockedProject(projectIdFromUrl);
+          await fetchMaterials(projectIdFromUrl);
+          await fetchMaterialBalances(projectIdFromUrl); 
+        } else {
+          await loadProjects();
+          await fetchMaterials('');
+        }
+        loadDraft();
+      } catch (error) {
+        projectMode = 'ERROR';
+        document.getElementById('submitButton').disabled = true;
+        alert('案場載入失敗，請重新從施工群組開啟表單');
+      }
+    });
+
+    async function loadLockedProject(projectId) {
+      const response = await fetch(`${PROJECTS_API_URL}/${encodeURIComponent(projectId)}`);
+      const responseText = await response.text();
+      let result;
+      try { result = responseText ? JSON.parse(responseText) : {}; } catch { throw new Error(`HTTP ${response.status}`); }
+      if (!response.ok || result.success !== true || !result.project) throw new Error(result.error || '找不到指定案場');
+
+      document.getElementById('projectId').value = result.project.projectId;
+      document.getElementById('lockedProjectName').value = result.project.projectName;
+      document.getElementById('compatibleProjectSection').classList.add('hidden');
+      document.getElementById('lockedProjectSection').classList.remove('hidden');
+      projectMode = 'LOCKED';
+    }
+
+    async function loadProjects() {
+      const projectSelect = document.getElementById('projectName');
+      const response = await fetch(PROJECTS_API_URL);
+      const responseText = await response.text();
+      let result;
+      try { result = responseText ? JSON.parse(responseText) : {}; } catch { throw new Error(`HTTP ${response.status}`); }
+      if (!response.ok || result.success !== true || !Array.isArray(result.projects)) throw new Error(result.error || '無法取得案場清單');
+
+      projectSelect.innerHTML = '';
+      const placeholder = new Option('請選擇正式案場', '');
+      placeholder.disabled = true; placeholder.selected = true;
+      projectSelect.add(placeholder);
+
+      result.projects.forEach(project => projectSelect.add(new Option(project.projectName, project.projectName)));
+      projectSelect.disabled = false;
+      projectMode = 'COMPATIBLE';
+    }
+
+    function safeReadArray(key) {
+      try {
+        const value = JSON.parse(localStorage.getItem(key) || '[]');
+        return Array.isArray(value) ? value : [];
+      } catch { return []; }
+    }
+
+    function getSavedContractorsList() {
+      let savedStr = localStorage.getItem(CONTRACTORS_KEY);
+      if (!savedStr) {
+        const defaultList = ['容煜', '詮達'];
+        localStorage.setItem(CONTRACTORS_KEY, JSON.stringify(defaultList));
+        return defaultList;
+      }
+      return safeReadArray(CONTRACTORS_KEY);
+    }
+
+    function initializeStaticForm() {
+      const grid = document.getElementById('workItemsGrid');
+      workItemsList.forEach(item => {
+        const label = document.createElement('label');
+        label.className = 'checkbox-label';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = 'workItem';
+        checkbox.value = item;
+        checkbox.addEventListener('change', handleWorkItemChange);
+        label.append(checkbox, document.createTextNode(` ${item}`));
+        grid.appendChild(label);
+      });
+    }
+
+    function handleWorkItemChange() {
+      if (isRestoringDraft) return;
+      const otherChecked = [...document.querySelectorAll('input[name="workItem"]:checked')].some(cb => cb.value === '其他');
+      const input = document.getElementById('customWorkItem');
+      input.classList.toggle('hidden', !otherChecked);
+      if (!otherChecked) input.value = '';
+      saveDraft();
+    }
+
+    function handleNoWorkChange() {
+      const isNoWork = document.getElementById('noWorkToday').checked;
+      document.getElementById('noWorkReasonSection').classList.toggle('hidden', !isNoWork);
+      document.getElementById('contractorSection').classList.toggle('hidden', isNoWork);
+    }
+
+    function handleNoMaterialChange() {
+      const noMaterial = document.getElementById('noMaterial').checked;
+      const container = document.getElementById('materialsContainer');
+      const addButton = document.getElementById('addMaterialButton');
+      container.style.display = noMaterial ? 'none' : 'block';
+      addButton.style.display = noMaterial ? 'none' : 'block';
+      if (!noMaterial && container.children.length === 0) addMaterialRow();
+    }
+
+    function addContractorRow(name = '', customName = '', workers = '') {
+      const container = document.getElementById('contractorsContainer');
+      if (container.children.length >= MAX_CONTRACTOR_ROWS) { alert(`最多可填寫 ${MAX_CONTRACTOR_ROWS} 組廠商`); return; }
+
+      const div = document.createElement('div');
+      div.className = 'contractor-group material-group';
+      const header = document.createElement('div');
+      header.className = 'material-header';
+      const title = document.createElement('div');
+      title.className = 'material-title';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove-material-button';
+      removeBtn.textContent = '移除';
+      removeBtn.onclick = () => { div.remove(); refreshContractorTitles(); saveDraft(); };
+      header.append(title, removeBtn);
+
+      const row = document.createElement('div');
+      row.className = 'flex-row';
+
+      const nameSelect = document.createElement('select');
+      nameSelect.className = 'contractor-name';
+      nameSelect.add(new Option('請選擇廠商', ''));
+      nameSelect.options[0].disabled = true;
+      getSavedContractorsList().forEach(c => nameSelect.add(new Option(c, c)));
+      nameSelect.add(new Option('其他 (自行輸入)', '其他'));
+
+      const workerInput = document.createElement('input');
+      workerInput.type = 'number';
+      workerInput.className = 'contractor-workers';
+      workerInput.placeholder = '人數';
+      workerInput.min = '1'; workerInput.step = '1';
+      
+      row.append(nameSelect, workerInput);
+
+      const customInput = document.createElement('input');
+      customInput.type = 'text';
+      customInput.className = 'custom-contractor-name hidden';
+      customInput.placeholder = '請輸入新廠商名稱';
+      div.append(header, row, customInput);
+
+      nameSelect.onchange = () => {
+        const isCustom = nameSelect.value === '其他';
+        customInput.classList.toggle('hidden', !isCustom);
+        if (isCustom) customInput.focus(); else customInput.value = '';
+        saveDraft();
+      };
+      customInput.oninput = saveDraft;
+      workerInput.oninput = saveDraft;
+
+      const isCustomVal = name === '其他' || (name && !getSavedContractorsList().includes(name));
+      nameSelect.value = isCustomVal ? '其他' : name;
+      if (isCustomVal) { customInput.value = name === '其他' ? customName : name; customInput.classList.remove('hidden'); }
+      if (workers !== '') workerInput.value = workers;
+
+      container.appendChild(div);
+      refreshContractorTitles();
+      if (!isRestoringDraft) saveDraft();
+    }
+
+    function refreshContractorTitles() {
+      document.querySelectorAll('.contractor-group').forEach((g, i) => g.querySelector('.material-title').textContent = `施工廠商 ${i + 1}`);
+    }
+
+    function addMaterialRow(materialId = '', qty = '') {
+      const container = document.getElementById('materialsContainer');
+      if (container.children.length >= MAX_MATERIAL_ROWS) { alert(`最多 ${MAX_MATERIAL_ROWS} 筆用料`); return; }
+      const div = document.createElement('div');
+      div.className = 'material-group';
+
+      const header = document.createElement('div');
+      header.className = 'material-header';
+      const title = document.createElement('div');
+      title.className = 'material-title';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove-material-button';
+      removeBtn.textContent = '移除';
+      removeBtn.onclick = () => { div.remove(); refreshMaterialTitles(); saveDraft(); };
+      header.append(title, removeBtn);
+
+      const nameSelect = document.createElement('select');
+      nameSelect.className = 'mat-name';
+      nameSelect.add(new Option('請選擇標準材料...', ''));
+      nameSelect.options[0].disabled = true;
+      
+      MATERIAL_OPTIONS.forEach(m => {
+          const specStr = m.packageQuantity && m.packageUnit && m.stockUnit && m.packageUnit !== m.stockUnit ? ` (${m.packageQuantity}${m.packageUnit}/${m.stockUnit})` : '';
+          nameSelect.add(new Option(`${m.materialName}${specStr}`, m.materialId));
+      });
+
+      const row = document.createElement('div');
+      row.className = 'flex-row';
+      const qtyInput = document.createElement('input');
+      qtyInput.type = 'number';
+      qtyInput.className = 'mat-qty';
+      qtyInput.placeholder = '數量';
+      qtyInput.step = '0.1'; qtyInput.min = '0.1';
+
+      const unitDisplay = document.createElement('div');
+      unitDisplay.className = 'mat-unit-display';
+      unitDisplay.style.cssText = "padding:10px; background:#e9ecef; border:1px solid #ccc; border-radius:5px; color:#555; text-align:center; min-width:60px;";
+      unitDisplay.textContent = "單位";
+
+      row.append(qtyInput, unitDisplay);
+      
+      const balanceInfo = document.createElement('div');
+      balanceInfo.className = 'material-balance-info hidden';
+      balanceInfo.style.cssText = "font-size:13px; color:#555; background:#eef5ee; padding:8px; border-left:3px solid #00B900; margin-top:5px; border-radius:4px;";
+
+      div.append(header, nameSelect, row, balanceInfo);
+
+      nameSelect.onchange = () => {
+          const sId = nameSelect.value;
+          if (sId && MATERIAL_ITEMS_MAP.has(sId)) {
+              unitDisplay.textContent = MATERIAL_ITEMS_MAP.get(sId).stockUnit;
+          }
+          updateBalanceDisplay(div);
+          saveDraft();
+      };
+      qtyInput.oninput = () => { updateBalanceDisplay(div); saveDraft(); };
+
+      if (materialId && MATERIAL_ITEMS_MAP.has(materialId)) {
+          nameSelect.value = materialId;
+          unitDisplay.textContent = MATERIAL_ITEMS_MAP.get(materialId).stockUnit;
+      }
+      if (qty !== '') qtyInput.value = qty;
+
+      container.appendChild(div);
+      refreshMaterialTitles();
+      if (!isRestoringDraft) saveDraft();
+    }
+
+    function refreshMaterialTitles() {
+      const groups = document.querySelectorAll('#materialsContainer .material-group');
+      groups.forEach((group, index) => group.querySelector('.material-title').textContent = `品項 ${index + 1}`);
+      const addButton = document.getElementById('addMaterialButton');
+      addButton.disabled = groups.length >= MAX_MATERIAL_ROWS;
+    }
+
+    function updateBalanceDisplay(groupDiv) {
+        const select = groupDiv.querySelector('.mat-name');
+        const qtyInput = groupDiv.querySelector('.mat-qty');
+        const infoDiv = groupDiv.querySelector('.material-balance-info');
+
+        const materialId = select.value;
+        if (!materialId || !projectMaterialBalances[materialId]) {
+            infoDiv.classList.add('hidden');
+            return;
         }
 
-        const graphClient = await getGraphClient();
-        const safeProjectName = sanitizePathSegment(project.projectName);
-        const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
-        
-        // ⭐ 關鍵修正 3：明確宣告 reportDate 並針對模式處理
-        const { dateStr, timeStr } = getTaiwanDateParts();
-        const reportDate = formType === 'material_issue' ? (reportData.date || dateStr) : dateStr;
-        const submitDate = reportDate;
+        const balanceData = projectMaterialBalances[materialId];
+        const inputQty = Number(qtyInput.value) || 0;
+        const itemMap = MATERIAL_ITEMS_MAP.get(materialId);
+        const pkgQty = itemMap && itemMap.packageQuantity ? Number(itemMap.packageQuantity) : 1;
+        const baseUnit = itemMap ? (itemMap.baseUnit || itemMap.stockUnit) : '';
 
-        const inventoryMap = await buildInventoryMap(project);
+        const currentUsageBaseQty = inputQty * pkgQty;
+        const currentRemaining = balanceData.remainingBaseQuantity;
+        const expectedRemaining = currentRemaining - currentUsageBaseQty;
+        const formType = document.getElementById('formType').value;
 
-        // ============================
-        // 處理材料進場模式
-        // ============================
+        infoDiv.classList.remove('hidden');
+
         if (formType === 'material_issue') {
-            // ⭐ 新增後端進場類型驗證
-            if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
-                return res.status(400).json({ success: false, error: '進場類型不正確' });
-            }
-
-            if (!reportData.materialItems || reportData.materialItems.length === 0) {
-                return res.status(400).json({ success: false, error: '請至少選擇一項進場材料' });
-            }
-
-            let materialItems;
-            try {
-                materialItems = normalizeMaterialItems(reportData.materialItems, false, inventoryMap);
-            } catch (materialError) {
-                return res.status(400).json({ success: false, error: materialError.message });
-            }
-
-            await withMaterialWriteLock(project.projectId, async () => {
-                const txPath = `${projectFolderPath}/project-material-transactions.json`;
-                let txData = { transactions: [] };
-                try {
-                    txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false);
-                } catch (e) {}
-
-                const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
-                
-                materialItems.forEach(m => {
-                    txData.transactions.push({
-                        transactionDate: submitDate,
-                        transactionType: issueType,
-                        materialId: m.materialId,
-                        materialCode: m.materialCode,
-                        materialName: m.materialName,
-                        quantity: m.quantity,
-                        stockUnit: m.stockUnit,
-                        packageQuantity: m.packageQuantity,
-                        packageUnit: m.packageUnit,
-                        baseQuantity: m.baseQuantity,
-                        baseUnit: m.baseUnit,
-                        remarks: reportData.remarks || ''
-                    });
-                });
-
-                await ensureProjectFolder(project.projectName);
-                await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txPath}:/content`).put(Buffer.from(JSON.stringify(txData, null, 2), 'utf-8'));
-            });
-
-            const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
-            const issueTypeLabel = reportData.issueType === 'ADDITIONAL' ? '追加進場' : '開工首批進場';
-            let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
-            
-            materialItems.forEach(m => {
-                msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
-            });
-            if (reportData.remarks) msg += `\n備註：${reportData.remarks}`;
-
-            let pushed = false;
-            const config = await readBindingsFromOneDrive();
-            const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.projectId === project.projectId && b.active);
-            
-            if (binding) {
-                try { 
-                    await pushLineMessage(binding.groupId, msg); 
-                    pushed = true;
-                } catch (e) {
-                    console.error('LINE推播失敗', e);
-                }
-            }
-
-            return res.status(200).json({ success: true, pushed: pushed, message: '材料進場紀錄已成功歸檔' });
-        }
-
-        // ============================
-        // 處理施工日報模式
-        // ============================
-        const isNoWork = reportData.isNoWork === true;
-        let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
-        if (!isNoWork && contractorItems.length === 0) {
-             return res.status(400).json({ success: false, error: '請填寫施工廠商' });
-        }
-
-        const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + Number(item.workerCount), 0);
-
-        await ensureProjectFolder(project.projectName);
-        const [textFolderResult, dataFolderResult] = await Promise.all([
-            ensureChildFolder(graphClient, projectFolderPath, '施工日報'),
-            ensureChildFolder(graphClient, projectFolderPath, '結構化資料')
-        ]);
-        
-        const submittedSubmissionId = String(reportData.submissionId || '').trim();
-        const fullSubmissionId = submittedSubmissionId || crypto.randomUUID();
-        const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
-
-        const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
-        let materialItems;
-        try {
-            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork, inventoryMap);
-        } catch (materialError) {
-            return res.status(400).json({ success: false, error: materialError.message });
-        }
-
-        const structuredReport = {
-            schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: reportDate,
-            submissionId: fullSubmissionId, submittedAt: new Date().toISOString(), submittedDateLocal: dateStr, submittedTimeLocal: timeStr,
-            reporterName: String(reportData.reporterName || '未紀錄').trim(),
-            isNoWork, noWorkReason: isNoWork ? String(reportData.noWorkReason || '') : '',
-            weather: { temp: reportData.temp, humidity: reportData.humidity, wind: reportData.wind },
-            contractorItems, totalWorkerCount: calculatedTotalWorkerCount, workItems: isNoWork ? [] : workItems,
-            customWorkItem: isNoWork ? '' : String(reportData.customWorkItem || ''), workNotes: isNoWork ? '' : String(reportData.workNotes || ''),
-            materialItems, remarks: String(reportData.remarks || '')
-        };
-
-        const baseFileName = `${reportDate}_${shortSubmissionId}`;
-        const jsonFilePath = `${dataFolderResult.folderPath}/${baseFileName}.json`;
-        const txtFilePath = `${textFolderResult.folderPath}/${baseFileName}_施工日報.txt`;
-
-        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${jsonFilePath}:/content`).put(Buffer.from(JSON.stringify(structuredReport, null, 2), 'utf-8'));
-
-        let alertMsgs = [];
-        if (!isNoWork && materialItems.length > 0) {
-            const txData = await readJsonFromOneDrive(`${projectFolderPath}/project-material-transactions.json`, { transactions: [] }, false);
-            const issuedStats = {};
-            (txData.transactions || []).forEach(tx => {
-                const key = tx.materialId;
-                issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
-            });
-            
-            const sRes = await generateProjectStats(project);
-            if (sRes.stats) {
-                materialItems.forEach(m => {
-                    const key = m.materialId;
-                    const totCons = sRes.stats.materialStats[key] || 0;
-                    const totIss = issuedStats[key] || 0;
-                    const bal = totIss - totCons;
-                    
-                    if (bal < 0) {
-                        alertMsgs.push(`⚠️ ${m.materialName}\n • 累計領入: ${totIss} ${m.baseUnit}\n • 累計耗用: ${totCons} ${m.baseUnit}\n • 理論剩餘: ${bal} ${m.baseUnit}`);
-                    }
-                });
-            }
-        }
-
-        const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
-        let reportText = `📋 施工日報\n\n日期：${reportDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n`;
-        
-        if (!isNoWork) {
-            reportText += `溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
+            const issueType = document.getElementById('issueType').value;
+            const issueLabel = issueType === 'OPENING' ? '本次開工首批進場' : '本次追加進場';
+            infoDiv.style.borderLeftColor = '#00B900';
+            infoDiv.style.backgroundColor = '#eef5ee';
+            infoDiv.innerHTML = `
+                <strong>目前案場剩餘：</strong> ${currentRemaining} ${baseUnit}<br>
+                <span style="color: #00B900;"><strong>${issueLabel}：</strong> +${currentUsageBaseQty} ${baseUnit}</span><br>
+                <strong>登記後預計剩餘：</strong> ${currentRemaining + currentUsageBaseQty} ${baseUnit}
+            `;
         } else {
-            reportText += `🛑 今日無出工\n原因：${reportData.noWorkReason}\n備註：${reportData.remarks || '無'}`;
-        }
-        
-        if (alertMsgs.length > 0) {
-            reportText += `\n\n🚨 【系統異常警示：材料帳庫存不足】\n\n` + alertMsgs.join('\n\n') + `\n\n💡 請協助確認是否漏登材料進場`;
-        }
-        
-        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txtFilePath}:/content`).put(reportText);
-
-        let pushed = false;
-        const config = await readBindingsFromOneDrive();
-        const binding = (Array.isArray(config.bindings) ? config.bindings : []).find(b => b.projectId === project.projectId && b.active);
-
-        if (binding) {
-            try { 
-                await pushLineMessage(binding.groupId, reportText); 
-                pushed = true;
-            } catch (e) {
-                console.error('LINE推播失敗', e);
+            if (expectedRemaining < 0 && inputQty > 0) {
+                infoDiv.style.borderLeftColor = '#dc3545';
+                infoDiv.style.backgroundColor = '#fff3f3';
+                infoDiv.innerHTML = `
+                    <strong>目前案場剩餘：</strong> ${currentRemaining} ${baseUnit}<br>
+                    <strong>本次預計耗用：</strong> -${currentUsageBaseQty} ${baseUnit}<br>
+                    <strong>送出後預計剩餘：</strong> <span style="color: #dc3545; font-weight: bold;">${expectedRemaining} ${baseUnit}</span><br>
+                    <div style="margin-top: 4px; font-size: 12px; color: #dc3545;">⚠️ 送出後請確認是否漏登進場單據</div>
+                `;
+            } else {
+                infoDiv.style.borderLeftColor = '#00B900';
+                infoDiv.style.backgroundColor = '#eef5ee';
+                infoDiv.innerHTML = `
+                    <strong>案場累計進場：</strong> ${balanceData.issuedBaseQuantity} ${baseUnit}<br>
+                    <strong>先前已耗用：</strong> ${balanceData.consumedBaseQuantity} ${baseUnit}<br>
+                    <strong>目前理論剩餘：</strong> ${currentRemaining} ${baseUnit}<br>
+                    <span style="color: #007bff;"><strong>送出後預計剩餘：</strong> ${expectedRemaining} ${baseUnit}</span>
+                `;
             }
         }
-        
-        return res.status(200).json({ success: true, pushed: pushed, message: '日報已歸檔' });
-
-    } catch (error) {
-        console.error('提交錯誤：', error);
-        return res.status(500).json({ success: false, error: error.message || '系統內部處理失敗' });
     }
-});
 
-const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET'];
-if (requiredVars.some(v => !process.env[v])) {
-    console.error('缺少必要環境變數');
-    process.exit(1);
-}
+    async function getWeather() {
+      if (!navigator.geolocation) { alert('此裝置不支援定位'); return; }
+      navigator.geolocation.getCurrentPosition(async position => {
+        try {
+          const lat = position.coords.latitude, lon = position.coords.longitude;
+          const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m&wind_speed_unit=ms&timezone=Asia%2FTaipei`);
+          if (!res.ok) throw new Error('氣象服務錯誤');
+          const data = await res.json();
+          document.getElementById('temp').value = Number(data.current.temperature_2m).toFixed(1);
+          document.getElementById('humidity').value = Math.round(data.current.relative_humidity_2m);
+          document.getElementById('wind').value = Number(data.current.wind_speed_10m).toFixed(1);
+          saveDraft();
+        } catch (error) {} 
+      }, () => {}, { timeout: 10000 });
+    }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+    function saveDraft() {
+      if (isRestoringDraft || reportArchived || (projectMode !== 'LOCKED' && projectMode !== 'COMPATIBLE')) return;
+      
+      const materialsList = [...document.querySelectorAll('#materialsContainer .material-group')].map(group => ({
+        materialId: group.querySelector('.mat-name').value,
+        qty: group.querySelector('.mat-qty').value
+      }));
+
+      const contractorsList = [...document.querySelectorAll('#contractorsContainer .contractor-group')].map(group => ({
+        name: group.querySelector('.contractor-name').value,
+        customName: group.querySelector('.custom-contractor-name')?.value.trim() || '',
+        workers: group.querySelector('.contractor-workers').value
+      }));
+
+      const draft = {
+        formType: document.getElementById('formType').value,
+        issueType: document.getElementById('issueType').value,
+        submissionId: ensureSubmissionId(),
+        projectId: document.getElementById('projectId').value.trim(),
+        reporterName: document.getElementById('reporterName').value.trim(), 
+        reportDate: document.getElementById('reportDate').value,
+        isNoWork: document.getElementById('noWorkToday').checked,
+        noWorkReason: document.getElementById('noWorkReason').value,
+        contractorsList, 
+        workItems: [...document.querySelectorAll('input[name="workItem"]:checked')].map(cb => cb.value),
+        customWorkItem: document.getElementById('customWorkItem').value,
+        workNotes: document.getElementById('workNotes').value,
+        noMaterial: document.getElementById('noMaterial').checked,
+        materialsList,
+        remarks: document.getElementById('remarks').value,
+        temp: document.getElementById('temp').value,
+        humidity: document.getElementById('humidity').value,
+        wind: document.getElementById('wind').value
+      };
+      localStorage.setItem(getDraftKey(), JSON.stringify(draft));
+    }
+
+    function loadDraft() {
+      isRestoringDraft = true;
+      try {
+        const saved = localStorage.getItem(getDraftKey());
+        if (!saved) { 
+          currentSubmissionId = createSubmissionId();
+          addContractorRow(); addMaterialRow(); return; 
+        }
+        
+        const draft = JSON.parse(saved);
+        if (draft.formType) switchMode(draft.formType);
+        if (draft.issueType) document.getElementById('issueType').value = draft.issueType;
+        if (draft.reportDate) document.getElementById('reportDate').value = draft.reportDate;
+
+        currentSubmissionId = String(draft.submissionId || createSubmissionId());
+        
+        if (draft.isNoWork) {
+            document.getElementById('noWorkToday').checked = true;
+            document.getElementById('noWorkReason').value = draft.noWorkReason || '';
+            handleNoWorkChange();
+        }
+
+        document.getElementById('temp').value = draft.temp || '';
+        document.getElementById('humidity').value = draft.humidity || '';
+        document.getElementById('wind').value = draft.wind || '';
+        document.getElementById('workNotes').value = draft.workNotes || '';
+        document.getElementById('remarks').value = draft.remarks || '';
+
+        // ⭐ 完全補回草稿恢復機制
+        document.getElementById('reporterName').value = draft.reporterName || document.getElementById('reporterName').value;
+
+        document.getElementById('contractorsContainer').innerHTML = '';
+        if (Array.isArray(draft.contractorsList) && draft.contractorsList.length > 0) {
+            draft.contractorsList.forEach(c => addContractorRow(c.name, c.customName, c.workers));
+        } else {
+            addContractorRow();
+        }
+
+        if (Array.isArray(draft.workItems)) {
+            document.querySelectorAll('input[name="workItem"]').forEach(checkbox => {
+                checkbox.checked = draft.workItems.includes(checkbox.value);
+            });
+            const hasOther = draft.workItems.includes('其他');
+            const customWorkInput = document.getElementById('customWorkItem');
+            customWorkInput.classList.toggle('hidden', !hasOther);
+            customWorkInput.value = hasOther ? (draft.customWorkItem || '') : '';
+        }
+
+        const noMaterial = draft.noMaterial === true;
+        document.getElementById('noMaterial').checked = noMaterial;
+        
+        if (noMaterial) {
+          handleNoMaterialChange();
+        } else {
+          document.getElementById('materialsContainer').style.display = 'block';
+          if (Array.isArray(draft.materialsList) && draft.materialsList.length > 0) {
+            document.getElementById('materialsContainer').innerHTML = '';
+            draft.materialsList.forEach(m => addMaterialRow(m.materialId || '', m.qty || ''));
+          } else { addMaterialRow(); }
+        }
+      } catch (error) {
+        localStorage.removeItem(getDraftKey());
+        document.getElementById('contractorsContainer').innerHTML = '';
+        addContractorRow(); addMaterialRow();
+      } finally {
+        isRestoringDraft = false;
+      }
+    }
+
+    function buildMaterialItems() {
+      const formType = document.getElementById('formType').value;
+      const isNoWork = formType === 'daily_report' && document.getElementById('noWorkToday').checked;
+      const isNoMaterial = formType === 'daily_report' && document.getElementById('noMaterial').checked;
+      if (isNoWork || isNoMaterial) return [];
+
+      return [...document.querySelectorAll('#materialsContainer .material-group')]
+        .map(group => {
+          const selectedId = group.querySelector('.mat-name').value;
+          if (!selectedId || !MATERIAL_ITEMS_MAP.has(selectedId)) return null;
+
+          const item = MATERIAL_ITEMS_MAP.get(selectedId);
+          const quantity = Number(group.querySelector('.mat-qty').value) || 0;
+
+          return {
+            materialId: item.materialId,
+            materialCode: item.materialCode,
+            materialName: item.materialName,
+            quantity,
+            stockUnit: item.stockUnit,
+            packageQuantity: item.packageQuantity,
+            packageUnit: item.packageUnit,
+            baseQuantity: quantity * (item.packageQuantity || 1),
+            baseUnit: item.baseUnit || item.stockUnit
+          };
+        })
+        .filter(item => item && item.quantity > 0);
+    }
+
+    function validateProject() {
+      if (projectMode !== 'LOCKED' && projectMode !== 'COMPATIBLE') { alert('案場資料尚未載入'); return false; }
+      if (!getSelectedProjectName()) { alert('請選擇案場'); return false; }
+      return true;
+    }
+
+    function validateForm() {
+      const reporterName = document.getElementById('reporterName').value.trim();
+      if (!reporterName) { alert('請填寫您的填表人姓名'); return false; }
+
+      const formType = document.getElementById('formType').value;
+      const mGroups = [...document.querySelectorAll('#materialsContainer .material-group')];
+      const selectedMatIds = new Set();
+
+      if (formType === 'material_issue') {
+          const issueType = document.getElementById('issueType').value;
+          const reportDate = document.getElementById('reportDate').value;
+
+          if (!issueType) { alert('請選擇進場類型'); return false; }
+          if (!reportDate) { alert('請選擇實際進場日期'); return false; }
+
+          let validCount = 0;
+          for (let i = 0; i < mGroups.length; i++) {
+              const selectedId = mGroups[i].querySelector('.mat-name').value;
+              const qty = Number(mGroups[i].querySelector('.mat-qty').value);
+              
+              if (!selectedId && !qty) continue;
+              if (!selectedId) { alert(`請選擇進場材料 ${i + 1} 的品項`); return false; }
+              if (!qty || qty <= 0) { alert(`請輸入進場材料 ${i + 1} 的正確數量`); return false; }
+              
+              if (selectedMatIds.has(selectedId)) {
+                  alert(`材料重複選取，請將相同材料合併為一筆數量計算`);
+                  return false;
+              }
+              selectedMatIds.add(selectedId);
+              validCount++;
+          }
+          if (validCount === 0) { alert('請至少填寫一筆進場材料'); return false; }
+          return true;
+      }
+
+      const isNoWork = document.getElementById('noWorkToday').checked;
+      if (isNoWork) {
+         if (!document.getElementById('noWorkReason').value) { alert('請選擇今日無出工原因'); return false; }
+      } else {
+          const cGroups = document.querySelectorAll('#contractorsContainer .contractor-group');
+          if (cGroups.length === 0) { alert('請至少填寫一組施工廠商'); return false; }
+          
+          const contractorNames = new Set(); 
+          for (let i = 0; i < cGroups.length; i++) {
+              const group = cGroups[i];
+              const name = group.querySelector('.contractor-name').value;
+              const custom = group.querySelector('.custom-contractor-name')?.value.trim() || '';
+              const workers = group.querySelector('.contractor-workers').value;
+
+              if (!name) { alert(`請選擇施工廠商 ${i + 1} 的名稱`); return false; }
+              if (name === '其他' && !custom) { alert(`請輸入施工廠商 ${i + 1} 的自訂名稱`); return false; }
+              
+              const workerCount = Number(workers);
+              if (!Number.isInteger(workerCount) || workerCount <= 0 || workerCount > 200) { 
+                  alert(`請輸入施工廠商 ${i + 1} 的正確整數人數`); 
+                  return false; 
+              }
+
+              const finalContractorName = name === '其他' ? custom : name;
+              const normalizedContractorName = finalContractorName.normalize('NFKC').replace(/\s+/g, ' ').trim();
+              
+              if (contractorNames.has(normalizedContractorName)) {
+                  alert(`施工廠商「${finalContractorName}」重複填寫，請合併人數`);
+                  return false;
+              }
+              contractorNames.add(normalizedContractorName);
+          }
+
+          const selectedWorkItems = [...document.querySelectorAll('input[name="workItem"]:checked')];
+          const workNotes = document.getElementById('workNotes').value.trim();
+          
+          if (selectedWorkItems.length === 0 && !workNotes) { 
+              alert('請選擇施工作業項目或填寫作業內容補充'); return false; 
+          }
+          if (selectedWorkItems.some(cb => cb.value === '其他') && !document.getElementById('customWorkItem').value.trim()) { 
+              alert('請輸入其他作業項目名稱'); return false; 
+          }
+          
+          if (!document.getElementById('noMaterial').checked) {
+              let matValidCount = 0;
+              for (let i = 0; i < mGroups.length; i++) {
+                  const selectedId = mGroups[i].querySelector('.mat-name').value;
+                  const qty = Number(mGroups[i].querySelector('.mat-qty').value);
+                  
+                  if (!selectedId && !qty) continue;
+                  if (!selectedId) { alert(`請選擇用料 ${i + 1} 的品項`); return false; }
+                  if (!qty || qty <= 0) { alert(`請輸入用料 ${i + 1} 的正確數量`); return false; }
+                  
+                  if (selectedMatIds.has(selectedId)) {
+                      alert(`材料重複選取，請將相同材料合併為一筆數量計算`);
+                      return false;
+                  }
+                  selectedMatIds.add(selectedId);
+                  matValidCount++;
+              }
+              if (matValidCount === 0) { alert('請選擇今日用料，或勾選「今日無用料」'); return false; }
+          }
+      }
+      return true;
+    }
+
+    async function submitForm() {
+      if (isSubmitting) return;
+      if (!validateProject()) return;
+      if (!validateForm()) return;
+
+      const submitButton = document.getElementById('submitButton');
+      isSubmitting = true;
+      submitButton.disabled = true;
+      submitButton.textContent = '⏳ 正在送出，請稍候...';
+
+      const formType = document.getElementById('formType').value;
+      let payload = {
+        formType: formType,
+        projectId: document.getElementById('projectId').value.trim(),
+        projectName: getSelectedProjectName(),
+        submissionId: ensureSubmissionId(),
+        reporterName: document.getElementById('reporterName').value.trim(),
+        remarks: document.getElementById('remarks').value.trim() || '無'
+      };
+
+      if (formType === 'material_issue') {
+          payload.issueType = document.getElementById('issueType').value;
+          payload.date = document.getElementById('reportDate').value;
+          payload.materialItems = buildMaterialItems();
+      } else {
+          const isNoWork = document.getElementById('noWorkToday').checked;
+          if (isNoWork) {
+              payload.isNoWork = true;
+              payload.noWorkReason = document.getElementById('noWorkReason').value;
+              payload.contractor = '無出工'; payload.workerCount = '0'; payload.progress = '本日無出工'; payload.materials = '無';
+              payload.contractorItems = [];
+          } else {
+              let totalWorkers = 0;
+              const contractorItems = [];
+              const contractorListStr = [];
+              
+              document.querySelectorAll('#contractorsContainer .contractor-group').forEach(group => {
+                  const select = group.querySelector('.contractor-name').value;
+                  const name = select === '其他' ? group.querySelector('.custom-contractor-name').value.trim() : select;
+                  const workers = Number(group.querySelector('.contractor-workers').value);
+                  
+                  if (name && Number.isInteger(workers) && workers > 0) {
+                      contractorItems.push({ contractorName: name, workerCount: workers });
+                      contractorListStr.push(`• ${name}（${workers}人）`);
+                      totalWorkers += workers;
+                  }
+              });
+
+              payload.isNoWork = false;
+              payload.contractorItems = contractorItems;
+              payload.contractor = '\n' + contractorListStr.join('\n');
+              payload.workerCount = `共 ${totalWorkers} 人`;
+              
+              const workItems = [...document.querySelectorAll('input[name="workItem"]:checked')].map(i => i.value);
+              const customWork = document.getElementById('customWorkItem').value.trim();
+              payload.workItems = workItems;
+              payload.customWorkItem = customWork;
+              payload.workNotes = document.getElementById('workNotes').value.trim();
+              
+              let progressStr = workItems.map(w => `• ${w === '其他' ? customWork : w}`).join('\n');
+              if (payload.workNotes) {
+                  progressStr += (progressStr ? '\n' : '') + `(補充: ${payload.workNotes})`;
+              }
+              payload.progress = progressStr || '未填寫施作項目';
+              
+              payload.materialItems = buildMaterialItems();
+              payload.materials = document.getElementById('noMaterial').checked ? '無' : payload.materialItems.map(m => `${m.materialName}：${m.quantity}${m.stockUnit}`).join('\n');
+          }
+      }
+
+      try {
+        const response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        
+        const responseText = await response.text();
+        let result = {};
+        try {
+            result = responseText ? JSON.parse(responseText) : {};
+        } catch {
+            throw new Error(`後端回傳格式錯誤，HTTP ${response.status}`);
+        }
+        
+        if (!response.ok || result.success !== true) {
+            throw new Error(result.error || result.message || `HTTP ${response.status}`);
+        }
+
+        localStorage.removeItem(getDraftKey());
+        alert(result.message || '✅ 資料已成功送出與歸檔');
+        if (window.liff && liff.isInClient()) liff.closeWindow();
+        
+      } catch (error) {
+        console.error('送出失敗完整資訊：', error);
+        alert(
+            `⚠️ 資料送出失敗\n\n` +
+            `原因：${error.message || '未知錯誤'}\n\n` +
+            `表單內容仍保留，請勿重新填寫。`
+        );
+      } finally {
+        isSubmitting = false;
+        submitButton.disabled = false;
+        submitButton.textContent = formType === 'material_issue' ? '確認送出材料進場紀錄' : '確認送出施工日報';
+      }
+    }
+  </script>
+</body>
+</html>
