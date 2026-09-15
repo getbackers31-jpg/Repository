@@ -63,7 +63,6 @@ function validateProjectName(projectName) {
     return normalizedName;
 }
 
-// ⭐ 補回的函式
 function getProjectRegistrationErrorMessage(error) {
     const message = String(error?.message || '');
     const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
@@ -134,7 +133,6 @@ async function readProjectsFromOneDrive() {
     return cloneJsonData(data);
 }
 
-// ⭐ 補回的函式
 async function writeProjectsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/projects.json', config);
     configCache.projects = { data: cloneJsonData(config), timestamp: Date.now() };
@@ -148,7 +146,6 @@ async function readBindingsFromOneDrive() {
     return cloneJsonData(data);
 }
 
-// ⭐ 補回的函式
 async function writeBindingsToOneDrive(config) {
     await writeJsonToOneDrive('工程專案管理/_系統設定/line-bindings.json', config);
     configCache.bindings = { data: cloneJsonData(config), timestamp: Date.now() };
@@ -247,12 +244,10 @@ async function findProjectById(projectId) {
     return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
 }
 
-// ⭐ 補回的函式
 function createProjectId() {
     return `PRJ-${crypto.randomUUID()}`;
 }
 
-// ⭐ 補回的函式
 async function registerProjectByName(projectName) {
     return withProjectWriteLock(async () => {
         const normalizedName = validateProjectName(projectName);
@@ -504,6 +499,171 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
+// ==========================================
+// API 路由
+// ==========================================
+
+// Webhook 必須使用 express.raw，維持獨立
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const signature = req.get('x-line-signature');
+    if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
+    
+    let body;
+    try { body = JSON.parse(req.body.toString('utf8')); } 
+    catch (error) { return res.status(400).send('Invalid JSON'); }
+    
+    res.status(200).send('OK');
+
+    for (const event of body.events || []) {
+        try {
+            const targetId = getLineTargetId(event);
+            
+            if (event.type === 'message' && event.message.type === 'text') {
+                const text = event.message.text.trim();
+                
+                if (text.startsWith('設定案場')) {
+                    if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用。'); continue; }
+                    const match = text.match(/^設定案場\s+(.+)$/);
+                    if (!match) { await replyLineMessage(event.replyToken, '⚠️ 格式錯誤\n正確格式：設定案場 大安區'); continue; }
+                    
+                    try {
+                        const reg = await registerProjectByName(match[1]);
+                        await withBindingWriteLock(async () => {
+                            const config = await readBindingsFromOneDrive();
+                            const bindings = (config.bindings || []).filter(b => b.projectId !== reg.project.projectId && b.groupId !== targetId);
+                            bindings.push({ 
+                                projectId: reg.project.projectId, projectName: reg.project.projectName, 
+                                groupId: targetId, active: true 
+                            });
+                            await writeBindingsToOneDrive({ ...config, bindings });
+                        });
+                        await replyLineMessage(event.replyToken, `✅ 案場設定完成\n\n網址：https://liff.line.me/${LIFF_ID}/?projectId=${encodeURIComponent(reg.project.projectId)}`);
+                    } catch (error) {
+                        await replyLineMessage(event.replyToken, `⚠️ 無法建立案場\n${getProjectRegistrationErrorMessage(error)}`);
+                    }
+                }
+                else if (text === '查詢案場' || text === '案場查詢') {
+                    if (!targetId) continue;
+                    const config = await readBindingsFromOneDrive();
+                    const binding = (config.bindings || []).find(b => b.groupId === targetId && b.active);
+                    await replyLineMessage(event.replyToken, binding ? `📍 本群組綁定案場：\n${binding.projectName}` : '⚠️ 尚未設定案場');
+                }
+                else if (text === '解除案場') {
+                    if (!targetId) continue;
+                    await withBindingWriteLock(async () => {
+                        const config = await readBindingsFromOneDrive();
+                        const filtered = (config.bindings || []).filter(b => b.groupId !== targetId);
+                        if (filtered.length === (config.bindings || []).length) { await replyLineMessage(event.replyToken, '無綁定紀錄。'); return; }
+                        await writeBindingsToOneDrive({ ...config, bindings: filtered });
+                        await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
+                    });
+                }
+                else if (text === '查詢統計' || text === '案場統計') {
+                    if (!targetId) continue;
+                    const bindingConfig = await readBindingsFromOneDrive();
+                    const currentBinding = (bindingConfig.bindings || []).find(b => b.groupId === targetId && b.active);
+                    if (!currentBinding) { 
+                        await replyLineMessage(event.replyToken, '⚠️ 本群組目前沒有綁定案場'); continue; 
+                    }
+
+                    const config = await readProjectsFromOneDrive();
+                    const project = (config.projects || []).find(p => p.projectId === currentBinding.projectId);
+                    if (!project) continue;
+
+                    try {
+                        const result = await generateProjectStats(project);
+                        if (result.error || !result.stats) { 
+                            await replyLineMessage(event.replyToken, '⚠️ 查詢失敗'); continue; 
+                        }
+                        
+                        const stats = result.stats;
+                        let msg = `【${project.projectName}】累計統計表\n━━━━━━━━━━━━\n實際工作天：${stats.workDays} 天\n免計工作天：${stats.noWorkDays} 天\n全案總人天：${stats.totalManDays} 人天\n\n[ 各廠商出工統計 ]\n`;
+                        
+                        for (const [name, data] of Object.entries(stats.contractorStats)) {
+                            msg += ` • ${name}：${data.workDays}天 (${data.manDays}人天)\n`;
+                        }
+                        
+                        msg += `\n[ 材料累計消耗 ]\n`;
+                        for (const [key, qty] of Object.entries(stats.materialStats)) {
+                            const detail = stats.materialDetails[key] || { name: key, unit: '' };
+                            msg += ` • ${detail.name}：共 ${qty} ${detail.unit}\n`;
+                        }
+                        
+                        await replyLineMessage(event.replyToken, msg);
+                    } catch (err) {
+                        await replyLineMessage(event.replyToken, '⚠️ 統計發生錯誤，請稍後再試。');
+                    }
+                }
+                else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
+                    await replyLineMessage(event.replyToken, '📖 「云說工程小幫手」指令：\n\n🔹 設定案場 案場名稱\n🔹 查詢案場\n🔹 查詢統計\n🔹 解除案場\n🔹 結案 案場名稱');
+                }
+                else if (text.startsWith('結案')) {
+                    if (!targetId) continue;
+                    const match = text.match(/^結案\s+(.+)$/);
+                    if (!match) continue;
+                    
+                    const bindings = await readBindingsFromOneDrive();
+                    const b = (bindings.bindings || []).find(x => x.groupId === targetId && x.active);
+                    if (!b || normalizeProjectName(b.projectName) !== normalizeProjectName(match[1])) {
+                        await replyLineMessage(event.replyToken, `⚠️ 名稱不符或無綁定`); 
+                        continue;
+                    }
+
+                    await withProjectWriteLock(async () => {
+                        const config = await readProjectsFromOneDrive();
+                        const pIdx = (config.projects || []).findIndex(p => p.projectId === b.projectId);
+                        if (pIdx === -1) {
+                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。'); return;
+                        }
+                        
+                        const closingProject = config.projects[pIdx];
+
+                        try {
+                            const resExcel = await fetch(`http://localhost:${PORT}/api/projects/${b.projectId}/export-excel`);
+                            if (!resExcel.ok) {
+                                const errorText = await resExcel.text();
+                                throw new Error(`HTTP ${resExcel.status} ${errorText}`);
+                            }
+                            
+                            const contentType = resExcel.headers.get('content-type') || '';
+                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
+                                throw new Error('結案 API 未回傳 Excel 檔案');
+                            }
+                            
+                            const buf = Buffer.from(await resExcel.arrayBuffer());
+                            const { dateStr } = getTaiwanDateParts();
+                            const gClient = await getGraphClient();
+                            
+                            await gClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
+                                
+                        } catch(e) { 
+                            console.error('結案失敗', e);
+                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${e.message})\n案場尚未下架。`); 
+                            return; 
+                        }
+                        
+                        config.projects.splice(pIdx, 1);
+                        await writeProjectsToOneDrive(config);
+                        
+                        await withBindingWriteLock(async () => {
+                            const latestB = await readBindingsFromOneDrive();
+                            await writeBindingsToOneDrive({ 
+                                ...latestB, 
+                                bindings: (latestB.bindings || []).filter(x => x.projectId !== b.projectId) 
+                            });
+                        });
+                        
+                        await replyLineMessage(event.replyToken, `✅ 案場「${match[1]}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
+                    });
+                }
+            }
+        } catch (e) { console.error('Webhook Error', e); }
+    }
+});
+
+// ⭐ 關鍵修正 1：所有的 API 路由前套用 express.json()
+app.use('/api', express.json());
+
 app.get('/api/projects', async (req, res) => {
     try {
         const config = await readProjectsFromOneDrive();
@@ -580,6 +740,213 @@ app.get('/api/projects/:projectId/material-balances', async (req, res) => {
     }
 });
 
+app.get('/api/projects/:projectId/export-excel', async (req, res) => {
+    try {
+        const projectId = req.params.projectId;
+        const project = await findProjectById(projectId);
+        
+        if (!project) {
+            return res.status(404).json({ success: false, message: '找不到此專案' });
+        }
+        
+        const projectName = project.projectName;
+        const projectBasePath = `工程專案管理/2026_工程專案/${projectName}`;
+
+        const inventoryMap = await buildInventoryMap(project);
+
+        let transactionData = await readJsonFromOneDrive(`${projectBasePath}/project-material-transactions.json`, { transactions: [] }, false);
+        const { stats, reports, dataQuality } = await generateProjectStats(project);
+
+        const workbook = new ExcelJS.Workbook();
+        workbook.creator = '工程專案自動化系統';
+        const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
+
+        // 第一張表：案場總表
+        const wsSummary = workbook.addWorksheet('案場總表');
+        wsSummary.views = [{ showGridLines: true }];
+        
+        const startDate = reports.length > 0 ? reports[0].reportDate : '未定';
+        const endDate = reports.length > 0 ? reports[reports.length - 1].reportDate : '未定';
+        let calDays = 0;
+        if(startDate !== '未定' && endDate !== '未定') {
+            calDays = Math.floor((Date.parse(`${endDate}T00:00:00+08:00`) - Date.parse(`${startDate}T00:00:00+08:00`)) / 86400000) + 1;
+        }
+        
+        wsSummary.addRow(['案場名稱', projectName]);
+        wsSummary.addRow(['開案日期', startDate]);
+        wsSummary.addRow(['結案日期', endDate]);
+        wsSummary.addRow(['累計日曆天', calDays]);
+        wsSummary.addRow(['實際工作天', stats.workDays]);
+        wsSummary.addRow(['免計工作天', stats.noWorkDays]);
+        wsSummary.addRow(['全案總人天', stats.totalManDays]);
+        wsSummary.addRow([]);
+        
+        wsSummary.addRow(['【各廠商出工統計】']);
+        wsSummary.addRow(['廠商名稱', '出工工作天', '累計人天', '平均每日人數', '占全案人天比例']);
+        for (const [name, data] of Object.entries(stats.contractorStats)) {
+            const ratio = stats.totalManDays > 0 ? ((data.manDays / stats.totalManDays) * 100).toFixed(1) + '%' : '0%';
+            wsSummary.addRow([name, data.workDays, data.manDays, (data.manDays / data.workDays).toFixed(1), ratio]);
+        }
+        wsSummary.addRow([]);
+        
+        wsSummary.addRow(['【各填表人填報統計】']);
+        wsSummary.addRow(['填表人', '出工天數']);
+        for (const [name, days] of Object.entries(stats.reporterStats)) {
+            wsSummary.addRow([name, days]);
+        }
+
+        // 第二張表：材料結案總表
+        const wsMaterials = workbook.addWorksheet('材料結案總表');
+        wsMaterials.views = [{ showGridLines: true }];
+        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
+        
+        const materialSummaryMap = {};
+        (transactionData.transactions || []).forEach(tx => {
+            const pkgSpec = `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`;
+            const uniqueKey = tx.materialId || `${tx.materialName}_${pkgSpec}`;
+            
+            if (!materialSummaryMap[uniqueKey]) {
+                materialSummaryMap[uniqueKey] = { 
+                    materialCode: resolveMaterialCode(tx), 
+                    materialName: tx.materialName, 
+                    packageSpec: pkgSpec, 
+                    stockUnit: tx.stockUnit, 
+                    issuedQty: 0, 
+                    baseIssuedQty: 0, 
+                    consumedBaseQty: 0, 
+                    baseUnit: tx.baseUnit 
+                };
+            }
+            materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0); 
+            materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
+        });
+        
+        reports.forEach(report => {
+            (report.materialItems || []).forEach(item => {
+                const pkgSpec = `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`;
+                const uniqueKey = item.materialId || `${item.materialName}_${pkgSpec}`;
+                
+                if (!materialSummaryMap[uniqueKey]) {
+                    materialSummaryMap[uniqueKey] = { 
+                        materialCode: resolveMaterialCode(item), 
+                        materialName: item.materialName, 
+                        packageSpec: pkgSpec, 
+                        stockUnit: item.stockUnit, 
+                        issuedQty: 0, 
+                        baseIssuedQty: 0, 
+                        consumedBaseQty: 0, 
+                        baseUnit: item.baseUnit 
+                    };
+                }
+                materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
+            });
+        });
+        
+        let matRowIdx = 2;
+        Object.values(materialSummaryMap).forEach(m => {
+            wsMaterials.addRow([
+                m.materialCode, m.materialName, m.packageSpec, m.stockUnit, 
+                m.issuedQty, m.baseIssuedQty, m.consumedBaseQty, 
+                { formula: `=F${matRowIdx}-G${matRowIdx}`, result: m.baseIssuedQty - m.consumedBaseQty }, 
+                m.baseUnit
+            ]);
+            matRowIdx++;
+        });
+
+        // 第三張表：材料進出紀錄
+        const wsTxLog = workbook.addWorksheet('材料進出紀錄');
+        wsTxLog.views = [{ showGridLines: true }];
+        wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
+        
+        const typeMap = { 'OPENING_ISSUE': '開工領入', 'ADDITIONAL_ISSUE': '追加領入' };
+        
+        (transactionData.transactions || []).forEach(tx => {
+            wsTxLog.addRow([
+                tx.transactionDate, 
+                typeMap[tx.transactionType] || tx.transactionType, 
+                resolveMaterialCode(tx), 
+                tx.materialName, 
+                `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`, 
+                tx.quantity, tx.stockUnit, tx.baseQuantity, tx.baseUnit, tx.remarks || ''
+            ]);
+        });
+        
+        reports.forEach(r => {
+            (r.materialItems || []).forEach(item => {
+                wsTxLog.addRow([
+                    r.reportDate, '施工耗用', 
+                    resolveMaterialCode(item), 
+                    item.materialName, 
+                    `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`, 
+                    item.quantity, item.stockUnit, item.baseQuantity, item.baseUnit, item.remarks || '日報自動記錄'
+                ]);
+            });
+        });
+
+        // 第四張表：日報明細
+        const wsDaily = workbook.addWorksheet('日報明細');
+        wsDaily.views = [{ showGridLines: true }];
+        wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
+        
+        reports.forEach(r => {
+            wsDaily.addRow([
+                r.reportDate, r.reporterName || '未紀錄', r.isNoWork ? '無出工' : '施工', r.noWorkReason || '',
+                (r.contractorItems || []).map(c => c.contractorName).join(', ') || '', r.totalWorkerCount || 0,
+                (r.workItems || []).join(', ') || '', r.workNotes || '',
+                (r.materialItems || []).map(m => `${m.materialName} ${m.quantity}${m.stockUnit}`).join(', ') || '',
+                r.weather?.temp || '', r.weather?.humidity || '', r.weather?.wind || '', r.remarks || ''
+            ]);
+        });
+
+        // 第五張表：資料品質
+        const wsQuality = workbook.addWorksheet('資料品質');
+        wsQuality.views = [{ showGridLines: true }];
+        wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
+        wsQuality.addRow(['統計項目', '數量／內容']);
+        wsQuality.addRow(['原始 JSON 總數', dataQuality?.sourceFileCount || reports.length]);
+        wsQuality.addRow(['成功解析並納入日報數', dataQuality?.effectiveReportCount || reports.length]);
+        wsQuality.addRow(['異常資料數量 (解析失敗等)', dataQuality?.invalidFileCount || 0]);
+        wsQuality.addRow(['同日重複舊版排除數', dataQuality?.supersededReportCount || 0]);
+        wsQuality.addRow(['報表產生時間', new Date().toISOString().replace('T', ' ').substring(0, 19)]);
+        
+        workbook.eachSheet(worksheet => { 
+            for (let i = 1; i <= 15; i++) { 
+                worksheet.getColumn(i).width = 22; 
+                worksheet.getColumn(i).alignment = { vertical: 'middle', wrapText: true }; 
+            } 
+        });
+
+        const excelBuffer = await workbook.xlsx.writeBuffer();
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`結案總表_${projectName}.xlsx`)}`);
+        res.send(excelBuffer);
+    } catch (error) { 
+        console.error('產出 Excel 發生錯誤', error);
+        res.status(500).json({ success: false, message: '產出 Excel 失敗', error: error.message }); 
+    }
+});
+
+// ⭐ 關鍵修正 2：補回單一案場查詢 API
+app.get('/api/projects/:projectId', async (req, res) => {
+    try {
+        const project = await findProjectById(req.params.projectId);
+        if (!project) {
+            return res.status(404).json({ success: false, error: '找不到指定案場' });
+        }
+        
+        return res.status(200).json({
+            success: true,
+            project: {
+                projectId: project.projectId,
+                projectName: project.projectName
+            }
+        });
+    } catch (error) {
+        console.error('取得案場資料失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得案場資料' });
+    }
+});
+
 app.post('/api/submit-report', async (req, res) => {
     try {
         const reportData = req.body || {}; 
@@ -596,9 +963,9 @@ app.post('/api/submit-report', async (req, res) => {
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         
-        // ⭐ 修正 1：明確宣告並對齊 reportDate
+        // ⭐ 關鍵修正 3：明確宣告 reportDate 並針對模式處理
         const { dateStr, timeStr } = getTaiwanDateParts();
-        const reportDate = (reportData.date && /^\d{4}-\d{2}-\d{2}$/.test(reportData.date)) ? reportData.date : dateStr;
+        const reportDate = formType === 'material_issue' ? (reportData.date || dateStr) : dateStr;
         const submitDate = reportDate;
 
         const inventoryMap = await buildInventoryMap(project);
@@ -607,6 +974,11 @@ app.post('/api/submit-report', async (req, res) => {
         // 處理材料進場模式
         // ============================
         if (formType === 'material_issue') {
+            // ⭐ 新增後端進場類型驗證
+            if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
+                return res.status(400).json({ success: false, error: '進場類型不正確' });
+            }
+
             if (!reportData.materialItems || reportData.materialItems.length === 0) {
                 return res.status(400).json({ success: false, error: '請至少選擇一項進場材料' });
             }
@@ -776,344 +1148,6 @@ app.post('/api/submit-report', async (req, res) => {
     } catch (error) {
         console.error('提交錯誤：', error);
         return res.status(500).json({ success: false, error: error.message || '系統內部處理失敗' });
-    }
-});
-
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const signature = req.get('x-line-signature');
-    if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
-    
-    let body;
-    try { body = JSON.parse(req.body.toString('utf8')); } 
-    catch (error) { return res.status(400).send('Invalid JSON'); }
-    
-    res.status(200).send('OK');
-
-    for (const event of body.events || []) {
-        try {
-            const targetId = getLineTargetId(event);
-            
-            if (event.type === 'message' && event.message.type === 'text') {
-                const text = event.message.text.trim();
-                
-                if (text.startsWith('設定案場')) {
-                    if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用。'); continue; }
-                    const match = text.match(/^設定案場\s+(.+)$/);
-                    if (!match) { await replyLineMessage(event.replyToken, '⚠️ 格式錯誤\n正確格式：設定案場 大安區'); continue; }
-                    
-                    try {
-                        const reg = await registerProjectByName(match[1]);
-                        await withBindingWriteLock(async () => {
-                            const config = await readBindingsFromOneDrive();
-                            const bindings = (config.bindings || []).filter(b => b.projectId !== reg.project.projectId && b.groupId !== targetId);
-                            bindings.push({ 
-                                projectId: reg.project.projectId, projectName: reg.project.projectName, 
-                                groupId: targetId, active: true 
-                            });
-                            await writeBindingsToOneDrive({ ...config, bindings });
-                        });
-                        await replyLineMessage(event.replyToken, `✅ 案場設定完成\n\n網址：https://liff.line.me/${LIFF_ID}/?projectId=${encodeURIComponent(reg.project.projectId)}`);
-                    } catch (error) {
-                        await replyLineMessage(event.replyToken, `⚠️ 無法建立案場\n${getProjectRegistrationErrorMessage(error)}`);
-                    }
-                }
-                else if (text === '查詢案場' || text === '案場查詢') {
-                    if (!targetId) continue;
-                    const config = await readBindingsFromOneDrive();
-                    const binding = (config.bindings || []).find(b => b.groupId === targetId && b.active);
-                    await replyLineMessage(event.replyToken, binding ? `📍 本群組綁定案場：\n${binding.projectName}` : '⚠️ 尚未設定案場');
-                }
-                else if (text === '解除案場') {
-                    if (!targetId) continue;
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const filtered = (config.bindings || []).filter(b => b.groupId !== targetId);
-                        if (filtered.length === (config.bindings || []).length) { await replyLineMessage(event.replyToken, '無綁定紀錄。'); return; }
-                        await writeBindingsToOneDrive({ ...config, bindings: filtered });
-                        await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
-                    });
-                }
-                else if (text === '查詢統計' || text === '案場統計') {
-                    if (!targetId) continue;
-                    const bindingConfig = await readBindingsFromOneDrive();
-                    const currentBinding = (bindingConfig.bindings || []).find(b => b.groupId === targetId && b.active);
-                    if (!currentBinding) { 
-                        await replyLineMessage(event.replyToken, '⚠️ 本群組目前沒有綁定案場'); continue; 
-                    }
-
-                    const config = await readProjectsFromOneDrive();
-                    const project = (config.projects || []).find(p => p.projectId === currentBinding.projectId);
-                    if (!project) continue;
-
-                    try {
-                        const result = await generateProjectStats(project);
-                        if (result.error || !result.stats) { 
-                            await replyLineMessage(event.replyToken, '⚠️ 查詢失敗'); continue; 
-                        }
-                        
-                        const stats = result.stats;
-                        let msg = `【${project.projectName}】累計統計表\n━━━━━━━━━━━━\n實際工作天：${stats.workDays} 天\n免計工作天：${stats.noWorkDays} 天\n全案總人天：${stats.totalManDays} 人天\n\n[ 各廠商出工統計 ]\n`;
-                        
-                        for (const [name, data] of Object.entries(stats.contractorStats)) {
-                            msg += ` • ${name}：${data.workDays}天 (${data.manDays}人天)\n`;
-                        }
-                        
-                        msg += `\n[ 材料累計消耗 ]\n`;
-                        for (const [key, qty] of Object.entries(stats.materialStats)) {
-                            const detail = stats.materialDetails[key] || { name: key, unit: '' };
-                            msg += ` • ${detail.name}：共 ${qty} ${detail.unit}\n`;
-                        }
-                        
-                        await replyLineMessage(event.replyToken, msg);
-                    } catch (err) {
-                        await replyLineMessage(event.replyToken, '⚠️ 統計發生錯誤，請稍後再試。');
-                    }
-                }
-                else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
-                    await replyLineMessage(event.replyToken, '📖 「云說工程小幫手」指令：\n\n🔹 設定案場 案場名稱\n🔹 查詢案場\n🔹 查詢統計\n🔹 解除案場\n🔹 結案 案場名稱');
-                }
-                else if (text.startsWith('結案')) {
-                    if (!targetId) continue;
-                    const match = text.match(/^結案\s+(.+)$/);
-                    if (!match) continue;
-                    
-                    const bindings = await readBindingsFromOneDrive();
-                    const b = (bindings.bindings || []).find(x => x.groupId === targetId && x.active);
-                    if (!b || normalizeProjectName(b.projectName) !== normalizeProjectName(match[1])) {
-                        await replyLineMessage(event.replyToken, `⚠️ 名稱不符或無綁定`); 
-                        continue;
-                    }
-
-                    await withProjectWriteLock(async () => {
-                        const config = await readProjectsFromOneDrive();
-                        const pIdx = (config.projects || []).findIndex(p => p.projectId === b.projectId);
-                        if (pIdx === -1) {
-                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。'); return;
-                        }
-                        
-                        const closingProject = config.projects[pIdx];
-
-                        try {
-                            const resExcel = await fetch(`http://localhost:${PORT}/api/projects/${b.projectId}/export-excel`);
-                            if (!resExcel.ok) {
-                                const errorText = await resExcel.text();
-                                throw new Error(`HTTP ${resExcel.status} ${errorText}`);
-                            }
-                            
-                            const contentType = resExcel.headers.get('content-type') || '';
-                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
-                                throw new Error('結案 API 未回傳 Excel 檔案');
-                            }
-                            
-                            const buf = Buffer.from(await resExcel.arrayBuffer());
-                            const { dateStr } = getTaiwanDateParts();
-                            const gClient = await getGraphClient();
-                            
-                            await gClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
-                                
-                        } catch(e) { 
-                            console.error('結案失敗', e);
-                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${e.message})\n案場尚未下架。`); 
-                            return; 
-                        }
-                        
-                        config.projects.splice(pIdx, 1);
-                        await writeProjectsToOneDrive(config);
-                        
-                        await withBindingWriteLock(async () => {
-                            const latestB = await readBindingsFromOneDrive();
-                            await writeBindingsToOneDrive({ 
-                                ...latestB, 
-                                bindings: (latestB.bindings || []).filter(x => x.projectId !== b.projectId) 
-                            });
-                        });
-                        
-                        await replyLineMessage(event.replyToken, `✅ 案場「${match[1]}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
-                    });
-                }
-            }
-        } catch (e) { console.error('Webhook Error', e); }
-    }
-});
-
-app.get('/api/projects/:projectId/export-excel', async (req, res) => {
-    try {
-        const projectId = req.params.projectId;
-        const project = await findProjectById(projectId);
-        
-        if (!project) {
-            return res.status(404).json({ success: false, message: '找不到此專案' });
-        }
-        
-        const projectName = project.projectName;
-        const projectBasePath = `工程專案管理/2026_工程專案/${projectName}`;
-
-        const inventoryMap = await buildInventoryMap(project);
-
-        let transactionData = await readJsonFromOneDrive(`${projectBasePath}/project-material-transactions.json`, { transactions: [] }, false);
-        const { stats, reports, dataQuality } = await generateProjectStats(project);
-
-        const workbook = new ExcelJS.Workbook();
-        workbook.creator = '工程專案自動化系統';
-        const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
-
-        const wsSummary = workbook.addWorksheet('案場總表');
-        wsSummary.views = [{ showGridLines: true }];
-        
-        const startDate = reports.length > 0 ? reports[0].reportDate : '未定';
-        const endDate = reports.length > 0 ? reports[reports.length - 1].reportDate : '未定';
-        let calDays = 0;
-        if(startDate !== '未定' && endDate !== '未定') {
-            calDays = Math.floor((Date.parse(`${endDate}T00:00:00+08:00`) - Date.parse(`${startDate}T00:00:00+08:00`)) / 86400000) + 1;
-        }
-        
-        wsSummary.addRow(['案場名稱', projectName]);
-        wsSummary.addRow(['開案日期', startDate]);
-        wsSummary.addRow(['結案日期', endDate]);
-        wsSummary.addRow(['累計日曆天', calDays]);
-        wsSummary.addRow(['實際工作天', stats.workDays]);
-        wsSummary.addRow(['免計工作天', stats.noWorkDays]);
-        wsSummary.addRow(['全案總人天', stats.totalManDays]);
-        wsSummary.addRow([]);
-        
-        wsSummary.addRow(['【各廠商出工統計】']);
-        wsSummary.addRow(['廠商名稱', '出工工作天', '累計人天', '平均每日人數', '占全案人天比例']);
-        for (const [name, data] of Object.entries(stats.contractorStats)) {
-            const ratio = stats.totalManDays > 0 ? ((data.manDays / stats.totalManDays) * 100).toFixed(1) + '%' : '0%';
-            wsSummary.addRow([name, data.workDays, data.manDays, (data.manDays / data.workDays).toFixed(1), ratio]);
-        }
-        wsSummary.addRow([]);
-        
-        wsSummary.addRow(['【各填表人填報統計】']);
-        wsSummary.addRow(['填表人', '出工天數']);
-        for (const [name, days] of Object.entries(stats.reporterStats)) {
-            wsSummary.addRow([name, days]);
-        }
-
-        const wsMaterials = workbook.addWorksheet('材料結案總表');
-        wsMaterials.views = [{ showGridLines: true }];
-        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
-        
-        const materialSummaryMap = {};
-        (transactionData.transactions || []).forEach(tx => {
-            const pkgSpec = `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`;
-            const uniqueKey = tx.materialId || `${tx.materialName}_${pkgSpec}`;
-            
-            if (!materialSummaryMap[uniqueKey]) {
-                materialSummaryMap[uniqueKey] = { 
-                    materialCode: resolveMaterialCode(tx), 
-                    materialName: tx.materialName, 
-                    packageSpec: pkgSpec, 
-                    stockUnit: tx.stockUnit, 
-                    issuedQty: 0, 
-                    baseIssuedQty: 0, 
-                    consumedBaseQty: 0, 
-                    baseUnit: tx.baseUnit 
-                };
-            }
-            materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0); 
-            materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
-        });
-        
-        reports.forEach(report => {
-            (report.materialItems || []).forEach(item => {
-                const pkgSpec = `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`;
-                const uniqueKey = item.materialId || `${item.materialName}_${pkgSpec}`;
-                
-                if (!materialSummaryMap[uniqueKey]) {
-                    materialSummaryMap[uniqueKey] = { 
-                        materialCode: resolveMaterialCode(item), 
-                        materialName: item.materialName, 
-                        packageSpec: pkgSpec, 
-                        stockUnit: item.stockUnit, 
-                        issuedQty: 0, 
-                        baseIssuedQty: 0, 
-                        consumedBaseQty: 0, 
-                        baseUnit: item.baseUnit 
-                    };
-                }
-                materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
-            });
-        });
-        
-        let matRowIdx = 2;
-        Object.values(materialSummaryMap).forEach(m => {
-            wsMaterials.addRow([
-                m.materialCode, m.materialName, m.packageSpec, m.stockUnit, 
-                m.issuedQty, m.baseIssuedQty, m.consumedBaseQty, 
-                { formula: `=F${matRowIdx}-G${matRowIdx}`, result: m.baseIssuedQty - m.consumedBaseQty }, 
-                m.baseUnit
-            ]);
-            matRowIdx++;
-        });
-
-        const wsTxLog = workbook.addWorksheet('材料進出紀錄');
-        wsTxLog.views = [{ showGridLines: true }];
-        wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
-        
-        const typeMap = { 'OPENING_ISSUE': '開工領入', 'ADDITIONAL_ISSUE': '追加領入' };
-        
-        (transactionData.transactions || []).forEach(tx => {
-            wsTxLog.addRow([
-                tx.transactionDate, 
-                typeMap[tx.transactionType] || tx.transactionType, 
-                resolveMaterialCode(tx), 
-                tx.materialName, 
-                `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`, 
-                tx.quantity, tx.stockUnit, tx.baseQuantity, tx.baseUnit, tx.remarks || ''
-            ]);
-        });
-        
-        reports.forEach(r => {
-            (r.materialItems || []).forEach(item => {
-                wsTxLog.addRow([
-                    r.reportDate, '施工耗用', 
-                    resolveMaterialCode(item), 
-                    item.materialName, 
-                    `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`, 
-                    item.quantity, item.stockUnit, item.baseQuantity, item.baseUnit, item.remarks || '日報自動記錄'
-                ]);
-            });
-        });
-
-        const wsDaily = workbook.addWorksheet('日報明細');
-        wsDaily.views = [{ showGridLines: true }];
-        wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
-        
-        reports.forEach(r => {
-            wsDaily.addRow([
-                r.reportDate, r.reporterName || '未紀錄', r.isNoWork ? '無出工' : '施工', r.noWorkReason || '',
-                (r.contractorItems || []).map(c => c.contractorName).join(', ') || '', r.totalWorkerCount || 0,
-                (r.workItems || []).join(', ') || '', r.workNotes || '',
-                (r.materialItems || []).map(m => `${m.materialName} ${m.quantity}${m.stockUnit}`).join(', ') || '',
-                r.weather?.temp || '', r.weather?.humidity || '', r.weather?.wind || '', r.remarks || ''
-            ]);
-        });
-
-        const wsQuality = workbook.addWorksheet('資料品質');
-        wsQuality.views = [{ showGridLines: true }];
-        wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
-        wsQuality.addRow(['統計項目', '數量／內容']);
-        wsQuality.addRow(['原始 JSON 總數', dataQuality?.sourceFileCount || reports.length]);
-        wsQuality.addRow(['成功解析並納入日報數', dataQuality?.effectiveReportCount || reports.length]);
-        wsQuality.addRow(['異常資料數量 (解析失敗等)', dataQuality?.invalidFileCount || 0]);
-        wsQuality.addRow(['同日重複舊版排除數', dataQuality?.supersededReportCount || 0]);
-        wsQuality.addRow(['報表產生時間', new Date().toISOString().replace('T', ' ').substring(0, 19)]);
-        
-        workbook.eachSheet(worksheet => { 
-            for (let i = 1; i <= 15; i++) { 
-                worksheet.getColumn(i).width = 22; 
-                worksheet.getColumn(i).alignment = { vertical: 'middle', wrapText: true }; 
-            } 
-        });
-
-        const excelBuffer = await workbook.xlsx.writeBuffer();
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`結案總表_${projectName}.xlsx`)}`);
-        res.send(excelBuffer);
-    } catch (error) { 
-        console.error('產出 Excel 發生錯誤', error);
-        res.status(500).json({ success: false, message: '產出 Excel 失敗', error: error.message }); 
     }
 });
 
