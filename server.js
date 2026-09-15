@@ -180,6 +180,7 @@ async function readProjectMaterials(projectName) {
     return null;
 }
 
+// ⭐ [關鍵補回] 建立全域與專屬材料映射表
 async function buildInventoryMap(project) {
     const globalInventory = await readGlobalInventory();
     const customInventory = project ? await readProjectMaterials(project.projectName) : null;
@@ -194,6 +195,7 @@ async function buildInventoryMap(project) {
     return inventoryMap;
 }
 
+// ⭐ [關鍵補回] 原汁原味的專案資料夾建立功能
 async function ensureProjectFolder(projectName) {
     const graphClient = await getGraphClient();
     const safeProjectName = sanitizePathSegment(projectName);
@@ -216,6 +218,7 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
+// ⭐ [關鍵補回] 原汁原味的子資料夾建立功能
 async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
@@ -514,6 +517,7 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
+// Webhook 必須使用 express.raw，維持獨立
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -671,6 +675,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 });
 
+// ⭐ API 路由前必須套用 express.json()
 app.use('/api', express.json());
 
 app.get('/api/projects', async (req, res) => {
@@ -930,6 +935,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     }
 });
 
+// ⭐ 單一案場查詢 API 補回
 app.get('/api/projects/:projectId', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId);
@@ -966,6 +972,7 @@ app.post('/api/submit-report', async (req, res) => {
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         
+        // ⭐ 日期宣告邏輯
         const { dateStr, timeStr } = getTaiwanDateParts();
         let reportDate = dateStr;
         if (formType === 'material_issue') {
@@ -976,7 +983,11 @@ app.post('/api/submit-report', async (req, res) => {
 
         const inventoryMap = await buildInventoryMap(project);
 
+        // ============================
+        // 處理材料進場模式
+        // ============================
         if (formType === 'material_issue') {
+            // ⭐ 後端進場類型驗證
             if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
                 return res.status(400).json({ success: false, error: '進場類型不正確' });
             }
@@ -1058,6 +1069,9 @@ app.post('/api/submit-report', async (req, res) => {
             return res.status(200).json({ success: true, pushed: pushed, message: '材料進場紀錄已成功歸檔' });
         }
 
+        // ============================
+        // 處理施工日報模式
+        // ============================
         const isNoWork = reportData.isNoWork === true;
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
         if (!isNoWork) {
