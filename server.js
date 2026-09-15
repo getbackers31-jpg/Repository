@@ -1151,9 +1151,4 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-if (requiredVars.some(v => !process.env[v])) {
-    console.error('缺少必要環境變數');
-    process.exit(1);
-}
-
 app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
