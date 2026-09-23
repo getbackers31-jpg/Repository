@@ -180,7 +180,6 @@ async function readProjectMaterials(projectName) {
     return null;
 }
 
-// ⭐ [關鍵補回] 建立全域與專屬材料映射表
 async function buildInventoryMap(project) {
     const globalInventory = await readGlobalInventory();
     const customInventory = project ? await readProjectMaterials(project.projectName) : null;
@@ -195,7 +194,6 @@ async function buildInventoryMap(project) {
     return inventoryMap;
 }
 
-// ⭐ [關鍵補回] 原汁原味的專案資料夾建立功能
 async function ensureProjectFolder(projectName) {
     const graphClient = await getGraphClient();
     const safeProjectName = sanitizePathSegment(projectName);
@@ -218,7 +216,6 @@ async function ensureProjectFolder(projectName) {
     }
 }
 
-// ⭐ [關鍵補回] 原汁原味的子資料夾建立功能
 async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     const safeChildName = sanitizePathSegment(childFolderName);
     if (!safeChildName) throw new Error('子資料夾名稱不可為空');
@@ -534,6 +531,88 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
+
+                // 🟢 庫存查詢 (總表摘要模式)
+                if (text === '查庫存' || text === '庫存總表') {
+                    try {
+                        const inventoryData = await readGlobalInventory();
+                        
+                        let normalList = [];
+                        let lowList = [];
+                        let reviewList = [];
+                        let outOfStockList = [];
+
+                        (inventoryData.items || []).forEach(item => {
+                            if (!item.inventoryManaged) return;
+
+                            const lineText = `${item.materialName}：${item.stockQuantity} ${item.stockUnit}`;
+                            
+                            if (item.stockStatus === 'NORMAL') normalList.push(lineText);
+                            else if (item.stockStatus === 'LOW_STOCK') lowList.push(lineText);
+                            else if (item.stockStatus === 'REVIEW_REQUIRED' || item.stockQuantity < 0) reviewList.push(lineText);
+                            else if (item.stockStatus === 'OUT_OF_STOCK') outOfStockList.push(lineText);
+                        });
+
+                        const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
+                        let replyText = `📦【目前倉庫總庫存】\n更新時間：${updateTime}\n\n`;
+                        
+                        if (normalList.length > 0) replyText += `🟢 【庫存正常】\n${normalList.slice(0, 15).join('\n')}${normalList.length > 15 ? '\n...及其他品項' : ''}\n\n`;
+                        if (lowList.length > 0) replyText += `🟡 【低庫存】\n${lowList.join('\n')}\n\n`;
+                        if (reviewList.length > 0) replyText += `🔴 【帳面異常】\n${reviewList.join('\n')}\n\n`;
+                        if (outOfStockList.length > 0) replyText += `⚪ 【目前缺貨】\n${outOfStockList.join('\n')}\n\n`;
+                        
+                        replyText += `💡 提示：輸入「查庫存 關鍵字」可查單一品項`;
+
+                        await replyLineMessage(event.replyToken, replyText);
+                        continue;
+                    } catch (error) {
+                        console.error('讀取庫存失敗:', error);
+                        await replyLineMessage(event.replyToken, '❌ 無法讀取庫存資料，請檢查系統連線。');
+                        continue;
+                    }
+                }
+
+                // 🟢 庫存查詢 (精確搜尋模式)
+                if (text.startsWith('查庫存 ')) {
+                    try {
+                        const keyword = text.replace('查庫存', '').trim().toLowerCase();
+                        const inventoryData = await readGlobalInventory();
+                        
+                        const matchedItems = (inventoryData.items || []).filter(item => 
+                            item.inventoryManaged && 
+                            (item.materialName.toLowerCase().includes(keyword) || (item.materialCode && item.materialCode.toLowerCase().includes(keyword)))
+                        );
+
+                        if (matchedItems.length === 0) {
+                            await replyLineMessage(event.replyToken, `❌ 找不到包含「${keyword}」的庫存品項。`);
+                            continue;
+                        }
+
+                        if (matchedItems.length > 1) {
+                             const options = matchedItems.map(item => `▪ ${item.materialName}`).join('\n');
+                             await replyLineMessage(event.replyToken, `找到多筆符合「${keyword}」的品項，請輸入更完整的名稱：\n${options}`);
+                             continue;
+                        }
+
+                        const target = matchedItems[0];
+                        const statusMap = { 'NORMAL': '正常', 'LOW_STOCK': '⚠️ 偏低', 'REVIEW_REQUIRED': '🚨 異常', 'OUT_OF_STOCK': '❌ 缺貨' };
+                        const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
+                        
+                        const detailText = `📦 ${target.materialName}\n\n` +
+                                           `▪ 料號：${target.materialCode || '無'}\n` +
+                                           `▪ 庫存：${target.stockQuantity} ${target.stockUnit}\n` +
+                                           `▪ 換算：${target.stockBaseQuantity} ${target.baseUnit}\n` +
+                                           `▪ 狀態：${statusMap[target.stockStatus] || target.stockStatus}\n` +
+                                           `▪ 更新：${updateTime}`;
+
+                        await replyLineMessage(event.replyToken, detailText);
+                        continue;
+
+                    } catch (error) {
+                        await replyLineMessage(event.replyToken, '❌ 查詢失敗，請稍後再試。');
+                        continue;
+                    }
+                }
                 
                 if (text.startsWith('設定案場')) {
                     if (!targetId) { await replyLineMessage(event.replyToken, '⚠️ 請在施工群組內使用。'); continue; }
@@ -609,7 +688,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     }
                 }
                 else if (['指令', '說明', '功能', '小幫手'].includes(text)) {
-                    await replyLineMessage(event.replyToken, '📖 「云說工程小幫手」指令：\n\n🔹 設定案場 案場名稱\n🔹 查詢案場\n🔹 查詢統計\n🔹 解除案場\n🔹 結案 案場名稱');
+                    await replyLineMessage(event.replyToken, '📖 「云說工程小幫手」指令：\n\n🔹 設定案場 案場名稱\n🔹 查詢案場\n🔹 查詢統計\n🔹 解除案場\n🔹 結案 案場名稱\n🔹 查庫存\n🔹 查庫存 關鍵字');
                 }
                 else if (text.startsWith('結案')) {
                     if (!targetId) continue;
@@ -675,7 +754,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 });
 
-// ⭐ API 路由前必須套用 express.json()
 app.use('/api', express.json());
 
 app.get('/api/projects', async (req, res) => {
@@ -935,7 +1013,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     }
 });
 
-// ⭐ 單一案場查詢 API 補回
 app.get('/api/projects/:projectId', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId);
@@ -972,7 +1049,6 @@ app.post('/api/submit-report', async (req, res) => {
         const safeProjectName = sanitizePathSegment(project.projectName);
         const projectFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}`;
         
-        // ⭐ 日期宣告邏輯
         const { dateStr, timeStr } = getTaiwanDateParts();
         let reportDate = dateStr;
         if (formType === 'material_issue') {
@@ -983,11 +1059,7 @@ app.post('/api/submit-report', async (req, res) => {
 
         const inventoryMap = await buildInventoryMap(project);
 
-        // ============================
-        // 處理材料進場模式
-        // ============================
         if (formType === 'material_issue') {
-            // ⭐ 後端進場類型驗證
             if (!['OPENING', 'ADDITIONAL'].includes(reportData.issueType)) {
                 return res.status(400).json({ success: false, error: '進場類型不正確' });
             }
@@ -1069,9 +1141,6 @@ app.post('/api/submit-report', async (req, res) => {
             return res.status(200).json({ success: true, pushed: pushed, message: '材料進場紀錄已成功歸檔' });
         }
 
-        // ============================
-        // 處理施工日報模式
-        // ============================
         const isNoWork = reportData.isNoWork === true;
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
         if (!isNoWork) {
