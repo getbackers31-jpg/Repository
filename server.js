@@ -560,7 +560,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
                         // 👇 這裡已經幫你替換成你在前端專案的 GitHub Pages 網址了！
                         replyText += `\n👇 點擊下方網址查看【完整庫存總表】\n` +
-                                     `https://getbackers31-jpg.github.io/chuanda-frontend/inventory.html`;
+                                     `https://getbackers31-jpg.github.io/chuanda-frontend-/inventory.html`;
 
                         await replyLineMessage(event.replyToken, replyText);
                         continue;
