@@ -532,36 +532,35 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
 
-                // 🟢 庫存查詢 (總表摘要模式)
+                // 🟢 庫存查詢 (改為網頁引導模式)
                 if (text === '查庫存' || text === '庫存總表') {
                     try {
                         const inventoryData = await readGlobalInventory();
-                        
-                        let normalList = [];
-                        let lowList = [];
-                        let reviewList = [];
-                        let outOfStockList = [];
+                        let totalCount = 0, normalCount = 0, lowCount = 0, outCount = 0, errCount = 0;
 
                         (inventoryData.items || []).forEach(item => {
                             if (!item.inventoryManaged) return;
-
-                            const lineText = `${item.materialName}：${item.stockQuantity} ${item.stockUnit}`;
-                            
-                            if (item.stockStatus === 'NORMAL') normalList.push(lineText);
-                            else if (item.stockStatus === 'LOW_STOCK') lowList.push(lineText);
-                            else if (item.stockStatus === 'REVIEW_REQUIRED' || item.stockQuantity < 0) reviewList.push(lineText);
-                            else if (item.stockStatus === 'OUT_OF_STOCK') outOfStockList.push(lineText);
+                            totalCount++;
+                            if (item.stockStatus === 'NORMAL') normalCount++;
+                            else if (item.stockStatus === 'LOW_STOCK') lowCount++;
+                            else if (item.stockStatus === 'OUT_OF_STOCK' || item.stockQuantity === 0) outCount++;
+                            else errCount++;
                         });
 
                         const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
-                        let replyText = `📦【目前倉庫總庫存】\n更新時間：${updateTime}\n\n`;
                         
-                        if (normalList.length > 0) replyText += `🟢 【庫存正常】\n${normalList.slice(0, 15).join('\n')}${normalList.length > 15 ? '\n...及其他品項' : ''}\n\n`;
-                        if (lowList.length > 0) replyText += `🟡 【低庫存】\n${lowList.join('\n')}\n\n`;
-                        if (reviewList.length > 0) replyText += `🔴 【帳面異常】\n${reviewList.join('\n')}\n\n`;
-                        if (outOfStockList.length > 0) replyText += `⚪ 【目前缺貨】\n${outOfStockList.join('\n')}\n\n`;
-                        
-                        replyText += `💡 提示：輸入「查庫存 關鍵字」可查單一品項`;
+                        let replyText = `📦【倉庫庫存摘要】\n` +
+                                        `更新時間：${updateTime}\n\n` +
+                                        `總共 ${totalCount} 項追蹤中物料：\n` +
+                                        `🟢 正常庫存：${normalCount} 項\n` +
+                                        `🟡 偏低庫存：${lowCount} 項\n` +
+                                        `⚪ 目前缺貨：${outCount} 項\n`;
+                                        
+                        if (errCount > 0) replyText += `🚨 帳面異常：${errCount} 項\n`;
+
+                        // 👇 這裡已經幫你替換成你在前端專案的 GitHub Pages 網址了！
+                        replyText += `\n👇 點擊下方網址查看【完整庫存總表】\n` +
+                                     `https://getbackers31-jpg.github.io/chuanda-frontend/inventory.html`;
 
                         await replyLineMessage(event.replyToken, replyText);
                         continue;
