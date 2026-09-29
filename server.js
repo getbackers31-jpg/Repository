@@ -508,6 +508,22 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
     });
 }
 
+function resolveMaterialSource(tx) {
+    if (tx.materialSource === 'WAREHOUSE') {
+        return '公司倉庫';
+    }
+    if (tx.materialSource === 'SUPPLIER_DIRECT') {
+        return '供應商直送';
+    }
+    if (['WAREHOUSE_TRANSFER_IN', 'PROJECT_RETURN_OUT'].includes(tx.transactionType)) {
+        return '公司倉庫';
+    }
+    if (['OPENING_ISSUE', 'ADDITIONAL_ISSUE'].includes(tx.transactionType)) {
+        return '供應商直送／舊資料';
+    }
+    return '其他';
+}
+
 async function generateProjectStats(project) {
     const safeProjectName = sanitizePathSegment(project.projectName);
     const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
@@ -932,7 +948,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             const inventoryData = await readGlobalInventory();
             const txData = await readWarehouseTransactions();
             
-            // 【安全修正 1】：重送時自動比對並修復 inventory.json 快照
             const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
             if (existingTx) {
                 const reconciled = await reconcileWarehouseSnapshotIfLatest(
@@ -980,7 +995,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             const packageQuantity = Number(item.packageQuantity || 1);
             const baseQuantityChange = quantityChange * packageQuantity;
             
-            // 【安全修正 3】：交易日期統一使用台灣日期
             const { dateStr } = getTaiwanDateParts();
             const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
             const transactionId = `TX-${crypto.randomUUID()}`;
@@ -1045,7 +1059,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
     }
 });
 
-// 🚚 領至案場 (安全鎖定與同步優化版)
+// 🚚 領至案場 (帶有 materialSource: 'WAREHOUSE')
 app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -1069,7 +1083,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 const inventoryData = await readGlobalInventory();
                 const txData = await readWarehouseTransactions();
 
-                // 【安全修正 1】：重送時自動比對並修復快照
                 const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
                 if (existingTx) {
                     const reconciled = await reconcileWarehouseSnapshotIfLatest(
@@ -1099,7 +1112,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 const afterQuantity = beforeQuantity - quantity;
                 const baseQuantityChange = -(quantity * packageQuantity);
 
-                // 【安全修正 3】：交易日期統一使用台灣日期
                 const { dateStr } = getTaiwanDateParts();
                 const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
                 const transactionId = `TX-${crypto.randomUUID()}`;
@@ -1114,7 +1126,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 } catch(e) {}
                 if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
 
-                // 【安全修正 2】：部分寫入重送時，沿用相同的 transferId
                 const existingProjectTransaction = projTxData.transactions.find(tx => tx.submissionId === submissionId);
                 const transferId = existingProjectTransaction ? existingProjectTransaction.transferId : `TRF-${crypto.randomUUID()}`;
 
@@ -1122,6 +1133,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                     projTxData.transactions.push({
                         submissionId,
                         transferId,
+                        materialSource: 'WAREHOUSE',
                         transactionDate,
                         transactionType: 'WAREHOUSE_TRANSFER_IN',
                         materialId: item.materialId,
@@ -1191,7 +1203,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
     }
 });
 
-// ↩️ 案場退回（可安全接續部分成功交易）
+// ↩️ 案場退回 (帶有 materialSource: 'WAREHOUSE')
 app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body || {};
@@ -1301,13 +1313,6 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     );
                     transferId = existingProjectTransaction.transferId;
                     transactionDate = existingProjectTransaction.transactionDate;
-
-                    if (!quantity || !baseQuantityToReturn || !transferId) {
-                        return res.status(409).json({
-                            success: false,
-                            error: '既有案場退料交易資料不完整，請人工檢查'
-                        });
-                    }
                 } else {
                     let issuedBaseQuantity = 0;
                     for (const tx of projTxData.transactions) {
@@ -1340,6 +1345,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     projTxData.transactions.push({
                         submissionId,
                         transferId,
+                        materialSource: 'WAREHOUSE',
                         transactionDate,
                         transactionType: 'PROJECT_RETURN_OUT',
                         materialId: item.materialId,
@@ -1421,19 +1427,11 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
         });
     } catch (error) {
         console.error('退料失敗:', error);
-        const safeErrors = [
-            '倉庫異動日期格式不正確',
-            '倉庫異動日期無效',
-            '倉庫異動日期不可晚於今天'
-        ];
-        const message = String(error?.message || '');
-        if (safeErrors.includes(message)) {
-            return res.status(400).json({ success: false, error: message });
-        }
         return res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
     }
 });
 
+// 其他專案與材料相關 API 路由
 app.get('/api/projects', async (req, res) => {
     try {
         const config = await readProjectsFromOneDrive();
@@ -1463,6 +1461,26 @@ app.get('/api/materials', async (req, res) => {
     } catch (error) {
         console.error('讀取材料清單失敗：', error);
         return res.status(500).json({ success: false, error: '無法取得材料清單' });
+    }
+});
+
+app.get('/api/projects/:projectId', async (req, res) => {
+    try {
+        const project = await findProjectById(req.params.projectId);
+        if (!project) {
+            return res.status(404).json({ success: false, error: '找不到指定案場' });
+        }
+        
+        return res.status(200).json({
+            success: true,
+            project: {
+                projectId: project.projectId,
+                projectName: project.projectName
+            }
+        });
+    } catch (error) {
+        console.error('取得案場資料失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得案場資料' });
     }
 });
 
@@ -1510,6 +1528,7 @@ app.get('/api/projects/:projectId/material-balances', async (req, res) => {
     }
 });
 
+// Excel 結案報表匯出 (包含完整五張工作表與材料來源欄位)
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
         const projectId = req.params.projectId;
@@ -1525,12 +1544,31 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         const inventoryMap = await buildInventoryMap(project);
 
         let transactionData = await readJsonFromOneDrive(`${projectBasePath}/project-material-transactions.json`, { transactions: [] }, false);
-        const { stats, reports, dataQuality } = await generateProjectStats(project);
+        const statsResult = await generateProjectStats(project);
+        const reports = Array.isArray(statsResult.reports) ? statsResult.reports : [];
+        const stats = statsResult.stats || {
+            totalDays: 0,
+            workDays: 0,
+            noWorkDays: 0,
+            totalManDays: 0,
+            contractorStats: {},
+            materialStats: {},
+            materialDetails: {},
+            reporterStats: {}
+        };
+        const dataQuality = statsResult.dataQuality || {
+            sourceFileCount: 0,
+            parsedFileCount: 0,
+            invalidFileCount: 0,
+            effectiveReportCount: 0,
+            supersededReportCount: 0
+        };
 
         const workbook = new ExcelJS.Workbook();
         workbook.creator = '工程專案自動化系統';
         const resolveMaterialCode = (item) => (item.materialId && inventoryMap[item.materialId]) ? inventoryMap[item.materialId].materialCode : (item.materialCode || '無編碼');
 
+        // 工作表 1：案場總表
         const wsSummary = workbook.addWorksheet('案場總表');
         wsSummary.views = [{ showGridLines: true }];
         
@@ -1564,6 +1602,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
+        // 工作表 2：材料結案總表
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
         wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
@@ -1621,9 +1660,10 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             matRowIdx++;
         });
 
+        // 工作表 3：材料進出紀錄 (含材料來源)
         const wsTxLog = workbook.addWorksheet('材料進出紀錄');
         wsTxLog.views = [{ showGridLines: true }];
-        wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
+        wsTxLog.addRow(['日期', '異動類型', '材料來源', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
         
         const typeMap = { 
             'OPENING_ISSUE': '開工首批進場', 
@@ -1636,6 +1676,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsTxLog.addRow([
                 tx.transactionDate, 
                 typeMap[tx.transactionType] || tx.transactionType, 
+                resolveMaterialSource(tx),
                 resolveMaterialCode(tx), 
                 tx.materialName, 
                 `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`, 
@@ -1646,7 +1687,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         reports.forEach(r => {
             (r.materialItems || []).forEach(item => {
                 wsTxLog.addRow([
-                    r.reportDate, '施工耗用', 
+                    r.reportDate, '施工耗用', '-', 
                     resolveMaterialCode(item), 
                     item.materialName, 
                     `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`, 
@@ -1655,6 +1696,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             });
         });
 
+        // 工作表 4：日報明細
         const wsDaily = workbook.addWorksheet('日報明細');
         wsDaily.views = [{ showGridLines: true }];
         wsDaily.addRow(['日期', '填表人', '出工狀態', '無出工原因', '施工廠商', '出工人數', '施作項目', '作業補充', '材料使用摘要', '氣溫', '濕度', '風速', '日報備註']);
@@ -1669,6 +1711,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             ]);
         });
 
+        // 工作表 5：資料品質
         const wsQuality = workbook.addWorksheet('資料品質');
         wsQuality.views = [{ showGridLines: true }];
         wsQuality.addRow(['【本次結案資料品質與健檢摘要】']);
@@ -1696,26 +1739,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     }
 });
 
-app.get('/api/projects/:projectId', async (req, res) => {
-    try {
-        const project = await findProjectById(req.params.projectId);
-        if (!project) {
-            return res.status(404).json({ success: false, error: '找不到指定案場' });
-        }
-        
-        return res.status(200).json({
-            success: true,
-            project: {
-                projectId: project.projectId,
-                projectName: project.projectName
-            }
-        });
-    } catch (error) {
-        console.error('取得案場資料失敗：', error);
-        return res.status(500).json({ success: false, error: '無法取得案場資料' });
-    }
-});
-
+// 📋 提交日報與小幫手材料進場 (含第三層防呆與完整一般日報流程)
 app.post('/api/submit-report', async (req, res) => {
     try {
         const reportData = req.body || {}; 
@@ -1761,7 +1785,12 @@ app.post('/api/submit-report', async (req, res) => {
                 return res.status(400).json({ success: false, error: materialError.message });
             }
 
+            const isSameNumber = (a, b) => Math.abs(Number(a) - Number(b)) < 0.0001;
+            const forceDirectIssue = reportData.forceDirectIssue === true;
+
             let isDuplicateSubmission = false;
+            let suspiciousMatches = [];
+
             await withMaterialWriteLock(project.projectId, async () => {
                 const txPath = `${projectFolderPath}/project-material-transactions.json`;
                 let txData = { transactions: [] };
@@ -1769,14 +1798,44 @@ app.post('/api/submit-report', async (req, res) => {
                     txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false);
                 } catch (e) {}
                 if (!Array.isArray(txData.transactions)) txData.transactions = [];
+
                 isDuplicateSubmission = txData.transactions.some(tx => tx.submissionId === submissionId);
                 if (isDuplicateSubmission) return;
+
+                // 第三層防呆檢查：同日、同材料、同數量且來源為 WAREHOUSE (相容舊資料)
+                if (!forceDirectIssue) {
+                    for (const material of materialItems) {
+                        const matchedTransaction = txData.transactions.find(tx =>
+                            tx.transactionType === 'WAREHOUSE_TRANSFER_IN' &&
+                            (!tx.materialSource || tx.materialSource === 'WAREHOUSE') &&
+                            tx.transactionDate === submitDate &&
+                            tx.materialId === material.materialId &&
+                            isSameNumber(tx.quantity, material.quantity)
+                        );
+
+                        if (matchedTransaction) {
+                            suspiciousMatches.push({
+                                materialId: material.materialId,
+                                materialName: material.materialName,
+                                quantity: material.quantity,
+                                stockUnit: material.stockUnit,
+                                existingTransferId: matchedTransaction.transferId
+                            });
+                        }
+                    }
+                }
+
+                if (suspiciousMatches.length > 0 && !forceDirectIssue) {
+                    return; 
+                }
 
                 const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
                 
                 materialItems.forEach(m => {
                     txData.transactions.push({
                         submissionId,
+                        transferId: null,
+                        materialSource: 'SUPPLIER_DIRECT', // 👈 標記為供應商直送
                         transactionDate: submitDate,
                         transactionType: issueType,
                         materialId: m.materialId,
@@ -1795,13 +1854,31 @@ app.post('/api/submit-report', async (req, res) => {
                 await ensureProjectFolder(project.projectName);
                 await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${txPath}:/content`).put(Buffer.from(JSON.stringify(txData, null, 2), 'utf-8'));
             });
+
+            if (suspiciousMatches.length > 0 && !forceDirectIssue) {
+                return res.status(409).json({
+                    success: false,
+                    requiresConfirmation: true,
+                    warningCode: 'POSSIBLE_DUPLICATE_RECEIPT',
+                    error: `今天已有相同材料由公司倉庫領入 ${suspiciousMatches[0].quantity} ${suspiciousMatches[0].stockUnit}，請確認這次是否為另一批供應商直送材料。`,
+                    matches: suspiciousMatches
+                });
+            }
+
             if (isDuplicateSubmission) {
                 return res.status(200).json({ success: true, duplicate: true, pushed: false, message: '此筆材料進場先前已完成歸檔，未重複入帳' });
             }
 
             const reporterNameStr = reportData.reporterName ? String(reportData.reporterName).trim() : '未紀錄';
             const issueTypeLabel = reportData.issueType === 'ADDITIONAL' ? '追加進場' : '開工首批進場';
-            let msg = `📦 材料進場通知\n\n日期：${submitDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n類型：${issueTypeLabel}\n\n━━━━━━━━━━━━\n[進場明細]\n`;
+            
+            let msg = `📦 案場材料進場\n\n` +
+                      `來源：供應商直接送達\n` +
+                      `日期：${submitDate.replace(/-/g, '/')}\n` +
+                      `案場：${project.projectName}\n` +
+                      `填表：${reporterNameStr}\n` +
+                      `類型：${issueTypeLabel}\n\n` +
+                      `━━━━━━━━━━━━\n[進場明細]\n`;
             
             materialItems.forEach(m => {
                 msg += ` • ${m.materialName}：${m.quantity} ${m.stockUnit}\n`;
@@ -1821,9 +1898,10 @@ app.post('/api/submit-report', async (req, res) => {
                 }
             }
 
-            return res.status(200).json({ success: true, pushed: pushed, message: '材料進場紀錄已成功歸檔' });
+            return res.status(200).json({ success: true, pushed: pushed, message: pushed ? '供應商直送材料紀錄已成功歸檔' : '材料已成功歸檔，但LINE群組發布失敗' });
         }
 
+        // 完整的一般施工日報邏輯
         const isNoWork = reportData.isNoWork === true;
         let contractorItems = Array.isArray(reportData.contractorItems) ? reportData.contractorItems : [];
         if (!isNoWork) {
@@ -1906,7 +1984,49 @@ app.post('/api/submit-report', async (req, res) => {
         let reportText = `📋 施工日報\n\n日期：${reportDate.replace(/-/g, '/')}\n案場：${project.projectName}\n填表：${reporterNameStr}\n\n`;
         
         if (!isNoWork) {
-            reportText += `溫度：${reportData.temp}度\n濕度：${reportData.humidity}%\n風速：${reportData.wind}m/s\n\n施工廠商：${reportData.contractor}\n${reportData.workerCount}\n\n━━━━━━━━━━━━\n\n今日進度：\n${reportData.progress}\n\n今日用料：\n${reportData.materials}\n\n備註：\n${reportData.remarks || '無'}\n\n━━━━━━━━━━━━\n以上為今日進度報告`;
+            const contractorText = contractorItems.length > 0
+                ? contractorItems
+                    .map(item => `• ${item.contractorName}：${item.workerCount}人`)
+                    .join('\n')
+                : '無';
+
+            const workItemText = workItems.length > 0
+                ? workItems
+                    .map(item => `• ${item}`)
+                    .join('\n')
+                : '無';
+
+            const customWorkText = String(reportData.customWorkItem || '').trim();
+            const workNotesText = String(reportData.workNotes || '').trim();
+
+            const materialText = materialItems.length > 0
+                ? materialItems
+                    .map(item => `• ${item.materialName}：${item.quantity}${item.stockUnit}`)
+                    .join('\n')
+                : '今日無用料';
+
+            reportText +=
+                `溫度：${reportData.temp || '未紀錄'}度\n` +
+                `濕度：${reportData.humidity || '未紀錄'}%\n` +
+                `風速：${reportData.wind || '未紀錄'}m/s\n\n` +
+                `施工廠商：\n${contractorText}\n\n` +
+                `總出工人數：${calculatedTotalWorkerCount}人\n\n` +
+                `━━━━━━━━━━━━\n\n` +
+                `今日進度：\n${workItemText}\n`;
+
+            if (customWorkText) {
+                reportText += `• 其他：${customWorkText}\n`;
+            }
+
+            if (workNotesText) {
+                reportText += `\n作業補充：\n${workNotesText}\n`;
+            }
+
+            reportText +=
+                `\n今日用料：\n${materialText}\n\n` +
+                `備註：\n${reportData.remarks || '無'}\n\n` +
+                `━━━━━━━━━━━━\n` +
+                `以上為今日進度報告`;
         } else {
             reportText += `🛑 今日無出工\n原因：${reportData.noWorkReason}\n備註：${reportData.remarks || '無'}`;
         }
@@ -1930,7 +2050,7 @@ app.post('/api/submit-report', async (req, res) => {
             }
         }
         
-        return res.status(200).json({ success: true, pushed: pushed, message: '日報已歸檔' });
+        return res.status(200).json({ success: true, pushed: pushed, message: pushed ? '日報已歸檔' : '日報已歸檔，但LINE群組發布失敗' });
 
     } catch (error) {
         console.error('提交錯誤：', error);
