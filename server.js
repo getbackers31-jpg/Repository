@@ -823,6 +823,22 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 app.use('/api', express.json());
 
+// 倉庫專屬全域庫存 API
+app.get('/api/warehouse/inventory', async (req, res) => {
+    try {
+        const inventoryData = await readGlobalInventory();
+        const items = (inventoryData.items || []).filter(item => item.inventoryManaged !== false);
+        return res.status(200).json({ 
+            success: true, 
+            updatedAt: inventoryData.updatedAt || null,
+            items 
+        });
+    } catch (error) {
+        console.error('取得倉庫庫存失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得倉庫庫存' });
+    }
+});
+
 app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -940,6 +956,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
     }
 });
 
+// 🚚 領至案場 (安全鎖定優化版)
 app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -959,96 +976,101 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
         if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
 
         await withWarehouseWriteLock(async () => {
-            const inventoryData = await readGlobalInventory();
-            const txData = await readWarehouseTransactions();
+            await withMaterialWriteLock(project.projectId, async () => {
+                const inventoryData = await readGlobalInventory();
+                const txData = await readWarehouseTransactions();
 
-            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
-                return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
-            }
+                if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                    return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
+                }
 
-            const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
-            if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+                const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
+                if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
 
-            const item = inventoryData.items[itemIndex];
-            const beforeQuantity = Number(item.stockQuantity || 0);
+                const item = inventoryData.items[itemIndex];
+                const beforeQuantity = Number(item.stockQuantity || 0);
 
-            if (beforeQuantity < quantity) {
-                return res.status(400).json({ success: false, error: `倉庫庫存不足，目前只有 ${beforeQuantity} ${item.stockUnit}` });
-            }
+                if (beforeQuantity < quantity) {
+                    return res.status(400).json({ success: false, error: `倉庫庫存不足，目前只有 ${beforeQuantity} ${item.stockUnit}` });
+                }
 
-            const packageQuantity = Number(item.packageQuantity || 1);
-            const afterQuantity = beforeQuantity - quantity;
-            const baseQuantityChange = -(quantity * packageQuantity);
+                const packageQuantity = Number(item.packageQuantity || 1);
+                const afterQuantity = beforeQuantity - quantity;
+                const baseQuantityChange = -(quantity * packageQuantity);
 
-            const transactionId = `TX-${crypto.randomUUID()}`;
-            const transferId = `TRF-${crypto.randomUUID()}`;
-            const nowIso = new Date().toISOString();
-            const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
+                const transactionId = `TX-${crypto.randomUUID()}`;
+                const transferId = `TRF-${crypto.randomUUID()}`;
+                const nowIso = new Date().toISOString();
+                const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
 
-            const warehouseTx = {
-                transactionId,
-                submissionId,
-                transferId,
-                transactionType: 'PROJECT_TRANSFER_OUT',
-                transactionDate,
-                materialId: item.materialId,
-                materialCode: item.materialCode,
-                materialName: item.materialName,
-                quantityChange: -quantity,
-                beforeQuantity,
-                afterQuantity,
-                stockUnit: item.stockUnit,
-                packageQuantity,
-                packageUnit: item.packageUnit,
-                baseQuantityChange,
-                baseUnit: item.baseUnit || item.stockUnit,
-                projectId: project.projectId,
-                projectName: project.projectName,
-                operatorName,
-                remarks: String(payload.remarks || ''),
-                createdAt: nowIso,
-                writeStatus: "COMPLETED"
-            };
+                const safeProjectName = sanitizePathSegment(project.projectName);
+                const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
 
-            const safeProjectName = sanitizePathSegment(project.projectName);
-            const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+                let projTxData = { transactions: [] };
+                try {
+                    projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false);
+                } catch(e) {}
+                if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
 
-            let projTxData = { transactions: [] };
-            try {
-                projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false);
-            } catch(e) {}
-            if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
+                const projectAlreadyWritten = projTxData.transactions.some(tx => tx.submissionId === submissionId);
+                if (!projectAlreadyWritten) {
+                    projTxData.transactions.push({
+                        submissionId,
+                        transferId,
+                        transactionDate,
+                        transactionType: 'WAREHOUSE_TRANSFER_IN',
+                        materialId: item.materialId,
+                        materialCode: item.materialCode,
+                        materialName: item.materialName,
+                        quantity: quantity,
+                        stockUnit: item.stockUnit,
+                        packageQuantity: packageQuantity,
+                        packageUnit: item.packageUnit,
+                        baseQuantity: quantity * packageQuantity,
+                        baseUnit: item.baseUnit || item.stockUnit,
+                        remarks: String(payload.remarks || '倉庫轉入')
+                    });
+                    await writeJsonToOneDrive(projectTxPath, projTxData);
+                }
 
-            projTxData.transactions.push({
-                submissionId,
-                transferId,
-                transactionDate,
-                transactionType: 'WAREHOUSE_TRANSFER_IN',
-                materialId: item.materialId,
-                materialCode: item.materialCode,
-                materialName: item.materialName,
-                quantity: quantity,
-                stockUnit: item.stockUnit,
-                packageQuantity: packageQuantity,
-                packageUnit: item.packageUnit,
-                baseQuantity: quantity * packageQuantity,
-                baseUnit: item.baseUnit || item.stockUnit,
-                remarks: String(payload.remarks || '倉庫轉入')
+                const warehouseTx = {
+                    transactionId,
+                    submissionId,
+                    transferId,
+                    transactionType: 'PROJECT_TRANSFER_OUT',
+                    transactionDate,
+                    materialId: item.materialId,
+                    materialCode: item.materialCode,
+                    materialName: item.materialName,
+                    quantityChange: -quantity,
+                    beforeQuantity,
+                    afterQuantity,
+                    stockUnit: item.stockUnit,
+                    packageQuantity,
+                    packageUnit: item.packageUnit,
+                    baseQuantityChange,
+                    baseUnit: item.baseUnit || item.stockUnit,
+                    projectId: project.projectId,
+                    projectName: project.projectName,
+                    operatorName,
+                    remarks: String(payload.remarks || ''),
+                    createdAt: nowIso,
+                    writeStatus: "COMPLETED"
+                };
+
+                txData.transactions.push(warehouseTx);
+                txData.updatedAt = nowIso;
+                await writeWarehouseTransactions(txData);
+
+                item.stockQuantity = afterQuantity;
+                item.stockBaseQuantity = afterQuantity * packageQuantity;
+                item.stockStatus = calculateWarehouseStatus(item);
+                inventoryData.updatedAt = nowIso;
+                await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+                configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+
+                res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功領至案場' });
             });
-
-            await writeJsonToOneDrive(projectTxPath, projTxData);
-            txData.transactions.push(warehouseTx);
-            txData.updatedAt = nowIso;
-            await writeWarehouseTransactions(txData);
-
-            item.stockQuantity = afterQuantity;
-            item.stockBaseQuantity = afterQuantity * packageQuantity;
-            item.stockStatus = calculateWarehouseStatus(item);
-            inventoryData.updatedAt = nowIso;
-            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
-
-            res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功領至案場' });
         });
     } catch (error) {
         console.error('領料失敗:', error);
@@ -1056,6 +1078,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
     }
 });
 
+// ↩️ 案場退回 (安全鎖定優化版)
 app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -1075,104 +1098,108 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
         if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
 
         await withWarehouseWriteLock(async () => {
-            const inventoryData = await readGlobalInventory();
-            const txData = await readWarehouseTransactions();
+            await withMaterialWriteLock(project.projectId, async () => {
+                const inventoryData = await readGlobalInventory();
+                const txData = await readWarehouseTransactions();
 
-            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
-                return res.status(200).json({ success: true, duplicate: true, message: '此筆退料先前已完成' });
-            }
-
-            const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
-            if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
-            const item = inventoryData.items[itemIndex];
-
-            const safeProjectName = sanitizePathSegment(project.projectName);
-            const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
-            let projTxData = { transactions: [] };
-            try { projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false); } catch(e) {}
-
-            let issuedBaseQuantity = 0;
-            (projTxData.transactions || []).forEach(tx => {
-                if (tx.materialId === materialId) {
-                    issuedBaseQuantity += Number(tx.baseQuantity || 0);
+                if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                    return res.status(200).json({ success: true, duplicate: true, message: '此筆退料先前已完成' });
                 }
+
+                const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
+                if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+                const item = inventoryData.items[itemIndex];
+
+                const safeProjectName = sanitizePathSegment(project.projectName);
+                const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+                let projTxData = { transactions: [] };
+                try { projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false); } catch(e) {}
+
+                let issuedBaseQuantity = 0;
+                (projTxData.transactions || []).forEach(tx => {
+                    if (tx.materialId === materialId) {
+                        issuedBaseQuantity += Number(tx.baseQuantity || 0);
+                    }
+                });
+
+                const statsResult = await generateProjectStats(project);
+                const consumedBaseQuantity = (statsResult.stats?.materialStats || {})[materialId] || 0;
+
+                const packageQuantity = Number(item.packageQuantity || 1);
+                const baseQuantityToReturn = quantity * packageQuantity;
+                const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
+
+                if (currentBalance < baseQuantityToReturn) {
+                    return res.status(400).json({ success: false, error: `退料超過案場餘額！案場帳面僅剩 ${currentBalance / packageQuantity} ${item.stockUnit}` });
+                }
+
+                const beforeQuantity = Number(item.stockQuantity || 0);
+                const afterQuantity = beforeQuantity + quantity;
+
+                const transactionId = `TX-${crypto.randomUUID()}`;
+                const transferId = `TRF-${crypto.randomUUID()}`;
+                const nowIso = new Date().toISOString();
+                const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
+
+                const projectAlreadyWritten = (projTxData.transactions || []).some(tx => tx.submissionId === submissionId);
+                if (!projectAlreadyWritten) {
+                    projTxData.transactions.push({
+                        submissionId,
+                        transferId,
+                        transactionDate,
+                        transactionType: 'PROJECT_RETURN_OUT',
+                        materialId: item.materialId,
+                        materialCode: item.materialCode,
+                        materialName: item.materialName,
+                        quantity: -quantity, 
+                        stockUnit: item.stockUnit,
+                        packageQuantity: packageQuantity,
+                        packageUnit: item.packageUnit,
+                        baseQuantity: -baseQuantityToReturn, 
+                        baseUnit: item.baseUnit || item.stockUnit,
+                        remarks: String(payload.remarks || '案場退回倉庫')
+                    });
+                    await writeJsonToOneDrive(projectTxPath, projTxData);
+                }
+                
+                const warehouseTx = {
+                    transactionId,
+                    submissionId,
+                    transferId,
+                    transactionType: 'PROJECT_RETURN',
+                    transactionDate,
+                    materialId: item.materialId,
+                    materialCode: item.materialCode,
+                    materialName: item.materialName,
+                    quantityChange: quantity,
+                    beforeQuantity,
+                    afterQuantity,
+                    stockUnit: item.stockUnit,
+                    packageQuantity,
+                    packageUnit: item.packageUnit,
+                    baseQuantityChange: baseQuantityToReturn,
+                    baseUnit: item.baseUnit || item.stockUnit,
+                    projectId: project.projectId,
+                    projectName: project.projectName,
+                    operatorName,
+                    remarks: String(payload.remarks || ''),
+                    createdAt: nowIso,
+                    writeStatus: "COMPLETED"
+                };
+
+                txData.transactions.push(warehouseTx);
+                txData.updatedAt = nowIso;
+                await writeWarehouseTransactions(txData);
+
+                item.stockQuantity = afterQuantity;
+                item.stockBaseQuantity = afterQuantity * packageQuantity;
+                item.stockStatus = calculateWarehouseStatus(item);
+                inventoryData.updatedAt = nowIso;
+                await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+                configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+
+                res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功退回倉庫' });
             });
-
-            const statsResult = await generateProjectStats(project);
-            const consumedBaseQuantity = (statsResult.stats?.materialStats || {})[materialId] || 0;
-
-            const packageQuantity = Number(item.packageQuantity || 1);
-            const baseQuantityToReturn = quantity * packageQuantity;
-            const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
-
-            if (currentBalance < baseQuantityToReturn) {
-                return res.status(400).json({ success: false, error: `退料超過案場餘額！案場帳面僅剩 ${currentBalance / packageQuantity} ${item.stockUnit}` });
-            }
-
-            const beforeQuantity = Number(item.stockQuantity || 0);
-            const afterQuantity = beforeQuantity + quantity;
-
-            const transactionId = `TX-${crypto.randomUUID()}`;
-            const transferId = `TRF-${crypto.randomUUID()}`;
-            const nowIso = new Date().toISOString();
-            const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
-
-            const warehouseTx = {
-                transactionId,
-                submissionId,
-                transferId,
-                transactionType: 'PROJECT_RETURN',
-                transactionDate,
-                materialId: item.materialId,
-                materialCode: item.materialCode,
-                materialName: item.materialName,
-                quantityChange: quantity,
-                beforeQuantity,
-                afterQuantity,
-                stockUnit: item.stockUnit,
-                packageQuantity,
-                packageUnit: item.packageUnit,
-                baseQuantityChange: baseQuantityToReturn,
-                baseUnit: item.baseUnit || item.stockUnit,
-                projectId: project.projectId,
-                projectName: project.projectName,
-                operatorName,
-                remarks: String(payload.remarks || ''),
-                createdAt: nowIso,
-                writeStatus: "COMPLETED"
-            };
-
-            projTxData.transactions.push({
-                submissionId,
-                transferId,
-                transactionDate,
-                transactionType: 'PROJECT_RETURN_OUT',
-                materialId: item.materialId,
-                materialCode: item.materialCode,
-                materialName: item.materialName,
-                quantity: -quantity, 
-                stockUnit: item.stockUnit,
-                packageQuantity: packageQuantity,
-                packageUnit: item.packageUnit,
-                baseQuantity: -baseQuantityToReturn, 
-                baseUnit: item.baseUnit || item.stockUnit,
-                remarks: String(payload.remarks || '案場退回倉庫')
-            });
-
-            await writeJsonToOneDrive(projectTxPath, projTxData);
-            
-            txData.transactions.push(warehouseTx);
-            txData.updatedAt = nowIso;
-            await writeWarehouseTransactions(txData);
-
-            item.stockQuantity = afterQuantity;
-            item.stockBaseQuantity = afterQuantity * packageQuantity;
-            item.stockStatus = calculateWarehouseStatus(item);
-            inventoryData.updatedAt = nowIso;
-            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
-
-            res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功退回倉庫' });
         });
     } catch (error) {
         console.error('退料失敗:', error);
@@ -1371,7 +1398,6 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         wsTxLog.views = [{ showGridLines: true }];
         wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
         
-        // 🌟 完整的中文翻譯對照表 (新增 WAREHOUSE_TRANSFER_IN 與 PROJECT_RETURN_OUT)
         const typeMap = { 
             'OPENING_ISSUE': '開工首批進場', 
             'ADDITIONAL_ISSUE': '追加進場',
@@ -1685,11 +1711,23 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
-const requiredVars = ['LINE_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_SECRET'];
+const requiredVars = [
+    'LINE_ACCESS_TOKEN', 
+    'LINE_CHANNEL_SECRET', 
+    'LINE_LOGIN_CHANNEL_ID',
+    'WAREHOUSE_ALLOWED_LINE_USER_IDS',
+    'AZURE_CLIENT_ID', 
+    'AZURE_TENANT_ID', 
+    'AZURE_CLIENT_SECRET'
+];
 const missingVars = requiredVars.filter(name => !process.env[name]);
 if (missingVars.length > 0) {
     console.error('缺少必要環境變數：', missingVars.join(', '));
     process.exit(1);
 }
 
-app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+// 支援自動化測試 (被載入時不自動 listen)
+if (require.main === module) {
+    app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
+}
+module.exports = app;
