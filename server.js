@@ -839,6 +839,7 @@ app.get('/api/warehouse/inventory', async (req, res) => {
     }
 });
 
+// ➕ 採購入庫 / 🔄 盤點修正
 app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -866,7 +867,22 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             const inventoryData = await readGlobalInventory();
             const txData = await readWarehouseTransactions();
             
-            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+            // 【安全修正 1】：重送時自動比對並修復 inventory.json 快照
+            const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
+            if (existingTx) {
+                const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
+                if (itemIndex !== -1) {
+                    const item = inventoryData.items[itemIndex];
+                    if (item.stockQuantity !== existingTx.afterQuantity) {
+                        item.stockQuantity = existingTx.afterQuantity;
+                        item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
+                        item.stockStatus = calculateWarehouseStatus(item);
+                        inventoryData.updatedAt = new Date().toISOString();
+                        await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+                        configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+                        console.log(`[自動修復] 發現庫存快照未同步，已將 ${item.materialName} 修正為 ${existingTx.afterQuantity}`);
+                    }
+                }
                 return res.status(200).json({ success: true, duplicate: true, message: '此筆庫存異動先前已完成' });
             }
             
@@ -902,6 +918,9 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             const packageQuantity = Number(item.packageQuantity || 1);
             const baseQuantityChange = quantityChange * packageQuantity;
             
+            // 【安全修正 3】：交易日期統一使用台灣日期
+            const { dateStr } = getTaiwanDateParts();
+            const transactionDate = String(payload.transactionDate || dateStr);
             const transactionId = `TX-${crypto.randomUUID()}`;
             const nowIso = new Date().toISOString();
             
@@ -910,7 +929,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
                 submissionId,
                 transferId: null,
                 transactionType,
-                transactionDate: String(payload.transactionDate || nowIso.substring(0, 10)),
+                transactionDate,
                 materialId: item.materialId,
                 materialCode: item.materialCode,
                 materialName: item.materialName,
@@ -956,7 +975,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
     }
 });
 
-// 🚚 領至案場 (安全鎖定優化版)
+// 🚚 領至案場 (安全鎖定與同步優化版)
 app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -980,7 +999,21 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 const inventoryData = await readGlobalInventory();
                 const txData = await readWarehouseTransactions();
 
-                if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                // 【安全修正 1】：重送時自動比對並修復快照
+                const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
+                if (existingTx) {
+                    const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
+                    if (itemIndex !== -1) {
+                        const item = inventoryData.items[itemIndex];
+                        if (item.stockQuantity !== existingTx.afterQuantity) {
+                            item.stockQuantity = existingTx.afterQuantity;
+                            item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
+                            item.stockStatus = calculateWarehouseStatus(item);
+                            inventoryData.updatedAt = new Date().toISOString();
+                            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+                            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+                        }
+                    }
                     return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
                 }
 
@@ -998,10 +1031,11 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 const afterQuantity = beforeQuantity - quantity;
                 const baseQuantityChange = -(quantity * packageQuantity);
 
+                // 【安全修正 3】：交易日期統一使用台灣日期
+                const { dateStr } = getTaiwanDateParts();
+                const transactionDate = String(payload.transactionDate || dateStr);
                 const transactionId = `TX-${crypto.randomUUID()}`;
-                const transferId = `TRF-${crypto.randomUUID()}`;
                 const nowIso = new Date().toISOString();
-                const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
 
                 const safeProjectName = sanitizePathSegment(project.projectName);
                 const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
@@ -1012,8 +1046,11 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 } catch(e) {}
                 if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
 
-                const projectAlreadyWritten = projTxData.transactions.some(tx => tx.submissionId === submissionId);
-                if (!projectAlreadyWritten) {
+                // 【安全修正 2】：部分寫入重送時，沿用相同的 transferId
+                const existingProjectTransaction = projTxData.transactions.find(tx => tx.submissionId === submissionId);
+                const transferId = existingProjectTransaction ? existingProjectTransaction.transferId : `TRF-${crypto.randomUUID()}`;
+
+                if (!existingProjectTransaction) {
                     projTxData.transactions.push({
                         submissionId,
                         transferId,
@@ -1078,7 +1115,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
     }
 });
 
-// ↩️ 案場退回 (安全鎖定優化版)
+// ↩️ 案場退回 (安全鎖定與同步優化版)
 app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -1102,7 +1139,21 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 const inventoryData = await readGlobalInventory();
                 const txData = await readWarehouseTransactions();
 
-                if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                // 【安全修正 1】：重送時自動比對並修復快照
+                const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
+                if (existingTx) {
+                    const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
+                    if (itemIndex !== -1) {
+                        const item = inventoryData.items[itemIndex];
+                        if (item.stockQuantity !== existingTx.afterQuantity) {
+                            item.stockQuantity = existingTx.afterQuantity;
+                            item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
+                            item.stockStatus = calculateWarehouseStatus(item);
+                            inventoryData.updatedAt = new Date().toISOString();
+                            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+                            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+                        }
+                    }
                     return res.status(200).json({ success: true, duplicate: true, message: '此筆退料先前已完成' });
                 }
 
@@ -1136,13 +1187,17 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 const beforeQuantity = Number(item.stockQuantity || 0);
                 const afterQuantity = beforeQuantity + quantity;
 
+                // 【安全修正 3】：交易日期統一使用台灣日期
+                const { dateStr } = getTaiwanDateParts();
+                const transactionDate = String(payload.transactionDate || dateStr);
                 const transactionId = `TX-${crypto.randomUUID()}`;
-                const transferId = `TRF-${crypto.randomUUID()}`;
                 const nowIso = new Date().toISOString();
-                const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
 
-                const projectAlreadyWritten = (projTxData.transactions || []).some(tx => tx.submissionId === submissionId);
-                if (!projectAlreadyWritten) {
+                // 【安全修正 2】：部分寫入重送時，沿用相同的 transferId
+                const existingProjectTransaction = projTxData.transactions.find(tx => tx.submissionId === submissionId);
+                const transferId = existingProjectTransaction ? existingProjectTransaction.transferId : `TRF-${crypto.randomUUID()}`;
+
+                if (!existingProjectTransaction) {
                     projTxData.transactions.push({
                         submissionId,
                         transferId,
@@ -1726,7 +1781,6 @@ if (missingVars.length > 0) {
     process.exit(1);
 }
 
-// 支援自動化測試 (被載入時不自動 listen)
 if (require.main === module) {
     app.listen(PORT, () => console.log(`🚀 伺服器運作中：http://localhost:${PORT}`));
 }
