@@ -12,6 +12,7 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
+const LINE_LOGIN_CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
 const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
@@ -70,6 +71,73 @@ function getProjectRegistrationErrorMessage(error) {
     const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
     return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
 }
+
+
+let warehouseWriteQueue = Promise.resolve();
+function withWarehouseWriteLock(task) {
+    const current = warehouseWriteQueue.then(task, task);
+    warehouseWriteQueue = current.catch(() => undefined);
+    return current;
+}
+
+const WAREHOUSE_TRANSACTION_PATH = '工程專案管理/_系統設定/warehouse-transactions.json';
+
+async function readWarehouseTransactions() {
+    const data = await readJsonFromOneDrive(WAREHOUSE_TRANSACTION_PATH, { schemaVersion: 1, transactions: [] }, false);
+    if (!data || !Array.isArray(data.transactions)) {
+        throw new Error('倉庫異動檔格式不正確');
+    }
+    return data;
+}
+
+async function writeWarehouseTransactions(data) {
+    await writeJsonToOneDrive(WAREHOUSE_TRANSACTION_PATH, data);
+}
+
+function calculateWarehouseStatus(item) {
+    const stockQuantity = Number(item.stockQuantity);
+    const threshold = Number(item.lowStockThreshold || 0);
+    
+    if (!Number.isFinite(stockQuantity)) return 'REVIEW_REQUIRED';
+    if (stockQuantity < 0) return 'REVIEW_REQUIRED';
+    if (stockQuantity === 0) return 'OUT_OF_STOCK';
+    if (stockQuantity <= threshold) return 'LOW_STOCK';
+    return 'NORMAL';
+}
+
+async function requireWarehouseAccess(req, res, next) {
+    try {
+        const authorization = String(req.get('authorization') || '');
+        const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+        
+        if (!idToken) {
+            return res.status(401).json({ success: false, error: '缺少登入憑證' });
+        }
+        
+        const response = await fetch('https://api.line.me/oauth2/v2.1/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ id_token: idToken, client_id: process.env.LINE_LOGIN_CHANNEL_ID })
+        });
+        
+        const tokenData = await response.json();
+        if (!response.ok || !tokenData.sub) {
+            return res.status(401).json({ success: false, error: '登入憑證無效' });
+        }
+        
+        const allowedUserIds = String(process.env.WAREHOUSE_ALLOWED_LINE_USER_IDS || '').split(',').map(v => v.trim()).filter(Boolean);
+        if (!allowedUserIds.includes(tokenData.sub)) {
+            return res.status(403).json({ success: false, error: '沒有庫存異動權限' });
+        }
+        
+        req.warehouseUserId = tokenData.sub;
+        next();
+    } catch (error) {
+        console.error('倉庫權限驗證失敗：', error);
+        return res.status(500).json({ success: false, error: '無法驗證使用者權限' });
+    }
+}
+
 
 let projectWriteQueue = Promise.resolve();
 function withProjectWriteLock(task) {
@@ -532,6 +600,13 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
 
+                // 🟢 查詢個人 LINE ID (開通權限用)
+                if (text === '我的ID') {
+                    const userId = event.source.userId;
+                    await replyLineMessage(event.replyToken, `👤 您的專屬 LINE ID 是：\n\n${userId}\n\n👉 請長按複製上方代碼，並傳送給管理員以開通庫存修改權限。`);
+                    continue;
+                }
+
                 // 🟢 庫存查詢 (改為網頁引導模式)
                 if (text === '查庫存' || text === '庫存總表') {
                     try {
@@ -754,6 +829,386 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 });
 
 app.use('/api', express.json());
+
+app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res) => {
+    try {
+        const payload = req.body;
+        const submissionId = String(payload.submissionId || '').trim();
+        if (!submissionId) {
+            return res.status(400).json({ success: false, error: '缺少 submissionId' });
+        }
+        
+        const materialId = String(payload.materialId || '').trim();
+        if (!materialId) {
+            return res.status(400).json({ success: false, error: '缺少材料 ID' });
+        }
+        
+        const transactionType = payload.transactionType;
+        if (!['PURCHASE_IN', 'WAREHOUSE_ADJUSTMENT'].includes(transactionType)) {
+            return res.status(400).json({ success: false, error: '不支援的異動類型' });
+        }
+
+        const operatorName = String(payload.operatorName || '').trim();
+        if (!operatorName) {
+            return res.status(400).json({ success: false, error: '缺少操作人姓名' });
+        }
+
+        await withWarehouseWriteLock(async () => {
+            // 1 & 2. 重新讀取
+            const inventoryData = await readGlobalInventory();
+            const txData = await readWarehouseTransactions();
+            
+            // 3. 檢查重複
+            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                return res.status(200).json({ success: true, duplicate: true, message: '此筆庫存異動先前已完成' });
+            }
+            
+            // 4. 查 materialId
+            const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
+            if (itemIndex === -1) {
+                return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+            }
+            const item = inventoryData.items[itemIndex];
+            if (item.inventoryManaged === false) {
+                return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
+            }
+            
+            // 5, 6, 7. 計算數量
+            const beforeQuantity = Number(item.stockQuantity || 0);
+            let quantityChange = 0;
+            let afterQuantity = 0;
+            
+            if (transactionType === 'PURCHASE_IN') {
+                const qty = Number(payload.quantity);
+                if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ success: false, error: '入庫數量無效' });
+                quantityChange = qty;
+                afterQuantity = beforeQuantity + quantityChange;
+            } else if (transactionType === 'WAREHOUSE_ADJUSTMENT') {
+                const actualQty = Number(payload.actualQuantity);
+                if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ success: false, error: '實際盤點數量無效' });
+                afterQuantity = actualQty;
+                quantityChange = afterQuantity - beforeQuantity;
+            }
+            
+            // 如果沒變化
+            if (quantityChange === 0 && transactionType === 'WAREHOUSE_ADJUSTMENT') {
+                return res.status(400).json({ success: false, error: '盤點數量與目前庫存相同，無須調整' });
+            }
+
+            const packageQuantity = Number(item.packageQuantity || 1);
+            const baseQuantityChange = quantityChange * packageQuantity;
+            
+            // 8. 產生 transactionId
+            const transactionId = `TX-${crypto.randomUUID()}`;
+            const nowIso = new Date().toISOString();
+            
+            const newTx = {
+                transactionId,
+                submissionId,
+                transferId: null,
+                transactionType,
+                transactionDate: String(payload.transactionDate || nowIso.substring(0, 10)),
+                materialId: item.materialId,
+                materialCode: item.materialCode,
+                materialName: item.materialName,
+                quantityChange,
+                beforeQuantity,
+                afterQuantity,
+                stockUnit: item.stockUnit,
+                packageQuantity,
+                packageUnit: item.packageUnit,
+                baseQuantityChange,
+                baseUnit: item.baseUnit || item.stockUnit,
+                projectId: null,
+                projectName: null,
+                operatorName,
+                remarks: String(payload.remarks || ''),
+                createdAt: nowIso,
+                writeStatus: "COMPLETED"
+            };
+            
+            txData.transactions.push(newTx);
+            txData.updatedAt = nowIso;
+            
+            // 9. 更新 inventory item
+            item.stockQuantity = afterQuantity;
+            item.stockBaseQuantity = afterQuantity * packageQuantity;
+            item.stockStatus = calculateWarehouseStatus(item);
+            inventoryData.updatedAt = nowIso;
+            
+            // 10. 先寫入交易檔
+            await writeWarehouseTransactions(txData);
+            
+            // 11. 再更新主檔與快取
+            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+            
+            // 12. 回傳
+            res.status(200).json({ 
+                success: true, 
+                transactionId,
+                afterQuantity,
+                message: '庫存異動成功'
+            });
+        });
+
+    } catch (error) {
+        console.error('庫存異動失敗:', error);
+        res.status(500).json({ success: false, error: '系統錯誤，無法更新庫存' });
+    }
+});
+
+// 🚚 領至案場 (PROJECT_TRANSFER_OUT & WAREHOUSE_TRANSFER_IN)
+app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, res) => {
+    try {
+        const payload = req.body;
+        const submissionId = String(payload.submissionId || '').trim();
+        if (!submissionId) return res.status(400).json({ success: false, error: '缺少 submissionId' });
+
+        const projectId = String(payload.projectId || '').trim();
+        const materialId = String(payload.materialId || '').trim();
+        const quantity = Number(payload.quantity);
+        const operatorName = String(payload.operatorName || '').trim();
+
+        if (!projectId || !materialId || !operatorName || !Number.isFinite(quantity) || quantity <= 0) {
+            return res.status(400).json({ success: false, error: '參數不完整或數量無效' });
+        }
+
+        const project = await findProjectById(projectId);
+        if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
+
+        await withWarehouseWriteLock(async () => {
+            const inventoryData = await readGlobalInventory();
+            const txData = await readWarehouseTransactions();
+
+            // 檢查重複提交
+            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
+            }
+
+            const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
+            if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+
+            const item = inventoryData.items[itemIndex];
+            const beforeQuantity = Number(item.stockQuantity || 0);
+
+            // 庫存不足防呆
+            if (beforeQuantity < quantity) {
+                return res.status(400).json({ success: false, error: `倉庫庫存不足，目前只有 ${beforeQuantity} ${item.stockUnit}` });
+            }
+
+            const packageQuantity = Number(item.packageQuantity || 1);
+            const afterQuantity = beforeQuantity - quantity;
+            const baseQuantityChange = -(quantity * packageQuantity);
+
+            const transactionId = `TX-${crypto.randomUUID()}`;
+            const transferId = `TRF-${crypto.randomUUID()}`;
+            const nowIso = new Date().toISOString();
+            const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
+
+            // 1. 準備寫入倉庫的交易 (扣除)
+            const warehouseTx = {
+                transactionId,
+                submissionId,
+                transferId,
+                transactionType: 'PROJECT_TRANSFER_OUT',
+                transactionDate,
+                materialId: item.materialId,
+                materialCode: item.materialCode,
+                materialName: item.materialName,
+                quantityChange: -quantity,
+                beforeQuantity,
+                afterQuantity,
+                stockUnit: item.stockUnit,
+                packageQuantity,
+                packageUnit: item.packageUnit,
+                baseQuantityChange,
+                baseUnit: item.baseUnit || item.stockUnit,
+                projectId: project.projectId,
+                projectName: project.projectName,
+                operatorName,
+                remarks: String(payload.remarks || ''),
+                createdAt: nowIso,
+                writeStatus: "COMPLETED"
+            };
+
+            // 2. 準備寫入案場的交易 (增加)
+            const safeProjectName = sanitizePathSegment(project.projectName);
+            const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+
+            let projTxData = { transactions: [] };
+            try {
+                projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false);
+            } catch(e) {}
+            if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
+
+            projTxData.transactions.push({
+                submissionId,
+                transferId,
+                transactionDate,
+                transactionType: 'WAREHOUSE_TRANSFER_IN',
+                materialId: item.materialId,
+                materialCode: item.materialCode,
+                materialName: item.materialName,
+                quantity: quantity,
+                stockUnit: item.stockUnit,
+                packageQuantity: packageQuantity,
+                packageUnit: item.packageUnit,
+                baseQuantity: quantity * packageQuantity,
+                baseUnit: item.baseUnit || item.stockUnit,
+                remarks: String(payload.remarks || '倉庫轉入')
+            });
+
+            // 執行三方寫入
+            await writeJsonToOneDrive(projectTxPath, projTxData);
+            txData.transactions.push(warehouseTx);
+            txData.updatedAt = nowIso;
+            await writeWarehouseTransactions(txData);
+
+            item.stockQuantity = afterQuantity;
+            item.stockBaseQuantity = afterQuantity * packageQuantity;
+            item.stockStatus = calculateWarehouseStatus(item);
+            inventoryData.updatedAt = nowIso;
+            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+
+            res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功領至案場' });
+        });
+    } catch (error) {
+        console.error('領料失敗:', error);
+        res.status(500).json({ success: false, error: '系統錯誤，無法完成領料' });
+    }
+});
+
+// ↩️ 案場退回 (PROJECT_RETURN & PROJECT_RETURN_OUT)
+app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
+    try {
+        const payload = req.body;
+        const submissionId = String(payload.submissionId || '').trim();
+        if (!submissionId) return res.status(400).json({ success: false, error: '缺少 submissionId' });
+
+        const projectId = String(payload.projectId || '').trim();
+        const materialId = String(payload.materialId || '').trim();
+        const quantity = Number(payload.quantity);
+        const operatorName = String(payload.operatorName || '').trim();
+
+        if (!projectId || !materialId || !operatorName || !Number.isFinite(quantity) || quantity <= 0) {
+            return res.status(400).json({ success: false, error: '參數不完整或數量無效' });
+        }
+
+        const project = await findProjectById(projectId);
+        if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
+
+        await withWarehouseWriteLock(async () => {
+            const inventoryData = await readGlobalInventory();
+            const txData = await readWarehouseTransactions();
+
+            if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
+                return res.status(200).json({ success: true, duplicate: true, message: '此筆退料先前已完成' });
+            }
+
+            const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
+            if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+            const item = inventoryData.items[itemIndex];
+
+            // 檢查案場餘額 (不能超退)
+            const safeProjectName = sanitizePathSegment(project.projectName);
+            const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+            let projTxData = { transactions: [] };
+            try { projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false); } catch(e) {}
+
+            // 計算該材料目前領入的總量
+            let issuedBaseQuantity = 0;
+            (projTxData.transactions || []).forEach(tx => {
+                if (tx.materialId === materialId) {
+                    issuedBaseQuantity += Number(tx.baseQuantity || 0);
+                }
+            });
+
+            // 取得日報的耗用量
+            const statsResult = await generateProjectStats(project);
+            const consumedBaseQuantity = (statsResult.stats?.materialStats || {})[materialId] || 0;
+
+            const packageQuantity = Number(item.packageQuantity || 1);
+            const baseQuantityToReturn = quantity * packageQuantity;
+            const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
+
+            if (currentBalance < baseQuantityToReturn) {
+                return res.status(400).json({ success: false, error: `退料超過案場餘額！案場帳面僅剩 ${currentBalance / packageQuantity} ${item.stockUnit}` });
+            }
+
+            const beforeQuantity = Number(item.stockQuantity || 0);
+            const afterQuantity = beforeQuantity + quantity;
+
+            const transactionId = `TX-${crypto.randomUUID()}`;
+            const transferId = `TRF-${crypto.randomUUID()}`;
+            const nowIso = new Date().toISOString();
+            const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
+
+            // 1. 寫入倉庫 (增加)
+            const warehouseTx = {
+                transactionId,
+                submissionId,
+                transferId,
+                transactionType: 'PROJECT_RETURN',
+                transactionDate,
+                materialId: item.materialId,
+                materialCode: item.materialCode,
+                materialName: item.materialName,
+                quantityChange: quantity,
+                beforeQuantity,
+                afterQuantity,
+                stockUnit: item.stockUnit,
+                packageQuantity,
+                packageUnit: item.packageUnit,
+                baseQuantityChange: baseQuantityToReturn,
+                baseUnit: item.baseUnit || item.stockUnit,
+                projectId: project.projectId,
+                projectName: project.projectName,
+                operatorName,
+                remarks: String(payload.remarks || ''),
+                createdAt: nowIso,
+                writeStatus: "COMPLETED"
+            };
+
+            // 2. 寫入案場 (神來一筆：利用負數扣除餘額，與 Excel 和統計完美相容)
+            projTxData.transactions.push({
+                submissionId,
+                transferId,
+                transactionDate,
+                transactionType: 'PROJECT_RETURN_OUT',
+                materialId: item.materialId,
+                materialCode: item.materialCode,
+                materialName: item.materialName,
+                quantity: -quantity, // 負數扣除
+                stockUnit: item.stockUnit,
+                packageQuantity: packageQuantity,
+                packageUnit: item.packageUnit,
+                baseQuantity: -baseQuantityToReturn, // 負數扣除
+                baseUnit: item.baseUnit || item.stockUnit,
+                remarks: String(payload.remarks || '案場退回倉庫')
+            });
+
+            await writeJsonToOneDrive(projectTxPath, projTxData);
+            
+            txData.transactions.push(warehouseTx);
+            txData.updatedAt = nowIso;
+            await writeWarehouseTransactions(txData);
+
+            item.stockQuantity = afterQuantity;
+            item.stockBaseQuantity = afterQuantity * packageQuantity;
+            item.stockStatus = calculateWarehouseStatus(item);
+            inventoryData.updatedAt = nowIso;
+            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
+            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
+
+            res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功退回倉庫' });
+        });
+    } catch (error) {
+        console.error('退料失敗:', error);
+        res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
+    }
+});
 
 app.get('/api/projects', async (req, res) => {
     try {
