@@ -72,7 +72,6 @@ function getProjectRegistrationErrorMessage(error) {
     return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
 }
 
-
 let warehouseWriteQueue = Promise.resolve();
 function withWarehouseWriteLock(task) {
     const current = warehouseWriteQueue.then(task, task);
@@ -137,7 +136,6 @@ async function requireWarehouseAccess(req, res, next) {
         return res.status(500).json({ success: false, error: '無法驗證使用者權限' });
     }
 }
-
 
 let projectWriteQueue = Promise.resolve();
 function withProjectWriteLock(task) {
@@ -582,7 +580,6 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
-// Webhook 必須使用 express.raw，維持獨立
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -600,14 +597,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             if (event.type === 'message' && event.message.type === 'text') {
                 const text = event.message.text.trim();
 
-                // 🟢 查詢個人 LINE ID (開通權限用)
                 if (text === '我的ID') {
                     const userId = event.source.userId;
                     await replyLineMessage(event.replyToken, `👤 您的專屬 LINE ID 是：\n\n${userId}\n\n👉 請長按複製上方代碼，並傳送給管理員以開通庫存修改權限。`);
                     continue;
                 }
 
-                // 🟢 庫存查詢 (改為網頁引導模式)
                 if (text === '查庫存' || text === '庫存總表') {
                     try {
                         const inventoryData = await readGlobalInventory();
@@ -633,7 +628,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                         
                         if (errCount > 0) replyText += `🚨 帳面異常：${errCount} 項\n`;
 
-                        // 👇 這裡已經幫你替換成你在前端專案的 GitHub Pages 網址了！
                         replyText += `\n👇 點擊下方網址查看【完整庫存總表】\n` +
                                      `https://getbackers31-jpg.github.io/chuanda-frontend-/inventory.html`;
 
@@ -646,7 +640,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     }
                 }
 
-                // 🟢 庫存查詢 (精確搜尋模式)
                 if (text.startsWith('查庫存 ')) {
                     try {
                         const keyword = text.replace('查庫存', '').trim().toLowerCase();
@@ -854,16 +847,13 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
         }
 
         await withWarehouseWriteLock(async () => {
-            // 1 & 2. 重新讀取
             const inventoryData = await readGlobalInventory();
             const txData = await readWarehouseTransactions();
             
-            // 3. 檢查重複
             if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
                 return res.status(200).json({ success: true, duplicate: true, message: '此筆庫存異動先前已完成' });
             }
             
-            // 4. 查 materialId
             const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
             if (itemIndex === -1) {
                 return res.status(404).json({ success: false, error: '找不到該材料主檔' });
@@ -873,7 +863,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
                 return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
             }
             
-            // 5, 6, 7. 計算數量
             const beforeQuantity = Number(item.stockQuantity || 0);
             let quantityChange = 0;
             let afterQuantity = 0;
@@ -890,7 +879,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
                 quantityChange = afterQuantity - beforeQuantity;
             }
             
-            // 如果沒變化
             if (quantityChange === 0 && transactionType === 'WAREHOUSE_ADJUSTMENT') {
                 return res.status(400).json({ success: false, error: '盤點數量與目前庫存相同，無須調整' });
             }
@@ -898,7 +886,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             const packageQuantity = Number(item.packageQuantity || 1);
             const baseQuantityChange = quantityChange * packageQuantity;
             
-            // 8. 產生 transactionId
             const transactionId = `TX-${crypto.randomUUID()}`;
             const nowIso = new Date().toISOString();
             
@@ -930,20 +917,15 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             txData.transactions.push(newTx);
             txData.updatedAt = nowIso;
             
-            // 9. 更新 inventory item
             item.stockQuantity = afterQuantity;
             item.stockBaseQuantity = afterQuantity * packageQuantity;
             item.stockStatus = calculateWarehouseStatus(item);
             inventoryData.updatedAt = nowIso;
             
-            // 10. 先寫入交易檔
             await writeWarehouseTransactions(txData);
-            
-            // 11. 再更新主檔與快取
             await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
             configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
             
-            // 12. 回傳
             res.status(200).json({ 
                 success: true, 
                 transactionId,
@@ -958,7 +940,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
     }
 });
 
-// 🚚 領至案場 (PROJECT_TRANSFER_OUT & WAREHOUSE_TRANSFER_IN)
 app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -981,7 +962,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
             const inventoryData = await readGlobalInventory();
             const txData = await readWarehouseTransactions();
 
-            // 檢查重複提交
             if (txData.transactions.some(tx => tx.submissionId === submissionId)) {
                 return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
             }
@@ -992,7 +972,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
             const item = inventoryData.items[itemIndex];
             const beforeQuantity = Number(item.stockQuantity || 0);
 
-            // 庫存不足防呆
             if (beforeQuantity < quantity) {
                 return res.status(400).json({ success: false, error: `倉庫庫存不足，目前只有 ${beforeQuantity} ${item.stockUnit}` });
             }
@@ -1006,7 +985,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
             const nowIso = new Date().toISOString();
             const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
 
-            // 1. 準備寫入倉庫的交易 (扣除)
             const warehouseTx = {
                 transactionId,
                 submissionId,
@@ -1032,7 +1010,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 writeStatus: "COMPLETED"
             };
 
-            // 2. 準備寫入案場的交易 (增加)
             const safeProjectName = sanitizePathSegment(project.projectName);
             const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
 
@@ -1059,7 +1036,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 remarks: String(payload.remarks || '倉庫轉入')
             });
 
-            // 執行三方寫入
             await writeJsonToOneDrive(projectTxPath, projTxData);
             txData.transactions.push(warehouseTx);
             txData.updatedAt = nowIso;
@@ -1080,7 +1056,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
     }
 });
 
-// ↩️ 案場退回 (PROJECT_RETURN & PROJECT_RETURN_OUT)
 app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
     try {
         const payload = req.body;
@@ -1111,13 +1086,11 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
             if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
             const item = inventoryData.items[itemIndex];
 
-            // 檢查案場餘額 (不能超退)
             const safeProjectName = sanitizePathSegment(project.projectName);
             const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
             let projTxData = { transactions: [] };
             try { projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false); } catch(e) {}
 
-            // 計算該材料目前領入的總量
             let issuedBaseQuantity = 0;
             (projTxData.transactions || []).forEach(tx => {
                 if (tx.materialId === materialId) {
@@ -1125,7 +1098,6 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 }
             });
 
-            // 取得日報的耗用量
             const statsResult = await generateProjectStats(project);
             const consumedBaseQuantity = (statsResult.stats?.materialStats || {})[materialId] || 0;
 
@@ -1145,7 +1117,6 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
             const nowIso = new Date().toISOString();
             const transactionDate = String(payload.transactionDate || nowIso.substring(0, 10));
 
-            // 1. 寫入倉庫 (增加)
             const warehouseTx = {
                 transactionId,
                 submissionId,
@@ -1171,7 +1142,6 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 writeStatus: "COMPLETED"
             };
 
-            // 2. 寫入案場 (神來一筆：利用負數扣除餘額，與 Excel 和統計完美相容)
             projTxData.transactions.push({
                 submissionId,
                 transferId,
@@ -1180,11 +1150,11 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 materialId: item.materialId,
                 materialCode: item.materialCode,
                 materialName: item.materialName,
-                quantity: -quantity, // 負數扣除
+                quantity: -quantity, 
                 stockUnit: item.stockUnit,
                 packageQuantity: packageQuantity,
                 packageUnit: item.packageUnit,
-                baseQuantity: -baseQuantityToReturn, // 負數扣除
+                baseQuantity: -baseQuantityToReturn, 
                 baseUnit: item.baseUnit || item.stockUnit,
                 remarks: String(payload.remarks || '案場退回倉庫')
             });
@@ -1401,7 +1371,13 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         wsTxLog.views = [{ showGridLines: true }];
         wsTxLog.addRow(['日期', '異動類型', '材料分類編碼', '材料名稱', '包裝規格', '原始數量', '庫存單位', '換算後數量', '基準單位', '備註']);
         
-        const typeMap = { 'OPENING_ISSUE': '開工領入', 'ADDITIONAL_ISSUE': '追加領入' };
+        // 🌟 完整的中文翻譯對照表 (新增 WAREHOUSE_TRANSFER_IN 與 PROJECT_RETURN_OUT)
+        const typeMap = { 
+            'OPENING_ISSUE': '開工首批進場', 
+            'ADDITIONAL_ISSUE': '追加進場',
+            'WAREHOUSE_TRANSFER_IN': '倉庫領料轉入',
+            'PROJECT_RETURN_OUT': '退料回大倉庫'
+        };
         
         (transactionData.transactions || []).forEach(tx => {
             wsTxLog.addRow([
