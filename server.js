@@ -104,6 +104,71 @@ function calculateWarehouseStatus(item) {
     return 'NORMAL';
 }
 
+function findLatestWarehouseTransaction(transactions, materialId) {
+    for (let index = transactions.length - 1; index >= 0; index--) {
+        const transaction = transactions[index];
+        if (transaction.materialId === materialId) return transaction;
+    }
+    return null;
+}
+
+async function reconcileWarehouseSnapshotIfLatest(inventoryData, txData, existingTx) {
+    const latestTransaction = findLatestWarehouseTransaction(
+        txData.transactions || [],
+        existingTx.materialId
+    );
+
+    const item = (inventoryData.items || []).find(
+        inventoryItem => inventoryItem.materialId === existingTx.materialId
+    );
+
+    const isLatestTransaction =
+        latestTransaction?.submissionId === existingTx.submissionId;
+
+    if (
+        item &&
+        isLatestTransaction &&
+        Number(item.stockQuantity) !== Number(latestTransaction.afterQuantity)
+    ) {
+        item.stockQuantity = Number(latestTransaction.afterQuantity);
+        const packageQuantity = Number(item.packageQuantity || 1);
+        item.stockBaseQuantity = Number(
+            (item.stockQuantity * packageQuantity).toFixed(4)
+        );
+        item.stockStatus = calculateWarehouseStatus(item);
+        inventoryData.updatedAt = new Date().toISOString();
+
+        await writeJsonToOneDrive(
+            '工程專案管理/_系統設定/inventory.json',
+            inventoryData
+        );
+
+        configCache.globalInventory = {
+            data: cloneJsonData(inventoryData),
+            timestamp: Date.now()
+        };
+
+        return true;
+    }
+
+    return false;
+}
+
+function validateWarehouseDate(value, today) {
+    const dateValue = String(value || today).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+        throw new Error('倉庫異動日期格式不正確');
+    }
+    const parsedDate = Date.parse(`${dateValue}T00:00:00+08:00`);
+    if (!Number.isFinite(parsedDate)) {
+        throw new Error('倉庫異動日期無效');
+    }
+    if (dateValue > today) {
+        throw new Error('倉庫異動日期不可晚於今天');
+    }
+    return dateValue;
+}
+
 async function requireWarehouseAccess(req, res, next) {
     try {
         const authorization = String(req.get('authorization') || '');
@@ -870,20 +935,17 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             // 【安全修正 1】：重送時自動比對並修復 inventory.json 快照
             const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
             if (existingTx) {
-                const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
-                if (itemIndex !== -1) {
-                    const item = inventoryData.items[itemIndex];
-                    if (item.stockQuantity !== existingTx.afterQuantity) {
-                        item.stockQuantity = existingTx.afterQuantity;
-                        item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
-                        item.stockStatus = calculateWarehouseStatus(item);
-                        inventoryData.updatedAt = new Date().toISOString();
-                        await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-                        configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
-                        console.log(`[自動修復] 發現庫存快照未同步，已將 ${item.materialName} 修正為 ${existingTx.afterQuantity}`);
-                    }
-                }
-                return res.status(200).json({ success: true, duplicate: true, message: '此筆庫存異動先前已完成' });
+                const reconciled = await reconcileWarehouseSnapshotIfLatest(
+                    inventoryData,
+                    txData,
+                    existingTx
+                );
+                return res.status(200).json({
+                    success: true,
+                    duplicate: true,
+                    reconciled,
+                    message: '此筆庫存異動先前已完成'
+                });
             }
             
             const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
@@ -920,7 +982,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             
             // 【安全修正 3】：交易日期統一使用台灣日期
             const { dateStr } = getTaiwanDateParts();
-            const transactionDate = String(payload.transactionDate || dateStr);
+            const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
             const transactionId = `TX-${crypto.randomUUID()}`;
             const nowIso = new Date().toISOString();
             
@@ -971,7 +1033,15 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
 
     } catch (error) {
         console.error('庫存異動失敗:', error);
-        res.status(500).json({ success: false, error: '系統錯誤，無法更新庫存' });
+        const message = String(error?.message || '');
+        if ([
+            '倉庫異動日期格式不正確',
+            '倉庫異動日期無效',
+            '倉庫異動日期不可晚於今天'
+        ].includes(message)) {
+            return res.status(400).json({ success: false, error: message });
+        }
+        return res.status(500).json({ success: false, error: '系統錯誤，無法更新庫存' });
     }
 });
 
@@ -1002,19 +1072,17 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 // 【安全修正 1】：重送時自動比對並修復快照
                 const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
                 if (existingTx) {
-                    const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
-                    if (itemIndex !== -1) {
-                        const item = inventoryData.items[itemIndex];
-                        if (item.stockQuantity !== existingTx.afterQuantity) {
-                            item.stockQuantity = existingTx.afterQuantity;
-                            item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
-                            item.stockStatus = calculateWarehouseStatus(item);
-                            inventoryData.updatedAt = new Date().toISOString();
-                            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-                            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
-                        }
-                    }
-                    return res.status(200).json({ success: true, duplicate: true, message: '此筆領料先前已完成' });
+                    const reconciled = await reconcileWarehouseSnapshotIfLatest(
+                        inventoryData,
+                        txData,
+                        existingTx
+                    );
+                    return res.status(200).json({
+                        success: true,
+                        duplicate: true,
+                        reconciled,
+                        message: '此筆領料先前已完成'
+                    });
                 }
 
                 const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
@@ -1033,7 +1101,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
 
                 // 【安全修正 3】：交易日期統一使用台灣日期
                 const { dateStr } = getTaiwanDateParts();
-                const transactionDate = String(payload.transactionDate || dateStr);
+                const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
                 const transactionId = `TX-${crypto.randomUUID()}`;
                 const nowIso = new Date().toISOString();
 
@@ -1111,93 +1179,164 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
         });
     } catch (error) {
         console.error('領料失敗:', error);
-        res.status(500).json({ success: false, error: '系統錯誤，無法完成領料' });
+        const message = String(error?.message || '');
+        if ([
+            '倉庫異動日期格式不正確',
+            '倉庫異動日期無效',
+            '倉庫異動日期不可晚於今天'
+        ].includes(message)) {
+            return res.status(400).json({ success: false, error: message });
+        }
+        return res.status(500).json({ success: false, error: '系統錯誤，無法完成領料' });
     }
 });
 
-// ↩️ 案場退回 (安全鎖定與同步優化版)
+// ↩️ 案場退回（可安全接續部分成功交易）
 app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, res) => {
     try {
-        const payload = req.body;
+        const payload = req.body || {};
         const submissionId = String(payload.submissionId || '').trim();
-        if (!submissionId) return res.status(400).json({ success: false, error: '缺少 submissionId' });
+        if (!submissionId) {
+            return res.status(400).json({ success: false, error: '缺少 submissionId' });
+        }
 
         const projectId = String(payload.projectId || '').trim();
         const materialId = String(payload.materialId || '').trim();
-        const quantity = Number(payload.quantity);
+        const requestedQuantity = Number(payload.quantity);
         const operatorName = String(payload.operatorName || '').trim();
 
-        if (!projectId || !materialId || !operatorName || !Number.isFinite(quantity) || quantity <= 0) {
+        if (
+            !projectId ||
+            !materialId ||
+            !operatorName ||
+            !Number.isFinite(requestedQuantity) ||
+            requestedQuantity <= 0
+        ) {
             return res.status(400).json({ success: false, error: '參數不完整或數量無效' });
         }
 
         const project = await findProjectById(projectId);
-        if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
+        if (!project) {
+            return res.status(404).json({ success: false, error: '找不到指定案場' });
+        }
 
         await withWarehouseWriteLock(async () => {
             await withMaterialWriteLock(project.projectId, async () => {
                 const inventoryData = await readGlobalInventory();
                 const txData = await readWarehouseTransactions();
 
-                // 【安全修正 1】：重送時自動比對並修復快照
-                const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
-                if (existingTx) {
-                    const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === existingTx.materialId);
-                    if (itemIndex !== -1) {
-                        const item = inventoryData.items[itemIndex];
-                        if (item.stockQuantity !== existingTx.afterQuantity) {
-                            item.stockQuantity = existingTx.afterQuantity;
-                            item.stockBaseQuantity = existingTx.afterQuantity * Number(item.packageQuantity || 1);
-                            item.stockStatus = calculateWarehouseStatus(item);
-                            inventoryData.updatedAt = new Date().toISOString();
-                            await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-                            configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
-                        }
-                    }
-                    return res.status(200).json({ success: true, duplicate: true, message: '此筆退料先前已完成' });
+                const existingWarehouseTx = txData.transactions.find(
+                    tx => tx.submissionId === submissionId
+                );
+
+                if (existingWarehouseTx) {
+                    const reconciled = await reconcileWarehouseSnapshotIfLatest(
+                        inventoryData,
+                        txData,
+                        existingWarehouseTx
+                    );
+                    return res.status(200).json({
+                        success: true,
+                        duplicate: true,
+                        reconciled,
+                        message: '此筆退料先前已完成'
+                    });
                 }
 
-                const itemIndex = (inventoryData.items || []).findIndex(i => i.materialId === materialId);
-                if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+                const itemIndex = (inventoryData.items || []).findIndex(
+                    item => item.materialId === materialId
+                );
+                if (itemIndex === -1) {
+                    return res.status(404).json({ success: false, error: '找不到該材料主檔' });
+                }
+
                 const item = inventoryData.items[itemIndex];
+                if (item.inventoryManaged === false) {
+                    return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
+                }
 
                 const safeProjectName = sanitizePathSegment(project.projectName);
-                const projectTxPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+                const projectTxPath =
+                    `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+
                 let projTxData = { transactions: [] };
-                try { projTxData = await readJsonFromOneDrive(projectTxPath, { transactions: [] }, false); } catch(e) {}
+                try {
+                    projTxData = await readJsonFromOneDrive(
+                        projectTxPath,
+                        { transactions: [] },
+                        false
+                    );
+                } catch (error) {}
+                if (!Array.isArray(projTxData.transactions)) projTxData.transactions = [];
 
-                let issuedBaseQuantity = 0;
-                (projTxData.transactions || []).forEach(tx => {
-                    if (tx.materialId === materialId) {
-                        issuedBaseQuantity += Number(tx.baseQuantity || 0);
-                    }
-                });
-
-                const statsResult = await generateProjectStats(project);
-                const consumedBaseQuantity = (statsResult.stats?.materialStats || {})[materialId] || 0;
+                const existingProjectTransaction = projTxData.transactions.find(
+                    tx => tx.submissionId === submissionId
+                );
 
                 const packageQuantity = Number(item.packageQuantity || 1);
-                const baseQuantityToReturn = quantity * packageQuantity;
-                const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
+                let quantity = requestedQuantity;
+                let baseQuantityToReturn = quantity * packageQuantity;
+                let transferId;
+                let transactionDate;
 
-                if (currentBalance < baseQuantityToReturn) {
-                    return res.status(400).json({ success: false, error: `退料超過案場餘額！案場帳面僅剩 ${currentBalance / packageQuantity} ${item.stockUnit}` });
-                }
-
-                const beforeQuantity = Number(item.stockQuantity || 0);
-                const afterQuantity = beforeQuantity + quantity;
-
-                // 【安全修正 3】：交易日期統一使用台灣日期
                 const { dateStr } = getTaiwanDateParts();
-                const transactionDate = String(payload.transactionDate || dateStr);
-                const transactionId = `TX-${crypto.randomUUID()}`;
-                const nowIso = new Date().toISOString();
 
-                // 【安全修正 2】：部分寫入重送時，沿用相同的 transferId
-                const existingProjectTransaction = projTxData.transactions.find(tx => tx.submissionId === submissionId);
-                const transferId = existingProjectTransaction ? existingProjectTransaction.transferId : `TRF-${crypto.randomUUID()}`;
+                if (existingProjectTransaction) {
+                    if (existingProjectTransaction.transactionType !== 'PROJECT_RETURN_OUT') {
+                        return res.status(409).json({
+                            success: false,
+                            error: '相同 submissionId 已被其他案場交易使用'
+                        });
+                    }
+                    if (existingProjectTransaction.materialId !== materialId) {
+                        return res.status(409).json({
+                            success: false,
+                            error: '重送資料的材料與原交易不一致'
+                        });
+                    }
 
-                if (!existingProjectTransaction) {
+                    quantity = Math.abs(Number(existingProjectTransaction.quantity || 0));
+                    baseQuantityToReturn = Math.abs(
+                        Number(existingProjectTransaction.baseQuantity || 0)
+                    );
+                    transferId = existingProjectTransaction.transferId;
+                    transactionDate = existingProjectTransaction.transactionDate;
+
+                    if (!quantity || !baseQuantityToReturn || !transferId) {
+                        return res.status(409).json({
+                            success: false,
+                            error: '既有案場退料交易資料不完整，請人工檢查'
+                        });
+                    }
+                } else {
+                    let issuedBaseQuantity = 0;
+                    for (const tx of projTxData.transactions) {
+                        if (tx.materialId === materialId) {
+                            issuedBaseQuantity += Number(tx.baseQuantity || 0);
+                        }
+                    }
+
+                    const statsResult = await generateProjectStats(project);
+                    const consumedBaseQuantity = Number(
+                        (statsResult.stats?.materialStats || {})[materialId] || 0
+                    );
+                    const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
+
+                    if (currentBalance < baseQuantityToReturn) {
+                        return res.status(400).json({
+                            success: false,
+                            error:
+                                `退料超過案場餘額！案場帳面僅剩 ` +
+                                `${currentBalance / packageQuantity} ${item.stockUnit}`
+                        });
+                    }
+
+                    transferId = `TRF-${crypto.randomUUID()}`;
+                    transactionDate = validateWarehouseDate(
+                        payload.transactionDate,
+                        dateStr
+                    );
+
                     projTxData.transactions.push({
                         submissionId,
                         transferId,
@@ -1206,17 +1345,23 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                         materialId: item.materialId,
                         materialCode: item.materialCode,
                         materialName: item.materialName,
-                        quantity: -quantity, 
+                        quantity: -quantity,
                         stockUnit: item.stockUnit,
-                        packageQuantity: packageQuantity,
+                        packageQuantity,
                         packageUnit: item.packageUnit,
-                        baseQuantity: -baseQuantityToReturn, 
+                        baseQuantity: -baseQuantityToReturn,
                         baseUnit: item.baseUnit || item.stockUnit,
                         remarks: String(payload.remarks || '案場退回倉庫')
                     });
+
                     await writeJsonToOneDrive(projectTxPath, projTxData);
                 }
-                
+
+                const beforeQuantity = Number(item.stockQuantity || 0);
+                const afterQuantity = beforeQuantity + quantity;
+                const transactionId = `TX-${crypto.randomUUID()}`;
+                const nowIso = new Date().toISOString();
+
                 const warehouseTx = {
                     transactionId,
                     submissionId,
@@ -1239,7 +1384,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     operatorName,
                     remarks: String(payload.remarks || ''),
                     createdAt: nowIso,
-                    writeStatus: "COMPLETED"
+                    writeStatus: 'COMPLETED'
                 };
 
                 txData.transactions.push(warehouseTx);
@@ -1247,18 +1392,45 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 await writeWarehouseTransactions(txData);
 
                 item.stockQuantity = afterQuantity;
-                item.stockBaseQuantity = afterQuantity * packageQuantity;
+                item.stockBaseQuantity = Number(
+                    (afterQuantity * packageQuantity).toFixed(4)
+                );
                 item.stockStatus = calculateWarehouseStatus(item);
                 inventoryData.updatedAt = nowIso;
-                await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
-                configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
 
-                res.status(200).json({ success: true, transactionId, transferId, afterQuantity, message: '成功退回倉庫' });
+                await writeJsonToOneDrive(
+                    '工程專案管理/_系統設定/inventory.json',
+                    inventoryData
+                );
+                configCache.globalInventory = {
+                    data: cloneJsonData(inventoryData),
+                    timestamp: Date.now()
+                };
+
+                return res.status(200).json({
+                    success: true,
+                    transactionId,
+                    transferId,
+                    afterQuantity,
+                    resumed: Boolean(existingProjectTransaction),
+                    message: existingProjectTransaction
+                        ? '已接續完成先前未完成的退料'
+                        : '成功退回倉庫'
+                });
             });
         });
     } catch (error) {
         console.error('退料失敗:', error);
-        res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
+        const safeErrors = [
+            '倉庫異動日期格式不正確',
+            '倉庫異動日期無效',
+            '倉庫異動日期不可晚於今天'
+        ];
+        const message = String(error?.message || '');
+        if (safeErrors.includes(message)) {
+            return res.status(400).json({ success: false, error: message });
+        }
+        return res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
     }
 });
 
