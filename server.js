@@ -120,9 +120,10 @@ function calculateWarehouseStatus(item) {
 }
 function enrichWarehouseInventoryItem(item) {
     applyWarehouseMinimumStockPolicy(item);
-    enrichWarehouseInventoryItem(item);
+    item.stockStatus = calculateWarehouseStatus(item);
     item.shortageQuantity = item.minimumStockEnabled === true
-        ? Math.max(0, MINIMUM_STOCK_THRESHOLD - Number(item.stockQuantity || 0)) : null;
+        ? Math.max(0, MINIMUM_STOCK_THRESHOLD - Number(item.stockQuantity || 0))
+        : null;
     return item;
 }
 
