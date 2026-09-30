@@ -1427,6 +1427,10 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
         });
     } catch (error) {
         console.error('退料失敗:', error);
+        const message = String(error?.message || '');
+        if (['倉庫異動日期格式不正確','倉庫異動日期無效','倉庫異動日期不可晚於今天'].includes(message)) {
+            return res.status(400).json({ success: false, error: message });
+        }
         return res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
     }
 });
