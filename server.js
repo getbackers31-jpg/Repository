@@ -93,15 +93,37 @@ async function writeWarehouseTransactions(data) {
     await writeJsonToOneDrive(WAREHOUSE_TRANSACTION_PATH, data);
 }
 
+const MINIMUM_STOCK_THRESHOLD = 20;
+function normalizeWarehousePolicyText(value) {
+    return String(value || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+}
+function isNippon9011MinimumStockItem(item) {
+    if (!item || typeof item !== 'object') return false;
+    const text = normalizeWarehousePolicyText([item.materialName, item.materialCode, item.packageUnit, item.baseUnit].filter(Boolean).join(' '));
+    const packageQuantity = Number(item.packageQuantity);
+    return text.includes('立邦') && text.includes('90-11') &&
+        (text.includes('加侖') || text.includes('gallon')) && [1, 5].includes(packageQuantity);
+}
+function applyWarehouseMinimumStockPolicy(item) {
+    const enabled = isNippon9011MinimumStockItem(item);
+    item.minimumStockEnabled = enabled;
+    item.lowStockThreshold = enabled ? MINIMUM_STOCK_THRESHOLD : null;
+    return item;
+}
 function calculateWarehouseStatus(item) {
+    applyWarehouseMinimumStockPolicy(item);
     const stockQuantity = Number(item.stockQuantity);
-    const threshold = Number(item.lowStockThreshold || 0);
-    
-    if (!Number.isFinite(stockQuantity)) return 'REVIEW_REQUIRED';
-    if (stockQuantity < 0) return 'REVIEW_REQUIRED';
+    if (!Number.isFinite(stockQuantity) || stockQuantity < 0) return 'REVIEW_REQUIRED';
     if (stockQuantity === 0) return 'OUT_OF_STOCK';
-    if (stockQuantity <= threshold) return 'LOW_STOCK';
+    if (item.minimumStockEnabled === true && stockQuantity < MINIMUM_STOCK_THRESHOLD) return 'LOW_STOCK';
     return 'NORMAL';
+}
+function enrichWarehouseInventoryItem(item) {
+    applyWarehouseMinimumStockPolicy(item);
+    enrichWarehouseInventoryItem(item);
+    item.shortageQuantity = item.minimumStockEnabled === true
+        ? Math.max(0, MINIMUM_STOCK_THRESHOLD - Number(item.stockQuantity || 0)) : null;
+    return item;
 }
 
 function findLatestWarehouseTransaction(transactions, materialId) {
@@ -135,7 +157,7 @@ async function reconcileWarehouseSnapshotIfLatest(inventoryData, txData, existin
         item.stockBaseQuantity = Number(
             (item.stockQuantity * packageQuantity).toFixed(4)
         );
-        item.stockStatus = calculateWarehouseStatus(item);
+        enrichWarehouseInventoryItem(item);
         inventoryData.updatedAt = new Date().toISOString();
 
         await writeJsonToOneDrive(
@@ -293,6 +315,7 @@ async function readGlobalInventory() {
     if (!data || !Array.isArray(data.items)) {
         throw new Error('inventory.json 格式不正確');
     }
+    data.items = data.items.map(enrichWarehouseInventoryItem);
     configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
@@ -693,7 +716,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             if (!item.inventoryManaged) return;
                             totalCount++;
                             if (item.stockStatus === 'NORMAL') normalCount++;
-                            else if (item.stockStatus === 'LOW_STOCK') lowCount++;
+                            else if (item.minimumStockEnabled === true && item.stockStatus === 'LOW_STOCK') lowCount++;
                             else if (item.stockStatus === 'OUT_OF_STOCK' || item.stockQuantity === 0) outCount++;
                             else errCount++;
                         });
@@ -704,7 +727,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                         `更新時間：${updateTime}\n\n` +
                                         `總共 ${totalCount} 項追蹤中物料：\n` +
                                         `🟢 正常庫存：${normalCount} 項\n` +
-                                        `🟡 偏低庫存：${lowCount} 項\n` +
+                                        `🟡 庫存不足：${lowCount} 項\n` +
                                         `⚪ 目前缺貨：${outCount} 項\n`;
                                         
                         if (errCount > 0) replyText += `🚨 帳面異常：${errCount} 項\n`;
@@ -743,7 +766,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         }
 
                         const target = matchedItems[0];
-                        const statusMap = { 'NORMAL': '正常', 'LOW_STOCK': '⚠️ 偏低', 'REVIEW_REQUIRED': '🚨 異常', 'OUT_OF_STOCK': '❌ 缺貨' };
+                        const statusMap = { 'NORMAL': '正常', 'LOW_STOCK': '⚠️ 庫存不足', 'REVIEW_REQUIRED': '🚨 異常', 'OUT_OF_STOCK': '❌ 缺貨' };
                         const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
                         
                         const detailText = `📦 ${target.materialName}\n\n` +
@@ -751,6 +774,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                                            `▪ 庫存：${target.stockQuantity} ${target.stockUnit}\n` +
                                            `▪ 換算：${target.stockBaseQuantity} ${target.baseUnit}\n` +
                                            `▪ 狀態：${statusMap[target.stockStatus] || target.stockStatus}\n` +
+                                           (target.minimumStockEnabled === true ? `▪ 最低保有：${target.lowStockThreshold} ${target.stockUnit}\n▪ 尚缺：${target.shortageQuantity || 0} ${target.stockUnit}\n` : '') +
                                            `▪ 更新：${updateTime}`;
 
                         await replyLineMessage(event.replyToken, detailText);
@@ -908,7 +932,7 @@ app.use('/api', express.json());
 app.get('/api/warehouse/inventory', async (req, res) => {
     try {
         const inventoryData = await readGlobalInventory();
-        const items = (inventoryData.items || []).filter(item => item.inventoryManaged !== false);
+        const items = (inventoryData.items || []).filter(item => item.inventoryManaged !== false).map(enrichWarehouseInventoryItem);
         return res.status(200).json({ 
             success: true, 
             updatedAt: inventoryData.updatedAt || null,
@@ -1030,7 +1054,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             
             item.stockQuantity = afterQuantity;
             item.stockBaseQuantity = afterQuantity * packageQuantity;
-            item.stockStatus = calculateWarehouseStatus(item);
+            enrichWarehouseInventoryItem(item);
             inventoryData.updatedAt = nowIso;
             
             await writeWarehouseTransactions(txData);
@@ -1181,7 +1205,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
 
                 item.stockQuantity = afterQuantity;
                 item.stockBaseQuantity = afterQuantity * packageQuantity;
-                item.stockStatus = calculateWarehouseStatus(item);
+                enrichWarehouseInventoryItem(item);
                 inventoryData.updatedAt = nowIso;
                 await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
                 configCache.globalInventory = { data: cloneJsonData(inventoryData), timestamp: Date.now() };
@@ -1401,7 +1425,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 item.stockBaseQuantity = Number(
                     (afterQuantity * packageQuantity).toFixed(4)
                 );
-                item.stockStatus = calculateWarehouseStatus(item);
+                enrichWarehouseInventoryItem(item);
                 inventoryData.updatedAt = nowIso;
 
                 await writeJsonToOneDrive(
