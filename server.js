@@ -7,15 +7,16 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.3';
+const APP_VERSION = '6.3.2';
 const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const LINE_LOGIN_CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
+const LINE_LOGIN_CHANNEL_ID = '2011289657';
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LIFF_ID = process.env.LIFF_ID || '2011289657-vQgMb0eI';
+const WAREHOUSE_LIFF_ID = '2011289657-dSXS9DVe';
 const TARGET_USER_EMAIL = "kate@cyber-cloud.info"; 
 const STATS_API_KEY = process.env.STATS_API_KEY;
 
@@ -205,7 +206,7 @@ async function requireWarehouseAccess(req, res, next) {
         const response = await fetch('https://api.line.me/oauth2/v2.1/verify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ id_token: idToken, client_id: process.env.LINE_LOGIN_CHANNEL_ID })
+            body: new URLSearchParams({ id_token: idToken, client_id: LINE_LOGIN_CHANNEL_ID })
         });
         
         const tokenData = await response.json();
