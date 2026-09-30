@@ -7,6 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
+const APP_VERSION = '6.3';
 const app = express();
 app.use(cors());
 
@@ -942,6 +943,48 @@ app.get('/api/warehouse/inventory', async (req, res) => {
     } catch (error) {
         console.error('取得倉庫庫存失敗：', error);
         return res.status(500).json({ success: false, error: '無法取得倉庫庫存' });
+    }
+});
+
+
+// v6.3 最近五筆倉庫異動摘要
+app.get('/api/warehouse/recent-transactions', requireWarehouseAccess, async (req, res) => {
+    try {
+        const requestedLimit = Number.parseInt(req.query.limit, 10);
+        const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 20) : 5;
+        const txData = await readWarehouseTransactions();
+        const completed = (txData.transactions || [])
+            .filter(tx => tx && tx.writeStatus !== 'FAILED')
+            .sort((a, b) => {
+                const aTime = Date.parse(a.createdAt || a.transactionDate || 0) || 0;
+                const bTime = Date.parse(b.createdAt || b.transactionDate || 0) || 0;
+                return bTime - aTime;
+            });
+        return res.status(200).json({
+            success: true,
+            version: APP_VERSION,
+            total: completed.length,
+            items: completed.slice(0, limit).map(tx => ({
+                transactionId: tx.transactionId || null,
+                transactionDate: tx.transactionDate || null,
+                createdAt: tx.createdAt || null,
+                transactionType: tx.transactionType || null,
+                materialId: tx.materialId || null,
+                materialCode: tx.materialCode || null,
+                materialName: tx.materialName || '未命名材料',
+                quantityChange: Number(tx.quantityChange || 0),
+                beforeQuantity: Number(tx.beforeQuantity || 0),
+                afterQuantity: Number(tx.afterQuantity || 0),
+                stockUnit: tx.stockUnit || '',
+                projectId: tx.projectId || null,
+                projectName: tx.projectName || null,
+                operatorName: tx.operatorName || '',
+                remarks: tx.remarks || ''
+            }))
+        });
+    } catch (error) {
+        console.error('取得最近倉庫異動失敗：', error);
+        return res.status(500).json({ success: false, error: '無法取得最近異動' });
     }
 });
 
