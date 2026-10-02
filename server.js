@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.3.2';
+const APP_VERSION = '6.4';
 const app = express();
 app.use(cors());
 
@@ -687,6 +687,144 @@ async function generateProjectStats(project) {
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
 
+
+const WAREHOUSE_REPORT_ROOT = '工程專案管理/倉庫管理/Excel報表';
+const WAREHOUSE_REPORT_VERSION = '6.4';
+const WAREHOUSE_TYPE_LABELS = {
+    INITIAL_COUNT: '期初盤點', PURCHASE_IN: '採購入庫', WAREHOUSE_ADJUSTMENT: '盤點修正',
+    PROJECT_TRANSFER_OUT: '領至案場', PROJECT_RETURN: '案場退回'
+};
+function parseTaiwanDateTimeParts(date = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Taipei', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).formatToParts(date);
+    return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+}
+function isRealDateString(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+    const [y,m,d] = value.split('-').map(Number);
+    const dt = new Date(Date.UTC(y,m-1,d));
+    return dt.getUTCFullYear()===y && dt.getUTCMonth()===m-1 && dt.getUTCDate()===d;
+}
+function resolveWarehouseReportRange(range, startDate, endDate) {
+    const p = parseTaiwanDateTimeParts();
+    const today = `${p.year}-${p.month}-${p.day}`;
+    if (!['all','month','custom','current'].includes(range)) throw new Error('不支援的報表範圍');
+    if (range === 'all') return { range, label:'全部紀錄', startDate:null, endDate:today };
+    if (range === 'month') return { range, label:'本月', startDate:`${p.year}-${p.month}-01`, endDate:today };
+    if (range === 'current') return { range, label:'目前庫存', startDate:null, endDate:today };
+    const start = String(startDate || '').trim();
+    const end = String(endDate || '').trim();
+    if (!isRealDateString(start) || !isRealDateString(end)) throw new Error('自訂日期格式不正確');
+    if (start > end) throw new Error('開始日期不可晚於結束日期');
+    if (end > today) throw new Error('結束日期不可晚於今天');
+    return { range, label:'自訂日期', startDate:start, endDate:end };
+}
+function filterWarehouseTransactionsByRange(transactions, rangeInfo) {
+    if (rangeInfo.range === 'current') return [];
+    return (transactions || []).filter(tx => {
+        const date = String(tx.transactionDate || '').slice(0,10);
+        if (!date) return false;
+        if (rangeInfo.startDate && date < rangeInfo.startDate) return false;
+        if (rangeInfo.endDate && date > rangeInfo.endDate) return false;
+        return tx.writeStatus !== 'FAILED';
+    });
+}
+function latestWarehouseTransactionsByMaterial(transactions) {
+    const map = new Map();
+    for (const tx of transactions || []) {
+        if (!tx?.materialId || tx.writeStatus === 'FAILED') continue;
+        const t = Date.parse(tx.createdAt || tx.transactionDate || 0) || 0;
+        const previous = map.get(tx.materialId);
+        if (!previous || t >= previous._time) map.set(tx.materialId, { ...tx, _time:t });
+    }
+    return map;
+}
+function styleWarehouseReportSheet(ws, title, rangeInfo, generatedAtText, columnCount) {
+    ws.mergeCells(1,1,1,columnCount);
+    ws.getCell(1,1).value = title;
+    ws.getCell(1,1).font = { bold:true, size:16, color:{argb:'FFFFFFFF'} };
+    ws.getCell(1,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FF087F5B'} };
+    ws.getCell(1,1).alignment = { vertical:'middle', horizontal:'left' };
+    ws.getRow(1).height = 28;
+    const periodText = rangeInfo.range === 'all' ? '第一筆異動至目前' : rangeInfo.range === 'current' ? '目前庫存快照' : `${rangeInfo.startDate} 至 ${rangeInfo.endDate}`;
+    ws.mergeCells(2,1,2,columnCount); ws.getCell(2,1).value = `報表範圍：${rangeInfo.label}｜${periodText}`;
+    ws.mergeCells(3,1,3,columnCount); ws.getCell(3,1).value = `匯出時間：${generatedAtText}｜系統版本：v${WAREHOUSE_REPORT_VERSION}`;
+    for (const rowNo of [2,3]) { ws.getCell(rowNo,1).font={size:10,color:{argb:'FF495057'}}; ws.getCell(rowNo,1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FFF1F3F5'}}; }
+    const headerRow = ws.getRow(5);
+    headerRow.font = { bold:true, color:{argb:'FFFFFFFF'} };
+    headerRow.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FF0CA678'} };
+    headerRow.alignment = { vertical:'middle', horizontal:'center', wrapText:true };
+    headerRow.height = 28;
+    ws.views = [{ state:'frozen', ySplit:5 }];
+    ws.autoFilter = { from:{row:5,column:1}, to:{row:5,column:columnCount} };
+    ws.eachRow((row, rowNumber) => { if (rowNumber >= 6) row.alignment = { vertical:'middle', wrapText:true }; });
+}
+function setWarehouseReportColumnWidths(ws, widths) { widths.forEach((width, i) => { ws.getColumn(i+1).width = width; }); }
+function toTaiwanDateTimeText(value) {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
+}
+async function ensureWarehouseReportFolder() {
+    const graphClient = await getGraphClient();
+    const p = parseTaiwanDateTimeParts();
+    await ensureChildFolder(graphClient, '工程專案管理', '倉庫管理');
+    await ensureChildFolder(graphClient, '工程專案管理/倉庫管理', 'Excel報表');
+    await ensureChildFolder(graphClient, WAREHOUSE_REPORT_ROOT, p.year);
+    const monthResult = await ensureChildFolder(graphClient, `${WAREHOUSE_REPORT_ROOT}/${p.year}`, p.month);
+    return monthResult.folderPath;
+}
+async function buildWarehouseReportWorkbook(inventoryData, allTransactions, rangeInfo) {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = '云說工程小幫手';
+    workbook.subject = '倉庫庫存報表';
+    workbook.description = `系統版本 v${WAREHOUSE_REPORT_VERSION}`;
+    workbook.created = new Date();
+    const p = parseTaiwanDateTimeParts();
+    const generatedAtText = `${p.year}/${p.month}/${p.day} ${p.hour}:${p.minute}`;
+    const filtered = filterWarehouseTransactionsByRange(allTransactions, rangeInfo).sort((a,b)=>(Date.parse(b.createdAt||b.transactionDate||0)||0)-(Date.parse(a.createdAt||a.transactionDate||0)||0));
+    const latestByMaterial = latestWarehouseTransactionsByMaterial(allTransactions);
+    const items = (inventoryData.items || []).filter(i => i.inventoryManaged !== false).map(i => enrichWarehouseInventoryItem({...i}));
+    const statusOrder = { REVIEW_REQUIRED:0, OUT_OF_STOCK:1, LOW_STOCK:2, NORMAL:3 };
+    items.sort((a,b)=>(statusOrder[a.stockStatus]??9)-(statusOrder[b.stockStatus]??9)||String(a.materialCode||'').localeCompare(String(b.materialCode||''),'zh-Hant'));
+    const statusLabel = s => ({NORMAL:'庫存正常',LOW_STOCK:'庫存不足',OUT_OF_STOCK:'缺貨',REVIEW_REQUIRED:'帳面異常'}[s] || s || '');
+
+    const ws1 = workbook.addWorksheet('倉庫庫存總表');
+    ws1.addRows([[],[],[],[],['材料編碼','材料名稱','目前庫存','庫存單位','包裝容量','包裝單位','換算後總量','基準單位','啟用最低庫存','最低庫存桶數','庫存狀態','尚缺桶數','最後異動日期','最後異動類型','最後操作人','最後異動備註']]);
+    for (const item of items) { const last=latestByMaterial.get(item.materialId)||{}; ws1.addRow([item.materialCode||'',item.materialName||'',Number(item.stockQuantity||0),item.stockUnit||'',Number(item.packageQuantity||1),item.packageUnit||'',Number(item.stockBaseQuantity||0),item.baseUnit||item.stockUnit||'',item.minimumStockEnabled===true?'是':'否',item.minimumStockEnabled===true?Number(item.lowStockThreshold||20):'',statusLabel(item.stockStatus),item.minimumStockEnabled===true?Number(item.shortageQuantity||0):'',last.transactionDate||'',WAREHOUSE_TYPE_LABELS[last.transactionType]||last.transactionType||'',last.operatorName||'',last.remarks||'']); }
+    styleWarehouseReportSheet(ws1,'云說工程小幫手｜倉庫庫存總表',rangeInfo,generatedAtText,16); setWarehouseReportColumnWidths(ws1,[18,28,12,10,12,12,15,12,14,14,14,12,14,16,14,30]);
+
+    const ws2 = workbook.addWorksheet('倉庫異動明細');
+    ws2.addRows([[],[],[],[],['異動日期','異動時間','異動類型','交易編號','提交編號','轉撥編號','材料編碼','材料名稱','數量變化','異動前數量','異動後數量','庫存單位','包裝容量','換算變化量','基準單位','案場編號','案場名稱','操作人','備註','建立時間','寫入狀態']]);
+    if (rangeInfo.range === 'current') ws2.addRow(['本次報表選擇「目前庫存」，未包含期間異動明細。']);
+    else for (const tx of filtered) ws2.addRow([tx.transactionDate||'',toTaiwanDateTimeText(tx.createdAt).split(' ')[1]||'',WAREHOUSE_TYPE_LABELS[tx.transactionType]||tx.transactionType||'',tx.transactionId||'',tx.submissionId||'',tx.transferId||'',tx.materialCode||'',tx.materialName||'',Number(tx.quantityChange||0),Number(tx.beforeQuantity||0),Number(tx.afterQuantity||0),tx.stockUnit||'',Number(tx.packageQuantity||1),Number(tx.baseQuantityChange||0),tx.baseUnit||'',tx.projectId||'',tx.projectName||'',tx.operatorName||'',tx.remarks||'',toTaiwanDateTimeText(tx.createdAt),tx.writeStatus||'']);
+    styleWarehouseReportSheet(ws2,'云說工程小幫手｜倉庫異動明細',rangeInfo,generatedAtText,21); setWarehouseReportColumnWidths(ws2,[13,10,15,38,38,38,18,28,12,13,13,10,12,15,12,38,22,14,30,20,12]);
+
+    const transferRows = filtered.filter(tx => ['PROJECT_TRANSFER_OUT','PROJECT_RETURN'].includes(tx.transactionType));
+    const ws3 = workbook.addWorksheet('案場轉撥紀錄');
+    ws3.addRows([[],[],[],[],['異動日期','異動時間','轉撥編號','異動方向','案場編號','案場名稱','材料編碼','材料名稱','領出數量','退回數量','淨轉撥數量','庫存單位','包裝容量','換算總量','基準單位','操作人','備註','交易編號','建立時間']]);
+    if (rangeInfo.range === 'current') ws3.addRow(['本次報表選擇「目前庫存」，未包含期間異動明細。']);
+    else for (const tx of transferRows) { const q=Math.abs(Number(tx.quantityChange||0)); const out=tx.transactionType==='PROJECT_TRANSFER_OUT'?q:0; const ret=tx.transactionType==='PROJECT_RETURN'?q:0; ws3.addRow([tx.transactionDate||'',toTaiwanDateTimeText(tx.createdAt).split(' ')[1]||'',tx.transferId||'',WAREHOUSE_TYPE_LABELS[tx.transactionType]||tx.transactionType||'',tx.projectId||'',tx.projectName||'',tx.materialCode||'',tx.materialName||'',out,ret,Number(tx.quantityChange||0),tx.stockUnit||'',Number(tx.packageQuantity||1),Math.abs(Number(tx.baseQuantityChange||0)),tx.baseUnit||'',tx.operatorName||'',tx.remarks||'',tx.transactionId||'',toTaiwanDateTimeText(tx.createdAt)]); }
+    styleWarehouseReportSheet(ws3,'云說工程小幫手｜案場轉撥紀錄',rangeInfo,generatedAtText,19); setWarehouseReportColumnWidths(ws3,[13,10,38,15,38,22,18,28,12,12,12,10,12,14,12,14,30,38,20]);
+
+    const inventoryRows = filtered.filter(tx => ['INITIAL_COUNT','WAREHOUSE_ADJUSTMENT'].includes(tx.transactionType));
+    const ws4 = workbook.addWorksheet('盤點差異');
+    ws4.addRows([[],[],[],[],['盤點日期','盤點時間','盤點類型','材料編碼','材料名稱','盤點前帳面數量','實際盤點數量','盤點差異','差異類型','庫存單位','包裝容量','換算差異量','基準單位','操作人','備註','交易編號','建立時間']]);
+    if (rangeInfo.range === 'current') ws4.addRow(['本次報表選擇「目前庫存」，未包含期間異動明細。']);
+    else for (const tx of inventoryRows) { const diff=Number(tx.quantityChange||0); ws4.addRow([tx.transactionDate||'',toTaiwanDateTimeText(tx.createdAt).split(' ')[1]||'',WAREHOUSE_TYPE_LABELS[tx.transactionType]||tx.transactionType||'',tx.materialCode||'',tx.materialName||'',Number(tx.beforeQuantity||0),Number(tx.afterQuantity||0),diff,diff>0?'盤盈':diff<0?'盤虧':'帳實相符',tx.stockUnit||'',Number(tx.packageQuantity||1),Number(tx.baseQuantityChange||0),tx.baseUnit||'',tx.operatorName||'',tx.remarks||'',tx.transactionId||'',toTaiwanDateTimeText(tx.createdAt)]); }
+    styleWarehouseReportSheet(ws4,'云說工程小幫手｜盤點差異',rangeInfo,generatedAtText,17); setWarehouseReportColumnWidths(ws4,[13,10,15,18,28,16,16,13,13,10,12,15,12,14,30,38,20]);
+
+    const alerts = items.filter(i => ['LOW_STOCK','OUT_OF_STOCK','REVIEW_REQUIRED'].includes(i.stockStatus));
+    const ws5 = workbook.addWorksheet('庫存警示');
+    ws5.addRows([[],[],[],[],['警示類型','材料編碼','材料名稱','目前庫存','庫存單位','最低庫存','尚缺數量','包裝容量','換算後總量','基準單位','最後異動日期','最後異動類型','最後操作人','建議處理']]);
+    for (const item of alerts) { const last=latestByMaterial.get(item.materialId)||{}; const advice=item.stockStatus==='LOW_STOCK'?'建議補貨至至少20桶':item.stockStatus==='OUT_OF_STOCK'?'請確認是否補貨':'請重新盤點並修正'; ws5.addRow([statusLabel(item.stockStatus),item.materialCode||'',item.materialName||'',Number(item.stockQuantity||0),item.stockUnit||'',item.minimumStockEnabled===true?Number(item.lowStockThreshold||20):'',item.minimumStockEnabled===true?Number(item.shortageQuantity||0):'',Number(item.packageQuantity||1),Number(item.stockBaseQuantity||0),item.baseUnit||item.stockUnit||'',last.transactionDate||'',WAREHOUSE_TYPE_LABELS[last.transactionType]||last.transactionType||'',last.operatorName||'',advice]); }
+    styleWarehouseReportSheet(ws5,'云說工程小幫手｜庫存警示',rangeInfo,generatedAtText,14); setWarehouseReportColumnWidths(ws5,[14,18,28,12,10,12,12,12,15,12,14,16,14,28]);
+
+    for (const ws of [ws1,ws2,ws3,ws4,ws5]) {
+        ws.eachRow((row,rowNo)=>{ if(rowNo>=6){ row.eachCell((cell,colNo)=>{ if(typeof cell.value==='number') cell.numFmt='#,##0.####'; }); }});
+    }
+    return workbook;
+}
+
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const signature = req.get('x-line-signature');
     if (!verifyLineSignature(req.body, signature)) return res.status(401).send('Invalid signature');
@@ -986,6 +1124,33 @@ app.get('/api/warehouse/recent-transactions', requireWarehouseAccess, async (req
     } catch (error) {
         console.error('取得最近倉庫異動失敗：', error);
         return res.status(500).json({ success: false, error: '無法取得最近異動' });
+    }
+});
+
+
+// v6.4 倉庫 Excel 報表，產生後直接儲存至 OneDrive
+app.post('/api/warehouse/export-excel', requireWarehouseAccess, async (req, res) => {
+    try {
+        const payload = req.body || {};
+        const rangeInfo = resolveWarehouseReportRange(String(payload.range || 'month'), payload.startDate, payload.endDate);
+        const [inventoryData, txData] = await Promise.all([readGlobalInventory(), readWarehouseTransactions()]);
+        const workbook = await buildWarehouseReportWorkbook(inventoryData, txData.transactions || [], rangeInfo);
+        const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+        const folderPath = await ensureWarehouseReportFolder();
+        const p = parseTaiwanDateTimeParts();
+        const stamp = `${p.year}${p.month}${p.day}_${p.hour}${p.minute}`;
+        let rangePart = rangeInfo.label;
+        if (rangeInfo.range === 'custom') rangePart += `_${rangeInfo.startDate.replace(/-/g,'')}-${rangeInfo.endDate.replace(/-/g,'')}`;
+        const fileName = `倉庫庫存報表_${rangePart}_${stamp}_v${WAREHOUSE_REPORT_VERSION}.xlsx`;
+        const graphClient = await getGraphClient();
+        await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}/${fileName}:/content`).put(buffer);
+        return res.status(200).json({ success:true, version:WAREHOUSE_REPORT_VERSION, fileName, folderPath, range:rangeInfo });
+    } catch (error) {
+        console.error('產生倉庫 Excel 報表失敗：', error);
+        const message = String(error?.message || '');
+        const validationMessages = ['不支援的報表範圍','自訂日期格式不正確','開始日期不可晚於結束日期','結束日期不可晚於今天'];
+        if (validationMessages.includes(message)) return res.status(400).json({ success:false, error:message });
+        return res.status(500).json({ success:false, error:'無法產生或儲存倉庫 Excel 報表' });
     }
 });
 
