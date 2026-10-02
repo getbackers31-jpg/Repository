@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.5.2';
+const APP_VERSION = '6.5.3';
 const app = express();
 app.use(cors());
 
@@ -703,7 +703,7 @@ async function generateProjectStats(project) {
 
 
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.5.2';
+const WAREHOUSE_REPORT_VERSION='6.5.3';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
