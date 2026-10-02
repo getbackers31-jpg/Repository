@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.4.5';
+const APP_VERSION = '6.5.1';
 const app = express();
 app.use(cors());
 
@@ -318,7 +318,7 @@ async function readGlobalInventory() {
     if (!data || !Array.isArray(data.items)) {
         throw new Error('inventory.json 格式不正確');
     }
-    data.items = data.items.map(enrichWarehouseInventoryItem);
+    data.items = migrateWarehouseInventory(data).items.map(enrichWarehouseInventoryItem);
     configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
@@ -703,8 +703,8 @@ async function generateProjectStats(project) {
 
 
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.4.5';
-const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回'};
+const WAREHOUSE_REPORT_VERSION='6.5.1';
+const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
 function reportRange(range,start,end){const p=reportTaiwanParts(),today=`${p.year}-${p.month}-${p.day}`;if(!['all','month','custom','current'].includes(range))throw new Error('不支援的報表範圍');if(range==='all')return{range,label:'全部紀錄',startDate:null,endDate:today};if(range==='month')return{range,label:'本月',startDate:`${p.year}-${p.month}-01`,endDate:today};if(range==='current')return{range,label:'目前庫存',startDate:null,endDate:today};start=String(start||'');end=String(end||'');if(!realDate(start)||!realDate(end))throw new Error('自訂日期格式不正確');if(start>end)throw new Error('開始日期不可晚於結束日期');if(end>today)throw new Error('結束日期不可晚於今天');return{range,label:'自訂日期',startDate:start,endDate:end}}
@@ -964,13 +964,33 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 });
 
+
+// ===== v6.5 材料品項管理核心 =====
+const MATERIAL_CODE_STATUS={FORMAL:'FORMAL',TEMPORARY:'TEMPORARY'};
+const SCRAP_REASONS=new Set(['材料過期','材料變質','材料結塊','包裝破損','受潮或污染','無法繼續施工使用','盤點確認報廢','其他']);
+const DISABLE_REASONS=new Set(['品牌不再使用','停止採購','改用其他品牌','材料規格淘汰','主管決定停用','其他']);
+function cleanText(v){return String(v==null?'':v).trim()}
+function round4(v){return Number(Number(v).toFixed(4))}
+function materialUid(){return `MAT-${crypto.randomUUID().toUpperCase()}`}
+function materialCode(v){return cleanText(v).toUpperCase().replace(/\s+/g,'')}
+function validateMaterialCode(v){const c=materialCode(v);if(!c)throw new Error('英文代碼不可空白');if(!/^[A-Z0-9-]+$/.test(c))throw new Error('英文代碼只能包含英文字母、數字與連字號');return c}
+function migrateWarehouseItem(x){x.materialUid=cleanText(x.materialUid)||materialUid();x.materialCode=cleanText(x.materialCode)||cleanText(x.materialId);x.materialId=cleanText(x.materialId)||x.materialCode;x.codeStatus=x.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';x.active=x.active!==false;x.materialCategories=Array.isArray(x.materialCategories)?[...new Set(x.materialCategories.map(cleanText).filter(Boolean))]:[];x.previousCodes=Array.isArray(x.previousCodes)?x.previousCodes:[];return x}
+function migrateWarehouseInventory(data){data.items=(data.items||[]).map(migrateWarehouseItem);return data}
+function allMaterialCodes(items,exceptUid=''){const set=new Set();for(const x of items||[]){if(exceptUid&&x.materialUid===exceptUid)continue;[x.materialId,x.materialCode,...(x.previousCodes||[]).map(p=>p.code)].map(materialCode).filter(Boolean).forEach(c=>set.add(c))}return set}
+function nextTemporaryMaterialCode(items){const d=getTaiwanDateParts().dateStr.replace(/-/g,''),prefix=`TMP-${d}-`;let max=0;for(const c of allMaterialCodes(items)){if(c.startsWith(prefix)){const n=Number(c.slice(prefix.length));if(Number.isInteger(n))max=Math.max(max,n)}}return `${prefix}${String(max+1).padStart(3,'0')}`}
+function findWarehouseItem(data,key){const k=cleanText(key);return(data.items||[]).find(x=>x.materialUid===k||x.materialId===k||x.materialCode===k)}
+function validateCategories(v){const a=[...new Set((Array.isArray(v)?v:[]).map(cleanText).filter(Boolean))];if(!a.length)throw new Error('至少選擇一個材料標籤');return a}
+function publicWarehouseItem(x){return enrichWarehouseInventoryItem(migrateWarehouseItem({...x}))}
+function safeV65Message(e){const m=String(e?.message||'');const allowed=['英文代碼不可空白','英文代碼只能包含英文字母、數字與連字號','英文代碼已存在','中文材料名稱不可空白','至少選擇一個材料標籤','庫存單位不可空白','基準單位不可空白','每一庫存單位的容量必須大於0','找不到該材料主檔','操作人不可空白','修改原因不可空白','更正原因不可空白','報廢數量必須大於0','報廢原因不正確','選擇其他報廢原因時，補充說明必填','停用原因不正確','選擇其他停用原因時，補充說明必填','目前庫存為0，請直接使用停用品項','目前仍有庫存，請先報廢材料或使用全部報廢並停用','重新啟用原因不可空白','已停用品項不可執行報廢'];return allowed.includes(m)||m.startsWith('報廢數量不可超過目前庫存')?m:'材料品項處理失敗'}
+async function saveWarehouseInventory(data){data.updatedAt=new Date().toISOString();await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json',data);configCache.globalInventory={data:cloneJsonData(data),timestamp:Date.now()}}
+
 app.use('/api', express.json());
 
 // 倉庫專屬全域庫存 API
 app.get('/api/warehouse/inventory', async (req, res) => {
     try {
         const inventoryData = await readGlobalInventory();
-        const items = (inventoryData.items || []).filter(item => item.inventoryManaged !== false).map(enrichWarehouseInventoryItem);
+        const items = (inventoryData.items || []).filter(item => item.inventoryManaged !== false).map(publicWarehouseItem);
         return res.status(200).json({ 
             success: true, 
             updatedAt: inventoryData.updatedAt || null,
@@ -1079,11 +1099,17 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             if (item.inventoryManaged === false) {
                 return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
             }
+            if (item.active === false) return res.status(400).json({success:false,error:'該品項已停用'});
             
             const beforeQuantity = Number(item.stockQuantity || 0);
             let quantityChange = 0;
             let afterQuantity = 0;
             
+            if (transactionType === 'WAREHOUSE_ADJUSTMENT') {
+                const adjustmentReason=cleanText(payload.adjustmentReason);
+                if(!adjustmentReason)return res.status(400).json({success:false,error:'盤點原因必填'});
+                if(adjustmentReason==='其他'&&!cleanText(payload.remarks))return res.status(400).json({success:false,error:'選擇其他盤點原因時，補充說明必填'});
+            }
             if (transactionType === 'PURCHASE_IN') {
                 const qty = Number(payload.quantity);
                 if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ success: false, error: '入庫數量無效' });
@@ -1129,6 +1155,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
                 projectName: null,
                 operatorName,
                 remarks: String(payload.remarks || ''),
+                adjustmentReason: transactionType==='WAREHOUSE_ADJUSTMENT'?cleanText(payload.adjustmentReason):null,
                 createdAt: nowIso,
                 writeStatus: "COMPLETED"
             };
@@ -1542,6 +1569,13 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
         return res.status(500).json({ success: false, error: '系統錯誤，無法完成退料' });
     }
 });
+
+
+// v6.5 品項清單
+app.get('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{const d=await readGlobalInventory();return res.json({success:true,version:APP_VERSION,items:(d.items||[]).map(publicWarehouseItem)})}catch(e){console.error(e);return res.status(500).json({success:false,error:'無法取得材料品項'})}});
+app.post('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),p=req.body||{},status=p.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';let code=status==='TEMPORARY'?nextTemporaryMaterialCode(d.items):validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items).has(code))throw new Error('英文代碼已存在');const name=cleanText(p.materialName),stockUnit=cleanText(p.stockUnit),baseUnit=cleanText(p.baseUnit),capacity=Number(p.packageQuantity);if(!name)throw new Error('中文材料名稱不可空白');if(!stockUnit)throw new Error('庫存單位不可空白');if(!baseUnit)throw new Error('基準單位不可空白');if(!(capacity>0))throw new Error('每一庫存單位的容量必須大於0');const now=new Date().toISOString(),item={materialUid:materialUid(),materialId:code,materialCode:code,materialName:name,codeStatus:status,active:true,materialCategories:validateCategories(p.materialCategories),previousCodes:[],stockQuantity:0,stockBaseQuantity:0,stockUnit,packageQuantity:round4(capacity),packageUnit:cleanText(p.packageUnit)||baseUnit,baseUnit,inventoryManaged:true,minimumStockEnabled:false,createdAt:now,createdBy:cleanText(p.operatorName),createReason:cleanText(p.createReason),remarks:cleanText(p.remarks)};if(!item.createdBy)throw new Error('操作人不可空白');d.items.push(item);await saveWarehouseInventory(d);return res.status(201).json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.patch('/api/warehouse/material-items/:uid',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),item=findWarehouseItem(d,req.params.uid);if(!item)throw new Error('找不到該材料主檔');const p=req.body||{},action=cleanText(p.action),operator=cleanText(p.operatorName);if(!operator)throw new Error('操作人不可空白');if(action==='RENAME'){if(!cleanText(p.materialName))throw new Error('中文材料名稱不可空白');if(!cleanText(p.reason))throw new Error('修改原因不可空白');item.materialName=cleanText(p.materialName);item.nameUpdatedAt=new Date().toISOString();item.nameUpdatedBy=operator;item.nameUpdateReason=cleanText(p.reason)}else if(action==='UPDATE_CATEGORIES'){item.materialCategories=validateCategories(p.materialCategories);item.categoriesUpdatedAt=new Date().toISOString();item.categoriesUpdatedBy=operator}else if(action==='RECODE'||action==='FORMALIZE'){const code=validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items,item.materialUid).has(code))throw new Error('英文代碼已存在');const reason=cleanText(p.reason);if(!reason)throw new Error('更正原因不可空白');const old=materialCode(item.materialCode||item.materialId);if(old!==code)item.previousCodes.push({code:old,changedAt:new Date().toISOString(),changedBy:operator,reason});item.materialId=code;item.materialCode=code;item.codeStatus='FORMAL';if(cleanText(p.materialName))item.materialName=cleanText(p.materialName)}else if(action==='DISABLE'){if(Number(item.stockQuantity||0)!==0)throw new Error('目前仍有庫存，請先報廢材料或使用全部報廢並停用');const reason=cleanText(p.disableReason);if(!DISABLE_REASONS.has(reason))throw new Error('停用原因不正確');item.active=false;item.disabledAt=new Date().toISOString();item.disabledBy=operator;item.disabledReason=reason}else if(action==='ENABLE'){if(!cleanText(p.reason))throw new Error('重新啟用原因不可空白');item.active=true;item.reenabledAt=new Date().toISOString();item.reenabledBy=operator;item.reenabledReason=cleanText(p.reason)}else throw new Error('不支援的品項操作');await saveWarehouseInventory(d);return res.json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.post('/api/warehouse/material-items/:uid/scrap',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),t=await readWarehouseTransactions(),item=findWarehouseItem(d,req.params.uid),p=req.body||{};if(!item)throw new Error('找不到該材料主檔');if(item.active===false)throw new Error('已停用品項不可執行報廢');if((t.transactions||[]).some(x=>x.submissionId===cleanText(p.submissionId)))return res.json({success:true,duplicate:true});const qty=Number(p.quantity),before=Number(item.stockQuantity||0);if(!(qty>0))throw new Error('報廢數量必須大於0');if(qty>before)throw new Error(`報廢數量不可超過目前庫存${before}${item.stockUnit||''}`);if(!SCRAP_REASONS.has(cleanText(p.scrapReason)))throw new Error('報廢原因不正確');if(cleanText(p.scrapReason)==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他報廢原因時，補充說明必填');if(!cleanText(p.operatorName))throw new Error('操作人不可空白');const after=round4(before-qty),now=new Date().toISOString(),tx={transactionId:`TX-${crypto.randomUUID()}`,submissionId:cleanText(p.submissionId),transferId:null,transactionType:'SCRAP_DISPOSAL',transactionDate:validateWarehouseDate(p.transactionDate,getTaiwanDateParts().dateStr),materialUid:item.materialUid,materialId:item.materialId,materialCode:item.materialCode,materialName:item.materialName,quantityChange:-qty,beforeQuantity:before,afterQuantity:after,stockUnit:item.stockUnit,packageQuantity:Number(item.packageQuantity||1),packageUnit:item.packageUnit,baseQuantityChange:round4(-qty*Number(item.packageQuantity||1)),baseUnit:item.baseUnit||item.stockUnit,projectId:null,projectName:null,scrapReason:cleanText(p.scrapReason),operatorName:cleanText(p.operatorName),remarks:cleanText(p.remarks),createdAt:now,writeStatus:'COMPLETED'};item.stockQuantity=after;item.stockBaseQuantity=round4(after*Number(item.packageQuantity||1));if(p.disableAfter===true){if(after!==0)throw new Error('全部報廢並停用必須報廢目前全部庫存');const dr=cleanText(p.disableReason);if(!DISABLE_REASONS.has(dr))throw new Error('停用原因不正確');if(dr==='其他'&&!cleanText(p.disableRemarks||p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');item.active=false;item.disabledAt=now;item.disabledBy=cleanText(p.operatorName);item.disabledReason=dr}enrichWarehouseInventoryItem(item);t.transactions.push(tx);t.updatedAt=now;await writeWarehouseTransactions(t);await saveWarehouseInventory(d);return res.json({success:true,transactionId:tx.transactionId,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
 
 // 其他專案與材料相關 API 路由
 app.get('/api/projects', async (req, res) => {
