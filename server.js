@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.4.4';
+const APP_VERSION = '6.4.5';
 const app = express();
 app.use(cors());
 
@@ -445,6 +445,20 @@ async function registerProjectByName(projectName) {
     });
 }
 
+function formatTaiwanDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '未紀錄';
+    return new Intl.DateTimeFormat('zh-TW', {
+        timeZone: 'Asia/Taipei',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).format(date).replace(/\//g, '-');
+}
+
 async function replyLineMessage(replyToken, text) {
     if (!replyToken) return;
     await fetch('https://api.line.me/v2/bot/message/reply', {
@@ -689,7 +703,7 @@ async function generateProjectStats(project) {
 
 
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.4.4';
+const WAREHOUSE_REPORT_VERSION='6.4.5';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
@@ -745,7 +759,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                             else errCount++;
                         });
 
-                        const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
+                        const updateTime = formatTaiwanDateTime(inventoryData.updatedAt);
                         
                         let replyText = `📦【倉庫庫存摘要】\n` +
                                         `更新時間：${updateTime}\n\n` +
@@ -791,7 +805,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
                         const target = matchedItems[0];
                         const statusMap = { 'NORMAL': '正常', 'LOW_STOCK': '⚠️ 庫存不足', 'REVIEW_REQUIRED': '🚨 異常', 'OUT_OF_STOCK': '❌ 缺貨' };
-                        const updateTime = (inventoryData.updatedAt || '').substring(0,16).replace('T', ' ');
+                        const updateTime = formatTaiwanDateTime(inventoryData.updatedAt);
                         
                         const detailText = `📦 ${target.materialName}\n\n` +
                                            `▪ 料號：${target.materialCode || '無'}\n` +
