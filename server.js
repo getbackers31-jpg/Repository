@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.5.7';
+const APP_VERSION = '6.5.8';
 const app = express();
 app.use(cors());
 
@@ -712,36 +712,57 @@ async function calculateProjectMaterialBalances(project) {
     let txData = { transactions: [] };
     try { txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false); } catch (error) {}
     if (!Array.isArray(txData.transactions)) txData.transactions = [];
-    const issuedStats = {};
-    for (const tx of txData.transactions) {
-        const key = tx.materialId || `${tx.materialName} (${tx.baseUnit || ''})`;
-        issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
-    }
-    const statsResult = await generateProjectStats(project);
-    const consumedStats = statsResult.stats?.materialStats || {};
     const inventoryMap = await buildInventoryMap(project);
-    return Object.values(inventoryMap).map(material => {
-        const key = material.materialId;
-        const issued = Number(issuedStats[key] || 0);
-        const consumed = Number(consumedStats[key] || 0);
-        const remaining = Number((issued - consumed).toFixed(4));
+    const flowByMaterial = {};
+    for (const tx of txData.transactions) {
+        const materialId = String(tx.materialId || '').trim();
+        if (!materialId) continue;
+        if (!flowByMaterial[materialId]) {
+            flowByMaterial[materialId] = { enteredBaseQuantity: 0, returnedBaseQuantity: 0 };
+        }
+        const baseQuantity = Math.abs(Number(tx.baseQuantity || 0));
+        if (!Number.isFinite(baseQuantity)) continue;
+        if (tx.transactionType === 'PROJECT_RETURN_OUT') {
+            flowByMaterial[materialId].returnedBaseQuantity += baseQuantity;
+        } else if (
+            tx.transactionType === 'WAREHOUSE_TRANSFER_IN' ||
+            tx.transactionType === 'OPENING_ISSUE' ||
+            tx.transactionType === 'ADDITIONAL_ISSUE' ||
+            tx.materialSource === 'SUPPLIER_DIRECT'
+        ) {
+            flowByMaterial[materialId].enteredBaseQuantity += baseQuantity;
+        }
+    }
+    return Object.entries(flowByMaterial).map(([materialId, flow]) => {
+        const material = inventoryMap[materialId] || {};
+        const packageQuantity = Number(material.packageQuantity || 1);
+        const entered = Number(flow.enteredBaseQuantity.toFixed(4));
+        const returned = Number(flow.returnedBaseQuantity.toFixed(4));
+        const unreturned = Number(Math.max(0, entered - returned).toFixed(4));
         return {
-            materialId: material.materialId,
-            materialName: material.materialName,
-            packageQuantity: Number(material.packageQuantity || 1),
+            materialId,
+            materialName: material.materialName || materialId,
+            materialCode: material.materialCode || materialId,
+            packageQuantity,
             packageUnit: material.packageUnit || '',
-            stockUnit: material.stockUnit,
-            baseUnit: material.baseUnit || material.stockUnit,
-            issuedBaseQuantity: issued,
-            consumedBaseQuantity: consumed,
-            remainingBaseQuantity: remaining,
-            returnable: remaining > 0.0001
+            stockUnit: material.stockUnit || '',
+            baseUnit: material.baseUnit || material.stockUnit || '',
+            enteredBaseQuantity: entered,
+            returnedBaseQuantity: returned,
+            unreturnedBaseQuantity: unreturned,
+            enteredQuantity: Number((entered / packageQuantity).toFixed(4)),
+            returnedQuantity: Number((returned / packageQuantity).toFixed(4)),
+            unreturnedQuantity: Number((unreturned / packageQuantity).toFixed(4)),
+            // Backward-compatible fields for existing callers.
+            issuedBaseQuantity: entered,
+            consumedBaseQuantity: returned,
+            remainingBaseQuantity: unreturned,
+            returnable: unreturned > 0.0001
         };
     });
 }
-
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.5.7';
+const WAREHOUSE_REPORT_VERSION='6.5.8';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
@@ -959,11 +980,11 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         try {
                             const balances = await calculateProjectMaterialBalances(project);
                             const leftovers = balances.filter(item => item.returnable).map(item => {
-                                const quantity = Number((item.remainingBaseQuantity / item.packageQuantity).toFixed(4));
+                                const quantity = item.unreturnedQuantity;
                                 return `• ${item.materialName}：${quantity} ${item.stockUnit}`;
                             });
                             if (leftovers.length) {
-                                leftoverSummary = `\n\n⚠️ 案場尚有剩餘材料：\n${leftovers.join('\n')}\n\n請至倉庫系統執行「案場退回」。`;
+                                leftoverSummary = `\n\n⚠️ 案場尚有材料未完成退回紀錄：\n${leftovers.join('\n')}\n\n請至倉庫系統執行「案場退回」。`;
                             }
                         } catch (error) {
                             console.error('計算結案剩料失敗：', error);
@@ -1503,7 +1524,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                         return res.status(400).json({
                             success: false,
                             error:
-                                `退料超過案場餘額！案場帳面僅剩 ` +
+                                `退回數量超過尚未退回紀錄！目前尚未退回 ` +
                                 `${currentBalance / packageQuantity} ${item.stockUnit}`
                         });
                     }
@@ -1641,7 +1662,9 @@ app.get('/api/projects', async (req, res) => {
                 active: project.active !== false,
                 status: project.status || (project.active === false ? 'CLOSED' : 'ACTIVE'),
                 hasReturnableMaterials,
-                returnableItemCount
+                returnableItemCount,
+                hasUnreturnedMaterials: hasReturnableMaterials,
+                unreturnedItemCount: returnableItemCount
             });
         }
         projects.sort((a, b) => (Number(b.active) - Number(a.active)) || a.projectName.localeCompare(b.projectName, 'zh-Hant'));
