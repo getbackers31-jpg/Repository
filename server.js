@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.5.3';
+const APP_VERSION = '6.5.7';
 const app = express();
 app.use(cors());
 
@@ -394,22 +394,25 @@ async function ensureChildFolder(graphClient, parentPath, childFolderName) {
     }
 }
 
-async function findProjectByName(projectName) {
+async function findProjectByName(projectName, includeInactive = false) {
     const config = await readProjectsFromOneDrive();
     const projects = Array.isArray(config.projects) ? config.projects : [];
     const normalizedName = normalizeProjectName(projectName);
-    return projects.find(p => p.active === true && normalizeProjectName(p.projectName) === normalizedName) || null;
+    return projects.find(project =>
+        (includeInactive || project.active !== false) &&
+        normalizeProjectName(project.projectName) === normalizedName
+    ) || null;
 }
-
-async function findProjectById(projectId) {
+async function findProjectById(projectId, includeInactive = false) {
     const config = await readProjectsFromOneDrive();
     const projects = Array.isArray(config.projects) ? config.projects : [];
     const normalizedProjectId = String(projectId || '').trim();
     if (!normalizedProjectId) return null;
-    return projects.find(project => project.active === true && project.projectId === normalizedProjectId) || null;
-}
-
-function createProjectId() {
+    return projects.find(project =>
+        (includeInactive || project.active !== false) &&
+        project.projectId === normalizedProjectId
+    ) || null;
+}function createProjectId() {
     return `PRJ-${crypto.randomUUID()}`;
 }
 
@@ -418,7 +421,7 @@ async function registerProjectByName(projectName) {
         const normalizedName = validateProjectName(projectName);
         const config = await readProjectsFromOneDrive();
         const projects = Array.isArray(config.projects) ? config.projects : [];
-        const existingProject = projects.find(project => project.active === true && normalizeProjectName(project.projectName) === normalizedName);
+        const existingProject = projects.find(project => project.active !== false && normalizeProjectName(project.projectName) === normalizedName);
 
         if (existingProject) {
             await ensureProjectFolder(existingProject.projectName);
@@ -702,8 +705,43 @@ async function generateProjectStats(project) {
 }
 
 
+
+async function calculateProjectMaterialBalances(project) {
+    const safeProjectName = sanitizePathSegment(project.projectName);
+    const txPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
+    let txData = { transactions: [] };
+    try { txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false); } catch (error) {}
+    if (!Array.isArray(txData.transactions)) txData.transactions = [];
+    const issuedStats = {};
+    for (const tx of txData.transactions) {
+        const key = tx.materialId || `${tx.materialName} (${tx.baseUnit || ''})`;
+        issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
+    }
+    const statsResult = await generateProjectStats(project);
+    const consumedStats = statsResult.stats?.materialStats || {};
+    const inventoryMap = await buildInventoryMap(project);
+    return Object.values(inventoryMap).map(material => {
+        const key = material.materialId;
+        const issued = Number(issuedStats[key] || 0);
+        const consumed = Number(consumedStats[key] || 0);
+        const remaining = Number((issued - consumed).toFixed(4));
+        return {
+            materialId: material.materialId,
+            materialName: material.materialName,
+            packageQuantity: Number(material.packageQuantity || 1),
+            packageUnit: material.packageUnit || '',
+            stockUnit: material.stockUnit,
+            baseUnit: material.baseUnit || material.stockUnit,
+            issuedBaseQuantity: issued,
+            consumedBaseQuantity: consumed,
+            remainingBaseQuantity: remaining,
+            returnable: remaining > 0.0001
+        };
+    });
+}
+
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.5.3';
+const WAREHOUSE_REPORT_VERSION='6.5.7';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
@@ -904,62 +942,70 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     if (!targetId) continue;
                     const match = text.match(/^結案\s+(.+)$/);
                     if (!match) continue;
-                    
                     const bindings = await readBindingsFromOneDrive();
-                    const b = (bindings.bindings || []).find(x => x.groupId === targetId && x.active);
-                    if (!b || normalizeProjectName(b.projectName) !== normalizeProjectName(match[1])) {
-                        await replyLineMessage(event.replyToken, `⚠️ 名稱不符或無綁定`); 
+                    const binding = (bindings.bindings || []).find(item => item.groupId === targetId && item.active);
+                    if (!binding || normalizeProjectName(binding.projectName) !== normalizeProjectName(match[1])) {
+                        await replyLineMessage(event.replyToken, '⚠️ 名稱不符或無綁定');
                         continue;
                     }
-
                     await withProjectWriteLock(async () => {
                         const config = await readProjectsFromOneDrive();
-                        const pIdx = (config.projects || []).findIndex(p => p.projectId === b.projectId);
-                        if (pIdx === -1) {
-                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。'); return;
+                        const project = (config.projects || []).find(item => item.projectId === binding.projectId);
+                        if (!project) {
+                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。');
+                            return;
                         }
-                        
-                        const closingProject = config.projects[pIdx];
-
+                        let leftoverSummary = '';
                         try {
-                            const resExcel = await fetch(`http://localhost:${PORT}/api/projects/${b.projectId}/export-excel`);
-                            if (!resExcel.ok) {
-                                const errorText = await resExcel.text();
-                                throw new Error(`HTTP ${resExcel.status} ${errorText}`);
-                            }
-                            
-                            const contentType = resExcel.headers.get('content-type') || '';
-                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
-                                throw new Error('結案 API 未回傳 Excel 檔案');
-                            }
-                            
-                            const buf = Buffer.from(await resExcel.arrayBuffer());
-                            const { dateStr } = getTaiwanDateParts();
-                            const gClient = await getGraphClient();
-                            
-                            await gClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(b.projectName)}/結案總表_${sanitizePathSegment(b.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buf);
-                                
-                        } catch(e) { 
-                            console.error('結案失敗', e);
-                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${e.message})\n案場尚未下架。`); 
-                            return; 
-                        }
-                        
-                        config.projects.splice(pIdx, 1);
-                        await writeProjectsToOneDrive(config);
-                        
-                        await withBindingWriteLock(async () => {
-                            const latestB = await readBindingsFromOneDrive();
-                            await writeBindingsToOneDrive({ 
-                                ...latestB, 
-                                bindings: (latestB.bindings || []).filter(x => x.projectId !== b.projectId) 
+                            const balances = await calculateProjectMaterialBalances(project);
+                            const leftovers = balances.filter(item => item.returnable).map(item => {
+                                const quantity = Number((item.remainingBaseQuantity / item.packageQuantity).toFixed(4));
+                                return `• ${item.materialName}：${quantity} ${item.stockUnit}`;
                             });
+                            if (leftovers.length) {
+                                leftoverSummary = `\n\n⚠️ 案場尚有剩餘材料：\n${leftovers.join('\n')}\n\n請至倉庫系統執行「案場退回」。`;
+                            }
+                        } catch (error) {
+                            console.error('計算結案剩料失敗：', error);
+                            leftoverSummary = '\n\n⚠️ 剩料摘要計算失敗，請至倉庫系統確認案場餘量。';
+                        }
+                        try {
+                            const response = await fetch(`http://localhost:${PORT}/api/projects/${binding.projectId}/export-excel`);
+                            if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`);
+                            const contentType = response.headers.get('content-type') || '';
+                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) throw new Error('結案 API 未回傳 Excel 檔案');
+                            const buffer = Buffer.from(await response.arrayBuffer());
+                            const { dateStr } = getTaiwanDateParts();
+                            const graphClient = await getGraphClient();
+                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(project.projectName)}/結案總表_${sanitizePathSegment(project.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buffer);
+                        } catch (error) {
+                            console.error('結案失敗：', error);
+                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${error.message})\n案場尚未結案。`);
+                            return;
+                        }
+                        const now = new Date().toISOString();
+                        project.active = false;
+                        project.status = 'CLOSED';
+                        project.closedAt = now;
+                        project.closedBy = event.source?.userId || '';
+                        project.updatedAt = now;
+                        config.updatedAt = now;
+                        await writeProjectsToOneDrive(config);
+                        await withBindingWriteLock(async () => {
+                            const latest = await readBindingsFromOneDrive();
+                            for (const item of latest.bindings || []) {
+                                if (item.projectId === binding.projectId && item.active !== false) {
+                                    item.active = false;
+                                    item.closedAt = now;
+                                    item.closeReason = 'PROJECT_CLOSED';
+                                }
+                            }
+                            latest.updatedAt = now;
+                            await writeBindingsToOneDrive(latest);
                         });
-                        
-                        await replyLineMessage(event.replyToken, `✅ 案場「${match[1]}」已成功結案！\n\n系統已自動產生【Excel 結案報表】與統計資料，並存入您的 OneDrive 資料夾中。`);
+                        await replyLineMessage(event.replyToken, `✅ 案場「${project.projectName}」已成功結案！\n\n系統已產生 Excel 結案報表並保留案場歷史資料。${leftoverSummary}`);
                     });
-                }
-            }
+                }            }
         } catch (e) { console.error('Webhook Error', e); }
     }
 });
@@ -1362,7 +1408,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
             return res.status(400).json({ success: false, error: '參數不完整或數量無效' });
         }
 
-        const project = await findProjectById(projectId);
+        const project = await findProjectById(projectId, true);
         if (!project) {
             return res.status(404).json({ success: false, error: '找不到指定案場' });
         }
@@ -1449,18 +1495,9 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     transferId = existingProjectTransaction.transferId;
                     transactionDate = existingProjectTransaction.transactionDate;
                 } else {
-                    let issuedBaseQuantity = 0;
-                    for (const tx of projTxData.transactions) {
-                        if (tx.materialId === materialId) {
-                            issuedBaseQuantity += Number(tx.baseQuantity || 0);
-                        }
-                    }
-
-                    const statsResult = await generateProjectStats(project);
-                    const consumedBaseQuantity = Number(
-                        (statsResult.stats?.materialStats || {})[materialId] || 0
-                    );
-                    const currentBalance = issuedBaseQuantity - consumedBaseQuantity;
+                    const balances = await calculateProjectMaterialBalances(project);
+                    const balanceItem = balances.find(entry => entry.materialId === materialId);
+                    const currentBalance = Number(balanceItem?.remainingBaseQuantity || 0);
 
                     if (currentBalance < baseQuantityToReturn) {
                         return res.status(400).json({
@@ -1574,24 +1611,46 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
 // v6.5 品項清單
 app.get('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{const d=await readGlobalInventory();return res.json({success:true,version:APP_VERSION,items:(d.items||[]).map(publicWarehouseItem)})}catch(e){console.error(e);return res.status(500).json({success:false,error:'無法取得材料品項'})}});
 app.post('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),p=req.body||{},status=p.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';let code=status==='TEMPORARY'?nextTemporaryMaterialCode(d.items):validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items).has(code))throw new Error('英文代碼已存在');const name=cleanText(p.materialName),stockUnit=cleanText(p.stockUnit),baseUnit=cleanText(p.baseUnit),capacity=Number(p.packageQuantity);if(!name)throw new Error('中文材料名稱不可空白');if(!stockUnit)throw new Error('庫存單位不可空白');if(!baseUnit)throw new Error('基準單位不可空白');if(!(capacity>0))throw new Error('每一庫存單位的容量必須大於0');const now=new Date().toISOString(),item={materialUid:materialUid(),materialId:code,materialCode:code,materialName:name,codeStatus:status,active:true,materialCategories:validateCategories(p.materialCategories),previousCodes:[],stockQuantity:0,stockBaseQuantity:0,stockUnit,packageQuantity:round4(capacity),packageUnit:cleanText(p.packageUnit)||baseUnit,baseUnit,inventoryManaged:true,minimumStockEnabled:false,createdAt:now,createdBy:cleanText(p.operatorName),createReason:cleanText(p.createReason),remarks:cleanText(p.remarks)};if(!item.createdBy)throw new Error('操作人不可空白');d.items.push(item);await saveWarehouseInventory(d);return res.status(201).json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
-app.patch('/api/warehouse/material-items/:uid',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),item=findWarehouseItem(d,req.params.uid);if(!item)throw new Error('找不到該材料主檔');const p=req.body||{},action=cleanText(p.action),operator=cleanText(p.operatorName);if(!operator)throw new Error('操作人不可空白');if(action==='RENAME'){if(!cleanText(p.materialName))throw new Error('中文材料名稱不可空白');if(!cleanText(p.reason))throw new Error('修改原因不可空白');item.materialName=cleanText(p.materialName);item.nameUpdatedAt=new Date().toISOString();item.nameUpdatedBy=operator;item.nameUpdateReason=cleanText(p.reason)}else if(action==='UPDATE_CATEGORIES'){item.materialCategories=validateCategories(p.materialCategories);item.categoriesUpdatedAt=new Date().toISOString();item.categoriesUpdatedBy=operator}else if(action==='RECODE'||action==='FORMALIZE'){const code=validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items,item.materialUid).has(code))throw new Error('英文代碼已存在');const reason=cleanText(p.reason);if(!reason)throw new Error('更正原因不可空白');const old=materialCode(item.materialCode||item.materialId);if(old!==code)item.previousCodes.push({code:old,changedAt:new Date().toISOString(),changedBy:operator,reason});item.materialId=code;item.materialCode=code;item.codeStatus='FORMAL';if(cleanText(p.materialName))item.materialName=cleanText(p.materialName)}else if(action==='DISABLE'){if(Number(item.stockQuantity||0)!==0)throw new Error('目前仍有庫存，請先報廢材料或使用全部報廢並停用');const reason=cleanText(p.disableReason);if(!DISABLE_REASONS.has(reason))throw new Error('停用原因不正確');item.active=false;item.disabledAt=new Date().toISOString();item.disabledBy=operator;item.disabledReason=reason}else if(action==='ENABLE'){if(!cleanText(p.reason))throw new Error('重新啟用原因不可空白');item.active=true;item.reenabledAt=new Date().toISOString();item.reenabledBy=operator;item.reenabledReason=cleanText(p.reason)}else throw new Error('不支援的品項操作');await saveWarehouseInventory(d);return res.json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.patch('/api/warehouse/material-items/:uid',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),item=findWarehouseItem(d,req.params.uid);if(!item)throw new Error('找不到該材料主檔');const p=req.body||{},action=cleanText(p.action),operator=cleanText(p.operatorName);if(!operator)throw new Error('操作人不可空白');if(action==='RENAME'){if(!cleanText(p.materialName))throw new Error('中文材料名稱不可空白');if(!cleanText(p.reason))throw new Error('修改原因不可空白');item.materialName=cleanText(p.materialName);item.nameUpdatedAt=new Date().toISOString();item.nameUpdatedBy=operator;item.nameUpdateReason=cleanText(p.reason)}else if(action==='UPDATE_CATEGORIES'){item.materialCategories=validateCategories(p.materialCategories);item.categoriesUpdatedAt=new Date().toISOString();item.categoriesUpdatedBy=operator}else if(action==='RECODE'||action==='FORMALIZE'){const code=validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items,item.materialUid).has(code))throw new Error('英文代碼已存在');const reason=cleanText(p.reason);if(!reason)throw new Error('更正原因不可空白');const old=materialCode(item.materialCode||item.materialId);if(old!==code)item.previousCodes.push({code:old,changedAt:new Date().toISOString(),changedBy:operator,reason});item.materialId=code;item.materialCode=code;item.codeStatus='FORMAL';if(cleanText(p.materialName))item.materialName=cleanText(p.materialName)}else if(action==='DISABLE'){if(Number(item.stockQuantity||0)!==0)throw new Error('目前仍有庫存，請先報廢材料或使用全部報廢並停用');const reason=cleanText(p.disableReason);if(!DISABLE_REASONS.has(reason))throw new Error('停用原因不正確');if(reason==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');item.active=false;item.disabledAt=new Date().toISOString();item.disabledBy=operator;item.disabledReason=reason}else if(action==='ENABLE'){if(!cleanText(p.reason))throw new Error('重新啟用原因不可空白');item.active=true;item.reenabledAt=new Date().toISOString();item.reenabledBy=operator;item.reenabledReason=cleanText(p.reason)}else throw new Error('不支援的品項操作');await saveWarehouseInventory(d);return res.json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
 app.post('/api/warehouse/material-items/:uid/scrap',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),t=await readWarehouseTransactions(),item=findWarehouseItem(d,req.params.uid),p=req.body||{};if(!item)throw new Error('找不到該材料主檔');if(item.active===false)throw new Error('已停用品項不可執行報廢');if((t.transactions||[]).some(x=>x.submissionId===cleanText(p.submissionId)))return res.json({success:true,duplicate:true});const qty=Number(p.quantity),before=Number(item.stockQuantity||0);if(!(qty>0))throw new Error('報廢數量必須大於0');if(qty>before)throw new Error(`報廢數量不可超過目前庫存${before}${item.stockUnit||''}`);if(!SCRAP_REASONS.has(cleanText(p.scrapReason)))throw new Error('報廢原因不正確');if(cleanText(p.scrapReason)==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他報廢原因時，補充說明必填');if(!cleanText(p.operatorName))throw new Error('操作人不可空白');const after=round4(before-qty),now=new Date().toISOString(),tx={transactionId:`TX-${crypto.randomUUID()}`,submissionId:cleanText(p.submissionId),transferId:null,transactionType:'SCRAP_DISPOSAL',transactionDate:validateWarehouseDate(p.transactionDate,getTaiwanDateParts().dateStr),materialUid:item.materialUid,materialId:item.materialId,materialCode:item.materialCode,materialName:item.materialName,quantityChange:-qty,beforeQuantity:before,afterQuantity:after,stockUnit:item.stockUnit,packageQuantity:Number(item.packageQuantity||1),packageUnit:item.packageUnit,baseQuantityChange:round4(-qty*Number(item.packageQuantity||1)),baseUnit:item.baseUnit||item.stockUnit,projectId:null,projectName:null,scrapReason:cleanText(p.scrapReason),operatorName:cleanText(p.operatorName),remarks:cleanText(p.remarks),createdAt:now,writeStatus:'COMPLETED'};item.stockQuantity=after;item.stockBaseQuantity=round4(after*Number(item.packageQuantity||1));if(p.disableAfter===true){if(after!==0)throw new Error('全部報廢並停用必須報廢目前全部庫存');const dr=cleanText(p.disableReason);if(!DISABLE_REASONS.has(dr))throw new Error('停用原因不正確');if(dr==='其他'&&!cleanText(p.disableRemarks||p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');item.active=false;item.disabledAt=now;item.disabledBy=cleanText(p.operatorName);item.disabledReason=dr}enrichWarehouseInventoryItem(item);t.transactions.push(tx);t.updatedAt=now;await writeWarehouseTransactions(t);await saveWarehouseInventory(d);return res.json({success:true,transactionId:tx.transactionId,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
 
 // 其他專案與材料相關 API 路由
 app.get('/api/projects', async (req, res) => {
     try {
+        const includeInactive = String(req.query.includeInactive || '').toLowerCase() === 'true';
+        const returnableOnly = String(req.query.returnableOnly || '').toLowerCase() === 'true';
         const config = await readProjectsFromOneDrive();
-        const activeProjects = (config.projects || [])
-            .filter(p => p.active === true)
-            .map(p => ({ projectId: p.projectId, projectName: p.projectName }))
-            .sort((a, b) => a.projectName.localeCompare(b.projectName, 'zh-Hant'));
-        return res.status(200).json({ success: true, projects: activeProjects });
+        const source = (config.projects || []).filter(project => includeInactive || project.active !== false);
+        const projects = [];
+        for (const project of source) {
+            let hasReturnableMaterials = false;
+            let returnableItemCount = 0;
+            if (includeInactive || returnableOnly) {
+                try {
+                    const balances = await calculateProjectMaterialBalances(project);
+                    returnableItemCount = balances.filter(item => item.returnable).length;
+                    hasReturnableMaterials = returnableItemCount > 0;
+                } catch (error) {
+                    console.error(`計算案場 ${project.projectName} 餘量失敗：`, error);
+                }
+            }
+            if (returnableOnly && !hasReturnableMaterials) continue;
+            projects.push({
+                projectId: project.projectId,
+                projectName: project.projectName,
+                active: project.active !== false,
+                status: project.status || (project.active === false ? 'CLOSED' : 'ACTIVE'),
+                hasReturnableMaterials,
+                returnableItemCount
+            });
+        }
+        projects.sort((a, b) => (Number(b.active) - Number(a.active)) || a.projectName.localeCompare(b.projectName, 'zh-Hant'));
+        return res.status(200).json({ success: true, projects });
     } catch (error) {
         console.error('讀取案場清單失敗：', error);
         return res.status(500).json({ success: false, error: '無法取得案場清單' });
     }
 });
-
 app.get('/api/materials', async (req, res) => {
     const projectId = req.query.projectId;
     try {
@@ -1632,53 +1691,20 @@ app.get('/api/projects/:projectId', async (req, res) => {
 
 app.get('/api/projects/:projectId/material-balances', async (req, res) => {
     try {
-        const project = await findProjectById(req.params.projectId);
+        const project = await findProjectById(req.params.projectId, true);
         if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
-
-        const safeProjectName = sanitizePathSegment(project.projectName);
-        const txPath = `工程專案管理/2026_工程專案/${safeProjectName}/project-material-transactions.json`;
-        let txData = { transactions: [] };
-        try { txData = await readJsonFromOneDrive(txPath, { transactions: [] }, false); } catch(e){}
-
-        const issuedStats = {};
-        (txData.transactions || []).forEach(tx => {
-            const key = tx.materialId || `${tx.materialName} (${tx.baseUnit})`;
-            issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
-        });
-
-        const statsResult = await generateProjectStats(project);
-        const consumedStats = statsResult.stats?.materialStats || {};
-
-        const inventoryMap = await buildInventoryMap(project);
-
-        const balances = Object.values(inventoryMap).map(m => {
-            const key = m.materialId;
-            const issued = issuedStats[key] || 0;
-            const consumed = consumedStats[key] || 0;
-            return {
-                materialId: m.materialId,
-                materialName: m.materialName,
-                packageQuantity: m.packageQuantity || 1,
-                packageUnit: m.packageUnit || '',
-                stockUnit: m.stockUnit,
-                baseUnit: m.baseUnit || m.stockUnit,
-                issuedBaseQuantity: issued,
-                consumedBaseQuantity: consumed,
-                remainingBaseQuantity: issued - consumed
-            };
-        });
-        
-        return res.status(200).json({ success: true, projectId: project.projectId, balances });
-    } catch (error) { 
-        return res.status(500).json({ success: false, error: '取得餘額失敗' }); 
+        const balances = await calculateProjectMaterialBalances(project);
+        return res.status(200).json({ success: true, projectId: project.projectId, active: project.active !== false, balances });
+    } catch (error) {
+        console.error('取得案場材料餘額失敗：', error);
+        return res.status(500).json({ success: false, error: '取得餘額失敗' });
     }
 });
-
 // Excel 結案報表匯出 (包含完整五張工作表與材料來源欄位)
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
         const projectId = req.params.projectId;
-        const project = await findProjectById(projectId);
+        const project = await findProjectById(projectId, true);
         
         if (!project) {
             return res.status(404).json({ success: false, message: '找不到此專案' });
