@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-const APP_VERSION = '6.5.8';
+const APP_VERSION = '6.5.9';
 const app = express();
 app.use(cors());
 
@@ -318,7 +318,13 @@ async function readGlobalInventory() {
     if (!data || !Array.isArray(data.items)) {
         throw new Error('inventory.json 格式不正確');
     }
+    const beforeMigration = JSON.stringify(data.items);
     data.items = migrateWarehouseInventory(data).items.map(enrichWarehouseInventoryItem);
+    const inventoryCorrected = JSON.stringify(data.items) !== beforeMigration;
+    if (inventoryCorrected) {
+        data.updatedAt = new Date().toISOString();
+        await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', data);
+    }
     configCache.globalInventory = { data: cloneJsonData(data), timestamp: Date.now() };
     return cloneJsonData(data);
 }
@@ -762,7 +768,7 @@ async function calculateProjectMaterialBalances(project) {
     });
 }
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.5.8';
+const WAREHOUSE_REPORT_VERSION='6.5.9';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
@@ -1041,7 +1047,7 @@ function round4(v){return Number(Number(v).toFixed(4))}
 function materialUid(){return `MAT-${crypto.randomUUID().toUpperCase()}`}
 function materialCode(v){return cleanText(v).toUpperCase().replace(/\s+/g,'')}
 function validateMaterialCode(v){const c=materialCode(v);if(!c)throw new Error('英文代碼不可空白');if(!/^[A-Z0-9-]+$/.test(c))throw new Error('英文代碼只能包含英文字母、數字與連字號');return c}
-function migrateWarehouseItem(x){x.materialUid=cleanText(x.materialUid)||materialUid();x.materialCode=cleanText(x.materialCode)||cleanText(x.materialId);x.materialId=cleanText(x.materialId)||x.materialCode;x.codeStatus=x.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';x.active=x.active!==false;x.materialCategories=Array.isArray(x.materialCategories)?[...new Set(x.materialCategories.map(cleanText).filter(Boolean))]:[];x.previousCodes=Array.isArray(x.previousCodes)?x.previousCodes:[];return x}
+function migrateWarehouseItem(x){x.materialUid=cleanText(x.materialUid)||materialUid();x.materialCode=cleanText(x.materialCode)||cleanText(x.materialId);x.materialId=cleanText(x.materialId)||x.materialCode;x.codeStatus=x.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';x.active=x.active!==false;x.materialCategories=Array.isArray(x.materialCategories)?[...new Set(x.materialCategories.map(cleanText).filter(Boolean))]:[];x.previousCodes=Array.isArray(x.previousCodes)?x.previousCodes:[];x.stockQuantity=round4(Number(x.stockQuantity||0));x.packageQuantity=round4(Number(x.packageQuantity||1));x.stockBaseQuantity=round4(x.stockQuantity*x.packageQuantity);return x}
 function migrateWarehouseInventory(data){data.items=(data.items||[]).map(migrateWarehouseItem);return data}
 function allMaterialCodes(items,exceptUid=''){const set=new Set();for(const x of items||[]){if(exceptUid&&x.materialUid===exceptUid)continue;[x.materialId,x.materialCode,...(x.previousCodes||[]).map(p=>p.code)].map(materialCode).filter(Boolean).forEach(c=>set.add(c))}return set}
 function nextTemporaryMaterialCode(items){const d=getTaiwanDateParts().dateStr.replace(/-/g,''),prefix=`TMP-${d}-`;let max=0;for(const c of allMaterialCodes(items)){if(c.startsWith(prefix)){const n=Number(c.slice(prefix.length));if(Number.isInteger(n))max=Math.max(max,n)}}return `${prefix}${String(max+1).padStart(3,'0')}`}
@@ -1231,7 +1237,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             txData.updatedAt = nowIso;
             
             item.stockQuantity = afterQuantity;
-            item.stockBaseQuantity = afterQuantity * packageQuantity;
+            item.stockBaseQuantity = round4(afterQuantity * packageQuantity);
             enrichWarehouseInventoryItem(item);
             inventoryData.updatedAt = nowIso;
             
@@ -1382,7 +1388,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 await writeWarehouseTransactions(txData);
 
                 item.stockQuantity = afterQuantity;
-                item.stockBaseQuantity = afterQuantity * packageQuantity;
+                item.stockBaseQuantity = round4(afterQuantity * packageQuantity);
                 enrichWarehouseInventoryItem(item);
                 inventoryData.updatedAt = nowIso;
                 await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json', inventoryData);
@@ -1797,64 +1803,56 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
-        // 工作表 2：材料結案總表
+        // 工作表 2：材料結案總表（v6.5.9：施工使用不扣除尚未退回桶數）
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
-        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '案場領入數量', '領入換算量', '日報累計耗用', '理論剩餘', '基準單位']);
-        
+        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '累計進場數量', '累計進場換算量', '日報登記使用量', '日報登記使用換算量', '已退回倉庫數量', '已退回換算量', '尚未退回紀錄', '尚未退回換算量', '基準單位']);
         const materialSummaryMap = {};
-        (transactionData.transactions || []).forEach(tx => {
-            const pkgSpec = `${tx.packageQuantity||1}${tx.packageUnit||''}/${tx.stockUnit}`;
-            const uniqueKey = tx.materialId || `${tx.materialName}_${pkgSpec}`;
-            
+        const ensureMaterialSummary = item => {
+            const packageQuantity = Number(item.packageQuantity || 1);
+            const pkgSpec = `${packageQuantity}${item.packageUnit||''}/${item.stockUnit}`;
+            const uniqueKey = item.materialId || `${item.materialName}_${pkgSpec}`;
             if (!materialSummaryMap[uniqueKey]) {
-                materialSummaryMap[uniqueKey] = { 
-                    materialCode: resolveMaterialCode(tx), 
-                    materialName: tx.materialName, 
-                    packageSpec: pkgSpec, 
-                    stockUnit: tx.stockUnit, 
-                    issuedQty: 0, 
-                    baseIssuedQty: 0, 
-                    consumedBaseQty: 0, 
-                    baseUnit: tx.baseUnit 
+                materialSummaryMap[uniqueKey] = {
+                    materialCode: resolveMaterialCode(item), materialName: item.materialName,
+                    packageSpec: pkgSpec, stockUnit: item.stockUnit,
+                    enteredQty: 0, enteredBaseQty: 0, usedQty: 0, usedBaseQty: 0,
+                    returnedQty: 0, returnedBaseQty: 0, baseUnit: item.baseUnit,
+                    packageQuantity
                 };
             }
-            materialSummaryMap[uniqueKey].issuedQty += Number(tx.quantity || 0); 
-            materialSummaryMap[uniqueKey].baseIssuedQty += Number(tx.baseQuantity || 0);
+            return materialSummaryMap[uniqueKey];
+        };
+        (transactionData.transactions || []).forEach(tx => {
+            const m = ensureMaterialSummary(tx);
+            const qty = Math.abs(Number(tx.quantity || 0));
+            const baseQty = Math.abs(Number(tx.baseQuantity || 0));
+            if (tx.transactionType === 'PROJECT_RETURN_OUT') {
+                m.returnedQty += qty;
+                m.returnedBaseQty += baseQty;
+            } else if (['WAREHOUSE_TRANSFER_IN','OPENING_ISSUE','ADDITIONAL_ISSUE'].includes(tx.transactionType) || tx.materialSource === 'SUPPLIER_DIRECT') {
+                m.enteredQty += qty;
+                m.enteredBaseQty += baseQty;
+            }
         });
-        
         reports.forEach(report => {
             (report.materialItems || []).forEach(item => {
-                const pkgSpec = `${item.packageQuantity||1}${item.packageUnit||''}/${item.stockUnit}`;
-                const uniqueKey = item.materialId || `${item.materialName}_${pkgSpec}`;
-                
-                if (!materialSummaryMap[uniqueKey]) {
-                    materialSummaryMap[uniqueKey] = { 
-                        materialCode: resolveMaterialCode(item), 
-                        materialName: item.materialName, 
-                        packageSpec: pkgSpec, 
-                        stockUnit: item.stockUnit, 
-                        issuedQty: 0, 
-                        baseIssuedQty: 0, 
-                        consumedBaseQty: 0, 
-                        baseUnit: item.baseUnit 
-                    };
-                }
-                materialSummaryMap[uniqueKey].consumedBaseQty += Number(item.baseQuantity || 0);
+                const m = ensureMaterialSummary(item);
+                m.usedQty += Number(item.quantity || 0);
+                m.usedBaseQty += Number(item.baseQuantity || 0);
             });
         });
-        
-        let matRowIdx = 2;
         Object.values(materialSummaryMap).forEach(m => {
+            const unreturnedQty = Math.max(0, m.enteredQty - m.returnedQty);
+            const unreturnedBaseQty = Math.max(0, m.enteredBaseQty - m.returnedBaseQty);
             wsMaterials.addRow([
-                m.materialCode, m.materialName, m.packageSpec, m.stockUnit, 
-                m.issuedQty, m.baseIssuedQty, m.consumedBaseQty, 
-                { formula: `=F${matRowIdx}-G${matRowIdx}`, result: m.baseIssuedQty - m.consumedBaseQty }, 
-                m.baseUnit
+                m.materialCode, m.materialName, m.packageSpec, m.stockUnit,
+                round4(m.enteredQty), round4(m.enteredBaseQty),
+                round4(m.usedQty), round4(m.usedBaseQty),
+                round4(m.returnedQty), round4(m.returnedBaseQty),
+                round4(unreturnedQty), round4(unreturnedBaseQty), m.baseUnit
             ]);
-            matRowIdx++;
         });
-
         // 工作表 3：材料進出紀錄 (含材料來源)
         const wsTxLog = workbook.addWorksheet('材料進出紀錄');
         wsTxLog.views = [{ showGridLines: true }];
