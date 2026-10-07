@@ -8,7 +8,7 @@ require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
 // 升級至 v6.6.0：資料安全與自動備份
-const APP_VERSION = '6.6.0';
+const APP_VERSION = '6.6.1';
 const app = express();
 app.use(cors());
 
@@ -213,8 +213,8 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
                 files: savedFiles,
                 status: 'COMPLETED'
             });
-            if (indexData.backups.length > 2000) indexData.backups.length = 2000;
-            await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
+            if (latestIndexData.backups.length > 2000) latestIndexData.backups.length = 2000;
+            await writeJsonToOneDrive(BACKUP_INDEX_PATH, latestIndexData);
 
             if (backupType === 'DAILY_FIRST_WRITE') {
                 await writeJsonToOneDrive(BACKUP_STATE_PATH, {
@@ -2226,11 +2226,162 @@ app.post('/api/submit-report', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// v6.6.1：管理員一鍵還原（預覽 -> 二次確認 -> 還原）
+// ==========================================
+function requireRestoreAdmin(req, res, next) {
+    const adminIds = String(process.env.RESTORE_ADMIN_LINE_USER_IDS || '')
+        .split(',').map(value => value.trim()).filter(Boolean);
+    if (!adminIds.length) {
+        return res.status(503).json({ success: false, error: '尚未設定還原管理員' });
+    }
+    if (!adminIds.includes(req.warehouseUserId)) {
+        return res.status(403).json({ success: false, error: '沒有系統還原權限' });
+    }
+    next();
+}
+
+function backupFolderPathFromId(backupId) {
+    const match = String(backupId || '').match(/^BKP-(\d{4})(\d{2})(\d{2})-/);
+    if (!match) throw new Error('備份編號格式不正確');
+    const [, year, month, day] = match;
+    const date = `${year}-${month}-${day}`;
+    return `${BACKUP_ROOT}/${year}/${year}-${month}/${date}`;
+}
+
+function clearAllDataCaches() {
+    configCache.projects = { data: null, timestamp: 0 };
+    configCache.bindings = { data: null, timestamp: 0 };
+    configCache.globalInventory = { data: null, timestamp: 0 };
+    configCache.projMaterials = {};
+}
+
+async function loadCompletedBackup(backupId) {
+    const indexData = await readJsonFromOneDrive(BACKUP_INDEX_PATH, { backups: [] }, false);
+    const backup = Array.isArray(indexData.backups)
+        ? indexData.backups.find(item => item.backupId === backupId)
+        : null;
+    if (!backup || backup.status !== 'COMPLETED') throw new Error('找不到可還原的完整備份');
+    const coreSources = new Set(CORE_BACKUP_FILES.map(file => file.source));
+    const files = Array.isArray(backup.files)
+        ? backup.files.filter(file => coreSources.has(file.sourcePath))
+        : [];
+    if (files.length !== CORE_BACKUP_FILES.length) throw new Error('此備份不包含完整四個核心檔案');
+    return { indexData, backup, files };
+}
+
+app.get('/api/admin/system-backups', requireWarehouseAccess, requireRestoreAdmin, async (req, res) => {
+    try {
+        const indexData = await readJsonFromOneDrive(BACKUP_INDEX_PATH, { backups: [] }, false);
+        const backups = (Array.isArray(indexData.backups) ? indexData.backups : [])
+            .filter(item => item.status === 'COMPLETED')
+            .slice(0, 100)
+            .map(item => ({
+                backupId: item.backupId,
+                backupType: item.backupType,
+                reason: item.reason,
+                createdAt: item.createdAt,
+                createdBy: item.createdBy,
+                fileCount: Array.isArray(item.files) ? item.files.length : 0,
+                restorable: Array.isArray(item.files) && CORE_BACKUP_FILES.every(core =>
+                    item.files.some(file => file.sourcePath === core.source)
+                )
+            }));
+        return res.json({ success: true, backups });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message || '無法讀取備份清單' });
+    }
+});
+
+app.get('/api/admin/system-backups/:backupId/preview', requireWarehouseAccess, requireRestoreAdmin, async (req, res) => {
+    try {
+        const { backup, files } = await loadCompletedBackup(req.params.backupId);
+        return res.json({
+            success: true,
+            backup: {
+                backupId: backup.backupId,
+                backupType: backup.backupType,
+                reason: backup.reason,
+                createdAt: backup.createdAt,
+                createdBy: backup.createdBy,
+                files
+            },
+            confirmationText: `確認還原 ${backup.backupId}`,
+            warning: '還原會以此備份覆蓋四個核心 JSON；系統會先自動保存目前狀態。'
+        });
+    } catch (error) {
+        return res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/api/admin/system-backups/:backupId/restore', requireWarehouseAccess, requireRestoreAdmin, async (req, res) => {
+    try {
+        const backupId = cleanText(req.params.backupId);
+        const confirmation = cleanText(req.body?.confirmation);
+        const restoreReason = cleanText(req.body?.reason);
+        const operatorName = cleanText(req.body?.operatorName) || req.warehouseUserId;
+        if (confirmation !== `確認還原 ${backupId}`) throw new Error('二次確認文字不正確');
+        if (restoreReason.length < 4) throw new Error('請填寫還原原因');
+
+        const result = await withWarehouseWriteLock(() => withProjectWriteLock(() => withBindingWriteLock(async () => {
+            const { backup, files } = await loadCompletedBackup(backupId);
+
+            // 任何覆蓋前，先將目前正式資料另存成可回復快照。
+            const safetyBackup = await performSystemBackup(
+                'HIGH_RISK_BEFORE_RESTORE',
+                `還原前安全備份：${restoreReason}`,
+                operatorName
+            );
+
+            const folderPath = backupFolderPathFromId(backupId);
+            const restorePayloads = [];
+            for (const file of files) {
+                const data = await readJsonFromOneDrive(`${folderPath}/${file.fileName}`, null, true);
+                if (data == null) throw new Error(`無法讀取備份檔：${file.fileName}`);
+                restorePayloads.push({ sourcePath: file.sourcePath, data });
+            }
+
+            // 全部備份檔都成功讀取及解析後，才開始覆蓋正式資料。
+            for (const item of restorePayloads) {
+                await writeJsonToOneDrive(item.sourcePath, item.data);
+            }
+            clearAllDataCaches();
+
+            // 重新讀取索引，避免覆蓋剛建立的還原前安全備份紀錄。
+            const latestIndexData = await readJsonFromOneDrive(BACKUP_INDEX_PATH, { backups: [] }, false);
+            if (!Array.isArray(latestIndexData.backups)) latestIndexData.backups = [];
+            latestIndexData.backups.unshift({
+                backupId: `RST-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+                backupType: 'RESTORE_AUDIT',
+                restoredFromBackupId: backup.backupId,
+                safetyBackupId: safetyBackup.backupId || null,
+                reason: restoreReason,
+                createdAt: new Date().toISOString(),
+                createdBy: operatorName,
+                files: files.map(file => ({ fileName: file.fileName, sourcePath: file.sourcePath })),
+                status: 'RESTORED'
+            });
+            if (indexData.backups.length > 2000) indexData.backups.length = 2000;
+            await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
+
+            return { restoredFromBackupId: backup.backupId, safetyBackupId: safetyBackup.backupId || null };
+        })));
+
+        return res.json({ success: true, ...result, message: '核心資料已完成還原，請重新整理倉庫頁面。' });
+    } catch (error) {
+        console.error('一鍵還原失敗：', error);
+        return res.status(400).json({ success: false, error: error.message || '一鍵還原失敗' });
+    }
+});
+// ==========================================
+
 const requiredVars = [
     'LINE_ACCESS_TOKEN', 
     'LINE_CHANNEL_SECRET', 
     'LINE_LOGIN_CHANNEL_ID',
     'WAREHOUSE_ALLOWED_LINE_USER_IDS',
+    'RESTORE_ADMIN_LINE_USER_IDS',
     'AZURE_CLIENT_ID', 
     'AZURE_TENANT_ID', 
     'AZURE_CLIENT_SECRET'
