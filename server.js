@@ -213,8 +213,8 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
                 files: savedFiles,
                 status: 'COMPLETED'
             });
-            if (latestIndexData.backups.length > 2000) latestIndexData.backups.length = 2000;
-            await writeJsonToOneDrive(BACKUP_INDEX_PATH, latestIndexData);
+            if (indexData.backups.length > 2000) indexData.backups.length = 2000;
+            await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
 
             if (backupType === 'DAILY_FIRST_WRITE') {
                 await writeJsonToOneDrive(BACKUP_STATE_PATH, {
@@ -2362,8 +2362,8 @@ app.post('/api/admin/system-backups/:backupId/restore', requireWarehouseAccess, 
                 files: files.map(file => ({ fileName: file.fileName, sourcePath: file.sourcePath })),
                 status: 'RESTORED'
             });
-            if (indexData.backups.length > 2000) indexData.backups.length = 2000;
-            await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
+            if (latestIndexData.backups.length > 2000) latestIndexData.backups.length = 2000;
+            await writeJsonToOneDrive(BACKUP_INDEX_PATH, latestIndexData);
 
             return { restoredFromBackupId: backup.backupId, safetyBackupId: safetyBackup.backupId || null };
         })));
