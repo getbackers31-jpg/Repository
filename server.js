@@ -8,7 +8,7 @@ require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
 // 升級至 v6.6.0：資料安全與自動備份
-const APP_VERSION = '6.6.1';
+const APP_VERSION = '6.6.3';
 const app = express();
 app.use(cors());
 
@@ -137,6 +137,10 @@ async function ensureChildFolder(graphClient, parentPath, childFolderName) {
 const BACKUP_ROOT = '工程專案管理/系統備份';
 const BACKUP_STATE_PATH = `${BACKUP_ROOT}/backup-state.json`;
 const BACKUP_INDEX_PATH = `${BACKUP_ROOT}/backup-index.json`;
+// v6.6.2：備份保留政策。可在 Render 環境變數調整天數。
+const DAILY_BACKUP_RETENTION_DAYS = Math.max(7, Number.parseInt(process.env.DAILY_BACKUP_RETENTION_DAYS || '90', 10) || 90);
+const HIGH_RISK_BACKUP_RETENTION_DAYS = Math.max(30, Number.parseInt(process.env.HIGH_RISK_BACKUP_RETENTION_DAYS || '180', 10) || 180);
+const RETENTION_EXEMPT_BACKUP_TYPES = new Set(['HIGH_RISK_BEFORE_RESTORE']);
 const CORE_BACKUP_FILES = [
     { source: '工程專案管理/_系統設定/inventory.json', name: 'inventory', required: true },
     { source: '工程專案管理/_系統設定/warehouse-transactions.json', name: 'warehouse-transactions', required: true },
@@ -146,6 +150,94 @@ const CORE_BACKUP_FILES = [
 
 let backupWriteQueue = Promise.resolve();
 let cachedDailyBackupDate = null;
+let cachedBackupCleanupDate = null;
+
+function backupRetentionDays(backup) {
+    if (!backup || backup.status !== 'COMPLETED') return null;
+    if (RETENTION_EXEMPT_BACKUP_TYPES.has(backup.backupType)) return null;
+    return backup.backupType === 'DAILY_FIRST_WRITE'
+        ? DAILY_BACKUP_RETENTION_DAYS
+        : HIGH_RISK_BACKUP_RETENTION_DAYS;
+}
+
+function backupStorageFolderFromId(backupId) {
+    const match = String(backupId || '').match(/^BKP-(\d{4})(\d{2})(\d{2})-/);
+    if (!match) return null;
+    const [, year, month, day] = match;
+    return `${BACKUP_ROOT}/${year}/${year}-${month}/${year}-${month}-${day}`;
+}
+
+async function deleteBackupRecordFiles(graphClient, backup) {
+    const folderPath = backupStorageFolderFromId(backup.backupId);
+    if (!folderPath || !Array.isArray(backup.files) || backup.files.length === 0) return false;
+    for (const file of backup.files) {
+        const fileName = sanitizePathSegment(file?.fileName || '');
+        if (!fileName) return false;
+        try {
+            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/${folderPath}/${fileName}`).delete();
+        } catch (error) {
+            const statusCode = error?.statusCode || error?.status || error?.code;
+            if (statusCode !== 404 && statusCode !== 'itemNotFound') throw error;
+        }
+    }
+    return true;
+}
+
+async function cleanupExpiredBackups(dateStr) {
+    const indexData = await readJsonFromOneDrive(BACKUP_INDEX_PATH, { backups: [] }, false);
+    if (!Array.isArray(indexData.backups) || indexData.backups.length === 0) {
+        return { deletedBackups: 0, deletedFiles: 0 };
+    }
+    const graphClient = await getGraphClient();
+    const now = Date.now();
+    const retained = [];
+    let deletedBackups = 0;
+    let deletedFiles = 0;
+
+    for (const backup of indexData.backups) {
+        const retentionDays = backupRetentionDays(backup);
+        const createdAt = Date.parse(backup?.createdAt || '');
+        const expired = retentionDays !== null && Number.isFinite(createdAt) &&
+            now - createdAt >= retentionDays * 24 * 60 * 60 * 1000;
+        if (!expired) {
+            retained.push(backup);
+            continue;
+        }
+        try {
+            const deleted = await deleteBackupRecordFiles(graphClient, backup);
+            if (!deleted) {
+                retained.push(backup);
+                continue;
+            }
+            deletedBackups++;
+            deletedFiles += backup.files.length;
+        } catch (error) {
+            console.error(`清理過期備份失敗，已保留索引：${backup.backupId}`, error);
+            retained.push(backup);
+        }
+    }
+
+    if (deletedBackups > 0) {
+        indexData.backups = retained;
+        indexData.lastCleanupAt = new Date().toISOString();
+        indexData.lastCleanupDate = dateStr;
+        indexData.lastCleanupSummary = { deletedBackups, deletedFiles };
+        await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
+    }
+    return { deletedBackups, deletedFiles };
+}
+
+async function runBackupCleanupOncePerDay(dateStr) {
+    if (cachedBackupCleanupDate === dateStr) return;
+    try {
+        const result = await cleanupExpiredBackups(dateStr);
+        cachedBackupCleanupDate = dateStr;
+        console.log(`備份保留清理完成：刪除 ${result.deletedBackups} 組、${result.deletedFiles} 個檔案`);
+    } catch (error) {
+        // 清理失敗不阻擋正常備份與庫存異動，下一次寫入仍可重試。
+        console.error('備份保留清理失敗：', error);
+    }
+}
 
 function withBackupWriteLock(task) {
     const current = backupWriteQueue.then(task, task);
@@ -168,10 +260,14 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
         const month = `${year}-${monthPart}`;
 
         if (backupType === 'DAILY_FIRST_WRITE') {
-            if (cachedDailyBackupDate === dateStr) return { skipped: true, reason: 'ALREADY_BACKED_UP' };
+            if (cachedDailyBackupDate === dateStr) {
+                await runBackupCleanupOncePerDay(dateStr);
+                return { skipped: true, reason: 'ALREADY_BACKED_UP' };
+            }
             const state = await readJsonFromOneDrive(BACKUP_STATE_PATH, { lastDailyBackupDate: null }, false);
             if (state?.lastDailyBackupDate === dateStr) {
                 cachedDailyBackupDate = dateStr;
+                await runBackupCleanupOncePerDay(dateStr);
                 return { skipped: true, reason: 'ALREADY_BACKED_UP' };
             }
         }
@@ -213,7 +309,6 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
                 files: savedFiles,
                 status: 'COMPLETED'
             });
-            if (indexData.backups.length > 2000) indexData.backups.length = 2000;
             await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
 
             if (backupType === 'DAILY_FIRST_WRITE') {
@@ -223,6 +318,9 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
                     completedAt: new Date().toISOString()
                 });
                 cachedDailyBackupDate = dateStr;
+            }
+            if (backupType !== 'HIGH_RISK_BEFORE_RESTORE') {
+                await runBackupCleanupOncePerDay(dateStr);
             }
             return { skipped: false, backupId, files: savedFiles };
         } catch (error) {
@@ -2362,7 +2460,6 @@ app.post('/api/admin/system-backups/:backupId/restore', requireWarehouseAccess, 
                 files: files.map(file => ({ fileName: file.fileName, sourcePath: file.sourcePath })),
                 status: 'RESTORED'
             });
-            if (latestIndexData.backups.length > 2000) latestIndexData.backups.length = 2000;
             await writeJsonToOneDrive(BACKUP_INDEX_PATH, latestIndexData);
 
             return { restoredFromBackupId: backup.backupId, safetyBackupId: safetyBackup.backupId || null };
