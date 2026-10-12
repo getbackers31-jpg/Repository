@@ -8,7 +8,7 @@ require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
 // 升級至 v6.6.0：資料安全與自動備份
-const APP_VERSION = '6.6.3';
+const APP_VERSION = '6.6.4';
 const app = express();
 app.use(cors());
 
@@ -945,27 +945,35 @@ async function calculateProjectMaterialBalances(project) {
         const materialId = String(tx.materialId || '').trim();
         if (!materialId) continue;
         if (!flowByMaterial[materialId]) {
-            flowByMaterial[materialId] = { enteredBaseQuantity: 0, returnedBaseQuantity: 0 };
+            flowByMaterial[materialId] = {
+                warehouseEnteredBaseQuantity: 0,
+                supplierDirectBaseQuantity: 0,
+                returnedBaseQuantity: 0
+            };
         }
         const baseQuantity = Math.abs(Number(tx.baseQuantity || 0));
         if (!Number.isFinite(baseQuantity)) continue;
         if (tx.transactionType === 'PROJECT_RETURN_OUT') {
             flowByMaterial[materialId].returnedBaseQuantity += baseQuantity;
+        } else if (tx.transactionType === 'WAREHOUSE_TRANSFER_IN' || tx.materialSource === 'WAREHOUSE') {
+            flowByMaterial[materialId].warehouseEnteredBaseQuantity += baseQuantity;
         } else if (
-            tx.transactionType === 'WAREHOUSE_TRANSFER_IN' ||
             tx.transactionType === 'OPENING_ISSUE' ||
             tx.transactionType === 'ADDITIONAL_ISSUE' ||
             tx.materialSource === 'SUPPLIER_DIRECT'
         ) {
-            flowByMaterial[materialId].enteredBaseQuantity += baseQuantity;
+            flowByMaterial[materialId].supplierDirectBaseQuantity += baseQuantity;
         }
     }
     return Object.entries(flowByMaterial).map(([materialId, flow]) => {
         const material = inventoryMap[materialId] || {};
         const packageQuantity = Number(material.packageQuantity || 1);
-        const entered = Number(flow.enteredBaseQuantity.toFixed(4));
+        const warehouseEntered = Number(flow.warehouseEnteredBaseQuantity.toFixed(4));
+        const supplierDirect = Number(flow.supplierDirectBaseQuantity.toFixed(4));
+        const entered = Number((warehouseEntered + supplierDirect).toFixed(4));
         const returned = Number(flow.returnedBaseQuantity.toFixed(4));
-        const unreturned = Number(Math.max(0, entered - returned).toFixed(4));
+        // 只有公司倉庫領入可退回；供應商直送不列入可退回數量。
+        const warehouseUnreturned = Number(Math.max(0, warehouseEntered - returned).toFixed(4));
         return {
             materialId,
             materialName: material.materialName || materialId,
@@ -975,18 +983,23 @@ async function calculateProjectMaterialBalances(project) {
             stockUnit: material.stockUnit || '',
             baseUnit: material.baseUnit || material.stockUnit || '',
             enteredBaseQuantity: entered,
+            warehouseEnteredBaseQuantity: warehouseEntered,
+            supplierDirectBaseQuantity: supplierDirect,
             returnedBaseQuantity: returned,
-            unreturnedBaseQuantity: unreturned,
+            unreturnedBaseQuantity: warehouseUnreturned,
             enteredQuantity: Number((entered / packageQuantity).toFixed(4)),
+            warehouseEnteredQuantity: Number((warehouseEntered / packageQuantity).toFixed(4)),
+            supplierDirectQuantity: Number((supplierDirect / packageQuantity).toFixed(4)),
             returnedQuantity: Number((returned / packageQuantity).toFixed(4)),
-            unreturnedQuantity: Number((unreturned / packageQuantity).toFixed(4)),
+            unreturnedQuantity: Number((warehouseUnreturned / packageQuantity).toFixed(4)),
             issuedBaseQuantity: entered,
             consumedBaseQuantity: returned,
-            remainingBaseQuantity: unreturned,
-            returnable: unreturned > 0.0001
+            remainingBaseQuantity: warehouseUnreturned,
+            returnable: warehouseUnreturned > 0.0001
         };
     });
 }
+
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
 const WAREHOUSE_REPORT_VERSION='6.6.0';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
