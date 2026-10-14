@@ -7,7 +7,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
-// 升級至 v6.6.0：資料安全與自動備份
+// v6.6.4：資料安全、自動備份與來源分流完整版
 const APP_VERSION = '6.6.4';
 const app = express();
 app.use(cors());
@@ -71,7 +71,7 @@ function validateProjectName(projectName) {
 
 function getProjectRegistrationErrorMessage(error) {
     const message = String(error?.message || '');
-    const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元'];
+    const safePrefixes = ['案場名稱不可為空', '案場名稱不可超過 80 個字', '案場名稱不可包含以下字元', '系統備份失敗'];
     return safePrefixes.some(prefix => message.startsWith(prefix)) ? message : '系統暫時無法建立案場，請稍後再試';
 }
 
@@ -132,7 +132,7 @@ async function ensureChildFolder(graphClient, parentPath, childFolderName) {
 }
 
 // ==========================================
-// v6.6.0：簡單可靠、可升級的自動備份核心
+// v6.6.0 ~ v6.6.4：簡單可靠、可升級的自動備份核心
 // ==========================================
 const BACKUP_ROOT = '工程專案管理/系統備份';
 const BACKUP_STATE_PATH = `${BACKUP_ROOT}/backup-state.json`;
@@ -259,17 +259,18 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
         const [year, monthPart] = dateStr.split('-');
         const month = `${year}-${monthPart}`;
 
-        if (backupType === 'DAILY_FIRST_WRITE') {
-            if (cachedDailyBackupDate === dateStr) {
-                await runBackupCleanupOncePerDay(dateStr);
-                return { skipped: true, reason: 'ALREADY_BACKED_UP' };
-            }
+        let isDailyDone = cachedDailyBackupDate === dateStr;
+        if (!isDailyDone) {
             const state = await readJsonFromOneDrive(BACKUP_STATE_PATH, { lastDailyBackupDate: null }, false);
             if (state?.lastDailyBackupDate === dateStr) {
                 cachedDailyBackupDate = dateStr;
-                await runBackupCleanupOncePerDay(dateStr);
-                return { skipped: true, reason: 'ALREADY_BACKED_UP' };
+                isDailyDone = true;
             }
+        }
+
+        if (backupType === 'DAILY_FIRST_WRITE' && isDailyDone) {
+            await runBackupCleanupOncePerDay(dateStr);
+            return { skipped: true, reason: 'ALREADY_BACKED_UP' };
         }
 
         try {
@@ -311,7 +312,9 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
             });
             await writeJsonToOneDrive(BACKUP_INDEX_PATH, indexData);
 
-            if (backupType === 'DAILY_FIRST_WRITE') {
+            // 無論當日首筆是 DAILY_FIRST_WRITE 或 HIGH_RISK_*（排除還原前備份），
+            // 只要今日尚未記錄每日基準點，皆將此完整核心備份標記為今日已完成首寫備份。
+            if (!isDailyDone && backupType !== 'HIGH_RISK_BEFORE_RESTORE') {
                 await writeJsonToOneDrive(BACKUP_STATE_PATH, {
                     lastDailyBackupDate: dateStr,
                     lastDailyBackupId: backupId,
@@ -332,7 +335,6 @@ async function performSystemBackup(backupType, reason, operatorName, extraFiles 
 
 /**
  * 可升級的統一保護寫入介面：read -> validate -> backup -> write。
- * 現有 API 可逐步遷移；未遷移 API 仍使用原有寫入鎖與 performSystemBackup。
  */
 async function executeProtectedWrite(options) {
     if (!options || typeof options.read !== 'function' || typeof options.write !== 'function') {
@@ -636,6 +638,7 @@ async function findProjectByName(projectName, includeInactive = false) {
         normalizeProjectName(project.projectName) === normalizedName
     ) || null;
 }
+
 async function findProjectById(projectId, includeInactive = false) {
     const config = await readProjectsFromOneDrive();
     const projects = Array.isArray(config.projects) ? config.projects : [];
@@ -645,7 +648,9 @@ async function findProjectById(projectId, includeInactive = false) {
         (includeInactive || project.active !== false) &&
         project.projectId === normalizedProjectId
     ) || null;
-}function createProjectId() {
+}
+
+function createProjectId() {
     return `PRJ-${crypto.randomUUID()}`;
 }
 
@@ -668,7 +673,6 @@ async function registerProjectByName(projectName) {
             createdAt: new Date().toISOString()
         };
 
-        // 系統備份介入：因涉及 projects 修改，視為高風險/日常寫入
         await performSystemBackup('DAILY_FIRST_WRITE', '新增案場', 'SYSTEM');
 
         await ensureProjectFolder(project.projectName);
@@ -768,11 +772,11 @@ function normalizeMaterialItems(rawItems, isNoWork, inventoryMap) {
             materialId: dbItem.materialId,
             materialCode: dbItem.materialCode || '無編碼',
             materialName: dbItem.materialName,
-            quantity: quantity,
+            quantity: round4(quantity),
             stockUnit: dbItem.stockUnit,
             packageQuantity: packageQty,
             packageUnit: dbItem.packageUnit || null,
-            baseQuantity: quantity * packageQty,
+            baseQuantity: round4(quantity * packageQty),
             baseUnit: dbItem.baseUnit || dbItem.stockUnit
         };
     });
@@ -913,7 +917,7 @@ async function generateProjectStats(project) {
             if (Array.isArray(report.materialItems)) {
                 report.materialItems.forEach(item => {
                     const key = item.materialId || `${item.materialName} (${item.baseUnit})`;
-                    stats.materialStats[key] = (stats.materialStats[key] || 0) + Number(item.baseQuantity || 0);
+                    stats.materialStats[key] = round4((stats.materialStats[key] || 0) + Number(item.baseQuantity || 0));
                     stats.materialDetails[key] = { name: item.materialName, unit: item.baseUnit || '' };
                 });
             }
@@ -930,8 +934,6 @@ async function generateProjectStats(project) {
 
     return { stats, dataQuality, warnings: invalidFiles, reports: validReports };
 }
-
-
 
 async function calculateProjectMaterialBalances(project) {
     const safeProjectName = sanitizePathSegment(project.projectName);
@@ -1001,7 +1003,7 @@ async function calculateProjectMaterialBalances(project) {
 }
 
 const WAREHOUSE_REPORT_ROOT='工程專案管理/倉庫管理/Excel報表';
-const WAREHOUSE_REPORT_VERSION='6.6.0';
+const WAREHOUSE_REPORT_VERSION='6.6.4';
 const WAREHOUSE_TYPE_LABELS={INITIAL_COUNT:'期初盤點',PURCHASE_IN:'採購入庫',WAREHOUSE_ADJUSTMENT:'盤點修正',PROJECT_TRANSFER_OUT:'領至案場',PROJECT_RETURN:'案場退回',SCRAP_DISPOSAL:'報廢處理'};
 function reportTaiwanParts(){return Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]))}
 function realDate(v){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v||'')))return false;const [y,m,d]=v.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()===m-1&&x.getUTCDate()===d}
@@ -1153,15 +1155,22 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                 }
                 else if (text === '解除案場') {
                     if (!targetId) continue;
-                    await withBindingWriteLock(async () => {
-                        const config = await readBindingsFromOneDrive();
-                        const filtered = (config.bindings || []).filter(b => b.groupId !== targetId);
-                        if (filtered.length === (config.bindings || []).length) { await replyLineMessage(event.replyToken, '無綁定紀錄。'); return; }
-                        
-                        await performSystemBackup('DAILY_FIRST_WRITE', '解除綁定群組', 'SYSTEM');
-                        await writeBindingsToOneDrive({ ...config, bindings: filtered });
-                        await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
-                    });
+                    try {
+                        await withBindingWriteLock(async () => {
+                            const config = await readBindingsFromOneDrive();
+                            const filtered = (config.bindings || []).filter(b => b.groupId !== targetId);
+                            if (filtered.length === (config.bindings || []).length) {
+                                await replyLineMessage(event.replyToken, '無綁定紀錄。');
+                                return;
+                            }
+                            await performSystemBackup('DAILY_FIRST_WRITE', '解除綁定群組', 'SYSTEM');
+                            await writeBindingsToOneDrive({ ...config, bindings: filtered });
+                            await replyLineMessage(event.replyToken, '✅ 已解除綁定。');
+                        });
+                    } catch (error) {
+                        console.error('解除案場失敗：', error);
+                        await replyLineMessage(event.replyToken, `⚠️ 無法解除綁定\n${error.message || '請稍後再試'}`);
+                    }
                 }
                 else if (text === '查詢統計' || text === '案場統計') {
                     if (!targetId) continue;
@@ -1212,69 +1221,77 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                         await replyLineMessage(event.replyToken, '⚠️ 名稱不符或無綁定');
                         continue;
                     }
-                    await withProjectWriteLock(async () => {
-                        const config = await readProjectsFromOneDrive();
-                        const project = (config.projects || []).find(item => item.projectId === binding.projectId);
-                        if (!project) {
-                            await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。');
-                            return;
-                        }
-                        
-                        // 系統備份介入：結案是高風險操作
-                        const operatorId = event.source?.userId || 'SYSTEM';
-                        await performSystemBackup('HIGH_RISK_PROJECT_CLOSE', `案場結案: ${project.projectName}`, operatorId);
+                    try {
+                        await withProjectWriteLock(async () => {
+                            const config = await readProjectsFromOneDrive();
+                            const project = (config.projects || []).find(item => item.projectId === binding.projectId);
+                            if (!project) {
+                                await replyLineMessage(event.replyToken, '⚠️ 系統找不到此案場資料。');
+                                return;
+                            }
+                            
+                            const operatorId = event.source?.userId || 'SYSTEM';
 
-                        let leftoverSummary = '';
-                        try {
-                            const balances = await calculateProjectMaterialBalances(project);
-                            const leftovers = balances.filter(item => item.returnable).map(item => {
-                                const quantity = item.unreturnedQuantity;
-                                return `• ${item.materialName}：${quantity} ${item.stockUnit}`;
-                            });
-                            if (leftovers.length) {
-                                leftoverSummary = `\n\n⚠️ 案場尚有材料未完成退回紀錄：\n${leftovers.join('\n')}\n\n請至倉庫系統執行「案場退回」。`;
-                            }
-                        } catch (error) {
-                            console.error('計算結案剩料失敗：', error);
-                            leftoverSummary = '\n\n⚠️ 剩料摘要計算失敗，請至倉庫系統確認案場餘量。';
-                        }
-                        try {
-                            const response = await fetch(`http://localhost:${PORT}/api/projects/${binding.projectId}/export-excel`);
-                            if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`);
-                            const contentType = response.headers.get('content-type') || '';
-                            if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) throw new Error('結案 API 未回傳 Excel 檔案');
-                            const buffer = Buffer.from(await response.arrayBuffer());
-                            const { dateStr } = getTaiwanDateParts();
-                            const graphClient = await getGraphClient();
-                            await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(project.projectName)}/結案總表_${sanitizePathSegment(project.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buffer);
-                        } catch (error) {
-                            console.error('結案失敗：', error);
-                            await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${error.message})\n案場尚未結案。`);
-                            return;
-                        }
-                        const now = new Date().toISOString();
-                        project.active = false;
-                        project.status = 'CLOSED';
-                        project.closedAt = now;
-                        project.closedBy = operatorId;
-                        project.updatedAt = now;
-                        config.updatedAt = now;
-                        await writeProjectsToOneDrive(config);
-                        await withBindingWriteLock(async () => {
-                            const latest = await readBindingsFromOneDrive();
-                            for (const item of latest.bindings || []) {
-                                if (item.projectId === binding.projectId && item.active !== false) {
-                                    item.active = false;
-                                    item.closedAt = now;
-                                    item.closeReason = 'PROJECT_CLOSED';
+                            let leftoverSummary = '';
+                            try {
+                                const balances = await calculateProjectMaterialBalances(project);
+                                const leftovers = balances.filter(item => item.returnable).map(item => {
+                                    const quantity = item.unreturnedQuantity;
+                                    return `• ${item.materialName}：${quantity} ${item.stockUnit}`;
+                                });
+                                if (leftovers.length) {
+                                    leftoverSummary = `\n\n⚠️ 案場尚有材料未完成退回紀錄：\n${leftovers.join('\n')}\n\n請至倉庫系統執行「案場退回」。`;
                                 }
+                            } catch (error) {
+                                console.error('計算結案剩料失敗：', error);
+                                leftoverSummary = '\n\n⚠️ 剩料摘要計算失敗，請至倉庫系統確認案場餘量。';
                             }
-                            latest.updatedAt = now;
-                            await writeBindingsToOneDrive(latest);
+                            try {
+                                const response = await fetch(`http://localhost:${PORT}/api/projects/${binding.projectId}/export-excel`);
+                                if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`);
+                                const contentType = response.headers.get('content-type') || '';
+                                if (!contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) throw new Error('結案 API 未回傳 Excel 檔案');
+                                const buffer = Buffer.from(await response.arrayBuffer());
+                                const { dateStr } = getTaiwanDateParts();
+                                const graphClient = await getGraphClient();
+                                await graphClient.api(`/users/${TARGET_USER_EMAIL}/drive/root:/工程專案管理/2026_工程專案/${sanitizePathSegment(project.projectName)}/結案總表_${sanitizePathSegment(project.projectName)}_${dateStr.replace(/-/g, '')}.xlsx:/content`).put(buffer);
+                            } catch (error) {
+                                console.error('結案失敗：', error);
+                                await replyLineMessage(event.replyToken, `⚠️ 結案報表產生異常 (${error.message})\n案場尚未結案。`);
+                                return;
+                            }
+
+                            // 系統備份介入：確認報表成功產生後、修改正式案場狀態前執行高風險備份
+                            await performSystemBackup('HIGH_RISK_PROJECT_CLOSE', `案場結案: ${project.projectName}`, operatorId);
+
+                            const now = new Date().toISOString();
+                            project.active = false;
+                            project.status = 'CLOSED';
+                            project.closedAt = now;
+                            project.closedBy = operatorId;
+                            project.updatedAt = now;
+                            config.updatedAt = now;
+                            await writeProjectsToOneDrive(config);
+                            await withBindingWriteLock(async () => {
+                                const latest = await readBindingsFromOneDrive();
+                                for (const item of latest.bindings || []) {
+                                    if (item.projectId === binding.projectId && item.active !== false) {
+                                        item.active = false;
+                                        item.closedAt = now;
+                                        item.closeReason = 'PROJECT_CLOSED';
+                                    }
+                                }
+                                latest.updatedAt = now;
+                                await writeBindingsToOneDrive(latest);
+                            });
+                            await replyLineMessage(event.replyToken, `✅ 案場「${project.projectName}」已成功結案！\n\n系統已產生 Excel 結案報表並保留案場歷史資料。${leftoverSummary}`);
                         });
-                        await replyLineMessage(event.replyToken, `✅ 案場「${project.projectName}」已成功結案！\n\n系統已產生 Excel 結案報表並保留案場歷史資料。${leftoverSummary}`);
-                    });
-                }            }
+                    } catch (error) {
+                        console.error('結案處理失敗：', error);
+                        await replyLineMessage(event.replyToken, `⚠️ 結案失敗：${error.message || '系統處理異常，案場尚未結案'}`);
+                    }
+                }
+            }
         } catch (e) { console.error('Webhook Error', e); }
     }
 });
@@ -1296,7 +1313,7 @@ function nextTemporaryMaterialCode(items){const d=getTaiwanDateParts().dateStr.r
 function findWarehouseItem(data,key){const k=cleanText(key);return(data.items||[]).find(x=>x.materialUid===k||x.materialId===k||x.materialCode===k)}
 function validateCategories(v){const a=[...new Set((Array.isArray(v)?v:[]).map(cleanText).filter(Boolean))];if(!a.length)throw new Error('至少選擇一個材料標籤');return a}
 function publicWarehouseItem(x){return enrichWarehouseInventoryItem(migrateWarehouseItem({...x}))}
-function safeV65Message(e){const m=String(e?.message||'');const allowed=['英文代碼不可空白','英文代碼只能包含英文字母、數字與連字號','英文代碼已存在','中文材料名稱不可空白','至少選擇一個材料標籤','庫存單位不可空白','基準單位不可空白','每一庫存單位的容量必須大於0','找不到該材料主檔','操作人不可空白','修改原因不可空白','更正原因不可空白','報廢數量必須大於0','報廢原因不正確','選擇其他報廢原因時，補充說明必填','停用原因不正確','選擇其他停用原因時，補充說明必填','目前庫存為0，請直接使用停用品項','目前仍有庫存，請先報廢材料或使用全部報廢並停用','重新啟用原因不可空白','已停用品項不可執行報廢', '系統備份失敗，為保護資料安全，本次異動未執行。請稍後再試。'];return allowed.some(a=>m.includes(a))||m.startsWith('報廢數量不可超過目前庫存')?m:'材料品項處理失敗'}
+function safeV65Message(e){const m=String(e?.message||'');const allowed=['英文代碼不可空白','英文代碼只能包含英文字母、數字與連字號','英文代碼已存在','中文材料名稱不可空白','至少選擇一個材料標籤','庫存單位不可空白','基準單位不可空白','每一庫存單位的容量必須大於0','找不到該材料主檔','操作人不可空白','修改原因不可空白','更正原因不可空白','報廢數量必須大於0','報廢原因不正確','選擇其他報廢原因時，補充說明必填','停用原因不正確','選擇其他停用原因時，補充說明必填','目前庫存為0，請直接使用停用品項','目前仍有庫存，請先報廢材料或使用全部報廢並停用','重新啟用原因不可空白','已停用品項不可執行報廢','全部報廢並停用必須報廢目前全部庫存','倉庫異動日期格式不正確','倉庫異動日期無效','倉庫異動日期不可晚於今天','系統備份失敗，為保護資料安全，本次異動未執行。請稍後再試。'];return allowed.some(a=>m.includes(a))||m.startsWith('報廢數量不可超過目前庫存')?m:'材料品項處理失敗'}
 async function saveWarehouseInventory(data){data.updatedAt=new Date().toISOString();await writeJsonToOneDrive('工程專案管理/_系統設定/inventory.json',data);configCache.globalInventory={data:cloneJsonData(data),timestamp:Date.now()}}
 
 app.use('/api', express.json());
@@ -1375,7 +1392,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
         
         const transactionType = payload.transactionType;
         if (!['PURCHASE_IN', 'WAREHOUSE_ADJUSTMENT'].includes(transactionType)) {
-            return res.status(400).json({ success: false, error: '不支援的異ro' });
+            return res.status(400).json({ success: false, error: '不支援的異動類型' });
         }
 
         const operatorName = String(payload.operatorName || '').trim();
@@ -1383,12 +1400,6 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
 
         await withWarehouseWriteLock(async () => {
             const inventoryData = await readGlobalInventory();
-            
-            // 系統備份介入
-            const isHighRisk = transactionType === 'WAREHOUSE_ADJUSTMENT';
-            const backupType = isHighRisk ? 'HIGH_RISK_ADJUSTMENT' : 'DAILY_FIRST_WRITE';
-            await performSystemBackup(backupType, isHighRisk ? '盤點修正' : '日常庫存異動', operatorName);
-
             const txData = await readWarehouseTransactions();
             const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
             if (existingTx) {
@@ -1402,7 +1413,7 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             if (item.inventoryManaged === false) return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
             if (item.active === false) return res.status(400).json({success:false,error:'該品項已停用'});
             
-            const beforeQuantity = Number(item.stockQuantity || 0);
+            const beforeQuantity = round4(Number(item.stockQuantity || 0));
             let quantityChange = 0;
             let afterQuantity = 0;
             
@@ -1414,24 +1425,29 @@ app.post('/api/warehouse/transactions', requireWarehouseAccess, async (req, res)
             if (transactionType === 'PURCHASE_IN') {
                 const qty = Number(payload.quantity);
                 if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ success: false, error: '入庫數量無效' });
-                quantityChange = qty;
-                afterQuantity = beforeQuantity + quantityChange;
+                quantityChange = round4(qty);
+                afterQuantity = round4(beforeQuantity + quantityChange);
             } else if (transactionType === 'WAREHOUSE_ADJUSTMENT') {
                 const actualQty = Number(payload.actualQuantity);
                 if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ success: false, error: '實際盤點數量無效' });
-                afterQuantity = actualQty;
-                quantityChange = afterQuantity - beforeQuantity;
+                afterQuantity = round4(actualQty);
+                quantityChange = round4(afterQuantity - beforeQuantity);
             }
             
             if (quantityChange === 0 && transactionType === 'WAREHOUSE_ADJUSTMENT') {
                 return res.status(400).json({ success: false, error: '盤點數量與目前庫存相同，無須調整' });
             }
 
-            const packageQuantity = Number(item.packageQuantity || 1);
-            const baseQuantityChange = quantityChange * packageQuantity;
-            
             const { dateStr } = getTaiwanDateParts();
             const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
+
+            // 系統備份介入：所有驗證與重送檢查通過後，才執行備份
+            const isHighRisk = transactionType === 'WAREHOUSE_ADJUSTMENT';
+            const backupType = isHighRisk ? 'HIGH_RISK_ADJUSTMENT' : 'DAILY_FIRST_WRITE';
+            await performSystemBackup(backupType, isHighRisk ? '盤點修正' : '日常庫存異動', operatorName);
+
+            const packageQuantity = Number(item.packageQuantity || 1);
+            const baseQuantityChange = round4(quantityChange * packageQuantity);
             const transactionId = `TX-${crypto.randomUUID()}`;
             const nowIso = new Date().toISOString();
             
@@ -1480,7 +1496,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
 
         const projectId = String(payload.projectId || '').trim();
         const materialId = String(payload.materialId || '').trim();
-        const quantity = Number(payload.quantity);
+        const quantity = round4(Number(payload.quantity));
         const operatorName = String(payload.operatorName || '').trim();
 
         if (!projectId || !materialId || !operatorName || !Number.isFinite(quantity) || quantity <= 0) {
@@ -1493,10 +1509,6 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
         await withWarehouseWriteLock(async () => {
             await withMaterialWriteLock(project.projectId, async () => {
                 const inventoryData = await readGlobalInventory();
-
-                // 系統備份介入
-                await performSystemBackup('DAILY_FIRST_WRITE', '倉庫領料至案場', operatorName);
-
                 const txData = await readWarehouseTransactions();
 
                 const existingTx = txData.transactions.find(tx => tx.submissionId === submissionId);
@@ -1509,18 +1521,24 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 if (itemIndex === -1) return res.status(404).json({ success: false, error: '找不到該材料主檔' });
 
                 const item = inventoryData.items[itemIndex];
-                const beforeQuantity = Number(item.stockQuantity || 0);
+                if (item.inventoryManaged === false) return res.status(400).json({ success: false, error: '該材料不納入庫存計算' });
+                if (item.active === false) return res.status(400).json({ success: false, error: '該品項已停用' });
 
-                if (beforeQuantity < quantity) {
+                const beforeQuantity = round4(Number(item.stockQuantity || 0));
+
+                if (beforeQuantity + 0.0001 < quantity) {
                     return res.status(400).json({ success: false, error: `倉庫庫存不足，目前只有 ${beforeQuantity} ${item.stockUnit}` });
                 }
 
-                const packageQuantity = Number(item.packageQuantity || 1);
-                const afterQuantity = beforeQuantity - quantity;
-                const baseQuantityChange = -(quantity * packageQuantity);
-
                 const { dateStr } = getTaiwanDateParts();
                 const transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
+
+                // 系統備份介入：驗證通過後執行備份
+                await performSystemBackup('DAILY_FIRST_WRITE', '倉庫領料至案場', operatorName);
+
+                const packageQuantity = Number(item.packageQuantity || 1);
+                const afterQuantity = round4(Math.max(0, beforeQuantity - quantity));
+                const baseQuantityChange = round4(-(quantity * packageQuantity));
                 const transactionId = `TX-${crypto.randomUUID()}`;
                 const nowIso = new Date().toISOString();
 
@@ -1542,7 +1560,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                         transactionType: 'WAREHOUSE_TRANSFER_IN', materialId: item.materialId,
                         materialCode: item.materialCode, materialName: item.materialName, quantity: quantity,
                         stockUnit: item.stockUnit, packageQuantity: packageQuantity, packageUnit: item.packageUnit,
-                        baseQuantity: quantity * packageQuantity, baseUnit: item.baseUnit || item.stockUnit,
+                        baseQuantity: round4(quantity * packageQuantity), baseUnit: item.baseUnit || item.stockUnit,
                         remarks: String(payload.remarks || '倉庫轉入')
                     });
                     await writeJsonToOneDrive(projectTxPath, projTxData);
@@ -1551,7 +1569,7 @@ app.post('/api/warehouse/project-transfer', requireWarehouseAccess, async (req, 
                 const warehouseTx = {
                     transactionId, submissionId, transferId, transactionType: 'PROJECT_TRANSFER_OUT',
                     transactionDate, materialId: item.materialId, materialCode: item.materialCode,
-                    materialName: item.materialName, quantityChange: -quantity, beforeQuantity,
+                    materialName: item.materialName, quantityChange: round4(-quantity), beforeQuantity,
                     afterQuantity, stockUnit: item.stockUnit, packageQuantity, packageUnit: item.packageUnit,
                     baseQuantityChange, baseUnit: item.baseUnit || item.stockUnit, projectId: project.projectId,
                     projectName: project.projectName, operatorName, remarks: String(payload.remarks || ''),
@@ -1591,7 +1609,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
 
         const projectId = String(payload.projectId || '').trim();
         const materialId = String(payload.materialId || '').trim();
-        const requestedQuantity = Number(payload.quantity);
+        const requestedQuantity = round4(Number(payload.quantity));
         const operatorName = String(payload.operatorName || '').trim();
 
         if (!projectId || !materialId || !operatorName || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
@@ -1604,10 +1622,6 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
         await withWarehouseWriteLock(async () => {
             await withMaterialWriteLock(project.projectId, async () => {
                 const inventoryData = await readGlobalInventory();
-
-                // 系統備份介入
-                await performSystemBackup('DAILY_FIRST_WRITE', '案場材料退回', operatorName);
-
                 const txData = await readWarehouseTransactions();
 
                 const existingWarehouseTx = txData.transactions.find(tx => tx.submissionId === submissionId);
@@ -1632,7 +1646,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 const existingProjectTransaction = projTxData.transactions.find(tx => tx.submissionId === submissionId);
                 const packageQuantity = Number(item.packageQuantity || 1);
                 let quantity = requestedQuantity;
-                let baseQuantityToReturn = quantity * packageQuantity;
+                let baseQuantityToReturn = round4(quantity * packageQuantity);
                 let transferId;
                 let transactionDate;
 
@@ -1642,8 +1656,8 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     if (existingProjectTransaction.transactionType !== 'PROJECT_RETURN_OUT') return res.status(409).json({ success: false, error: '相同 submissionId 已被其他案場交易使用' });
                     if (existingProjectTransaction.materialId !== materialId) return res.status(409).json({ success: false, error: '重送資料的材料與原交易不一致' });
 
-                    quantity = Math.abs(Number(existingProjectTransaction.quantity || 0));
-                    baseQuantityToReturn = Math.abs(Number(existingProjectTransaction.baseQuantity || 0));
+                    quantity = round4(Math.abs(Number(existingProjectTransaction.quantity || 0)));
+                    baseQuantityToReturn = round4(Math.abs(Number(existingProjectTransaction.baseQuantity || 0)));
                     transferId = existingProjectTransaction.transferId;
                     transactionDate = existingProjectTransaction.transactionDate;
                 } else {
@@ -1651,26 +1665,31 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                     const balanceItem = balances.find(entry => entry.materialId === materialId);
                     const currentBalance = Number(balanceItem?.remainingBaseQuantity || 0);
 
-                    if (currentBalance < baseQuantityToReturn) {
-                        return res.status(400).json({ success: false, error: `退回數量超過尚未退回紀錄！目前尚未退回 ${currentBalance / packageQuantity} ${item.stockUnit}` });
+                    if (currentBalance + 0.0001 < baseQuantityToReturn) {
+                        return res.status(400).json({ success: false, error: `退回數量超過尚未退回紀錄！目前尚未退回 ${round4(currentBalance / packageQuantity)} ${item.stockUnit}` });
                     }
 
                     transferId = `TRF-${crypto.randomUUID()}`;
                     transactionDate = validateWarehouseDate(payload.transactionDate, dateStr);
+                }
 
+                // 系統備份介入：驗證通過後執行備份
+                await performSystemBackup('DAILY_FIRST_WRITE', '案場材料退回', operatorName);
+
+                if (!existingProjectTransaction) {
                     projTxData.transactions.push({
                         submissionId, transferId, materialSource: 'WAREHOUSE', transactionDate,
                         transactionType: 'PROJECT_RETURN_OUT', materialId: item.materialId,
                         materialCode: item.materialCode, materialName: item.materialName,
-                        quantity: -quantity, stockUnit: item.stockUnit, packageQuantity,
-                        packageUnit: item.packageUnit, baseQuantity: -baseQuantityToReturn,
+                        quantity: round4(-quantity), stockUnit: item.stockUnit, packageQuantity,
+                        packageUnit: item.packageUnit, baseQuantity: round4(-baseQuantityToReturn),
                         baseUnit: item.baseUnit || item.stockUnit, remarks: String(payload.remarks || '案場退回倉庫')
                     });
                     await writeJsonToOneDrive(projectTxPath, projTxData);
                 }
 
-                const beforeQuantity = Number(item.stockQuantity || 0);
-                const afterQuantity = beforeQuantity + quantity;
+                const beforeQuantity = round4(Number(item.stockQuantity || 0));
+                const afterQuantity = round4(beforeQuantity + quantity);
                 const transactionId = `TX-${crypto.randomUUID()}`;
                 const nowIso = new Date().toISOString();
 
@@ -1689,7 +1708,7 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
                 await writeWarehouseTransactions(txData);
 
                 item.stockQuantity = afterQuantity;
-                item.stockBaseQuantity = Number((afterQuantity * packageQuantity).toFixed(4));
+                item.stockBaseQuantity = round4(afterQuantity * packageQuantity);
                 enrichWarehouseInventoryItem(item);
                 inventoryData.updatedAt = nowIso;
 
@@ -1712,9 +1731,9 @@ app.post('/api/warehouse/project-return', requireWarehouseAccess, async (req, re
 
 // v6.5 品項清單
 app.get('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{const d=await readGlobalInventory();return res.json({success:true,version:APP_VERSION,items:(d.items||[]).map(publicWarehouseItem)})}catch(e){console.error(e);return res.status(500).json({success:false,error:'無法取得材料品項'})}});
-app.post('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory();await performSystemBackup('DAILY_FIRST_WRITE', '新增材料品項', cleanText(req.body?.operatorName));const p=req.body||{},status=p.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';let code=status==='TEMPORARY'?nextTemporaryMaterialCode(d.items):validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items).has(code))throw new Error('英文代碼已存在');const name=cleanText(p.materialName),stockUnit=cleanText(p.stockUnit),baseUnit=cleanText(p.baseUnit),capacity=Number(p.packageQuantity);if(!name)throw new Error('中文材料名稱不可空白');if(!stockUnit)throw new Error('庫存單位不可空白');if(!baseUnit)throw new Error('基準單位不可空白');if(!(capacity>0))throw new Error('每一庫存單位的容量必須大於0');const now=new Date().toISOString(),item={materialUid:materialUid(),materialId:code,materialCode:code,materialName:name,codeStatus:status,active:true,materialCategories:validateCategories(p.materialCategories),previousCodes:[],stockQuantity:0,stockBaseQuantity:0,stockUnit,packageQuantity:round4(capacity),packageUnit:cleanText(p.packageUnit)||baseUnit,baseUnit,inventoryManaged:true,minimumStockEnabled:false,createdAt:now,createdBy:cleanText(p.operatorName),createReason:cleanText(p.createReason),remarks:cleanText(p.remarks)};if(!item.createdBy)throw new Error('操作人不可空白');d.items.push(item);await saveWarehouseInventory(d);return res.status(201).json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
-app.patch('/api/warehouse/material-items/:uid',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),item=findWarehouseItem(d,req.params.uid);if(!item)throw new Error('找不到該材料主檔');const p=req.body||{},action=cleanText(p.action),operator=cleanText(p.operatorName);if(!operator)throw new Error('操作人不可空白');let backupType='DAILY_FIRST_WRITE';if(action==='RECODE'||action==='FORMALIZE')backupType='HIGH_RISK_RECODE';if(action==='DISABLE')backupType='HIGH_RISK_DISABLE';await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);if(action==='RENAME'){if(!cleanText(p.materialName))throw new Error('中文材料名稱不可空白');if(!cleanText(p.reason))throw new Error('修改原因不可空白');item.materialName=cleanText(p.materialName);item.nameUpdatedAt=new Date().toISOString();item.nameUpdatedBy=operator;item.nameUpdateReason=cleanText(p.reason)}else if(action==='UPDATE_CATEGORIES'){item.materialCategories=validateCategories(p.materialCategories);item.categoriesUpdatedAt=new Date().toISOString();item.categoriesUpdatedBy=operator}else if(action==='RECODE'||action==='FORMALIZE'){const code=validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items,item.materialUid).has(code))throw new Error('英文代碼已存在');const reason=cleanText(p.reason);if(!reason)throw new Error('更正原因不可空白');const old=materialCode(item.materialCode||item.materialId);if(old!==code)item.previousCodes.push({code:old,changedAt:new Date().toISOString(),changedBy:operator,reason});item.materialId=code;item.materialCode=code;item.codeStatus='FORMAL';if(cleanText(p.materialName))item.materialName=cleanText(p.materialName)}else if(action==='DISABLE'){if(Number(item.stockQuantity||0)!==0)throw new Error('目前仍有庫存，請先報廢材料或使用全部報廢並停用');const reason=cleanText(p.disableReason);if(!DISABLE_REASONS.has(reason))throw new Error('停用原因不正確');if(reason==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');item.active=false;item.disabledAt=new Date().toISOString();item.disabledBy=operator;item.disabledReason=reason}else if(action==='ENABLE'){if(!cleanText(p.reason))throw new Error('重新啟用原因不可空白');item.active=true;item.reenabledAt=new Date().toISOString();item.reenabledBy=operator;item.reenabledReason=cleanText(p.reason)}else throw new Error('不支援的品項操作');await saveWarehouseInventory(d);return res.json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
-app.post('/api/warehouse/material-items/:uid/scrap',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),t=await readWarehouseTransactions(),item=findWarehouseItem(d,req.params.uid),p=req.body||{};if(!item)throw new Error('找不到該材料主檔');const backupType=p.disableAfter?'HIGH_RISK_DISABLE':'DAILY_FIRST_WRITE';await performSystemBackup(backupType, p.disableAfter?'全部報廢並停用':'材料報廢', cleanText(p.operatorName));if(item.active===false)throw new Error('已停用品項不可執行報廢');if((t.transactions||[]).some(x=>x.submissionId===cleanText(p.submissionId)))return res.json({success:true,duplicate:true});const qty=Number(p.quantity),before=Number(item.stockQuantity||0);if(!(qty>0))throw new Error('報廢數量必須大於0');if(qty>before)throw new Error(`報廢數量不可超過目前庫存${before}${item.stockUnit||''}`);if(!SCRAP_REASONS.has(cleanText(p.scrapReason)))throw new Error('報廢原因不正確');if(cleanText(p.scrapReason)==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他報廢原因時，補充說明必填');if(!cleanText(p.operatorName))throw new Error('操作人不可空白');const after=round4(before-qty),now=new Date().toISOString(),tx={transactionId:`TX-${crypto.randomUUID()}`,submissionId:cleanText(p.submissionId),transferId:null,transactionType:'SCRAP_DISPOSAL',transactionDate:validateWarehouseDate(p.transactionDate,getTaiwanDateParts().dateStr),materialUid:item.materialUid,materialId:item.materialId,materialCode:item.materialCode,materialName:item.materialName,quantityChange:-qty,beforeQuantity:before,afterQuantity:after,stockUnit:item.stockUnit,packageQuantity:Number(item.packageQuantity||1),packageUnit:item.packageUnit,baseQuantityChange:round4(-qty*Number(item.packageQuantity||1)),baseUnit:item.baseUnit||item.stockUnit,projectId:null,projectName:null,scrapReason:cleanText(p.scrapReason),operatorName:cleanText(p.operatorName),remarks:cleanText(p.remarks),createdAt:now,writeStatus:'COMPLETED'};item.stockQuantity=after;item.stockBaseQuantity=round4(after*Number(item.packageQuantity||1));if(p.disableAfter===true){if(after!==0)throw new Error('全部報廢並停用必須報廢目前全部庫存');const dr=cleanText(p.disableReason);if(!DISABLE_REASONS.has(dr))throw new Error('停用原因不正確');if(dr==='其他'&&!cleanText(p.disableRemarks||p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');item.active=false;item.disabledAt=now;item.disabledBy=cleanText(p.operatorName);item.disabledReason=dr}enrichWarehouseInventoryItem(item);t.transactions.push(tx);t.updatedAt=now;await writeWarehouseTransactions(t);await saveWarehouseInventory(d);return res.json({success:true,transactionId:tx.transactionId,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.post('/api/warehouse/material-items',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory();const p=req.body||{},status=p.codeStatus==='TEMPORARY'?'TEMPORARY':'FORMAL';let code=status==='TEMPORARY'?nextTemporaryMaterialCode(d.items):validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items).has(code))throw new Error('英文代碼已存在');const name=cleanText(p.materialName),stockUnit=cleanText(p.stockUnit),baseUnit=cleanText(p.baseUnit),capacity=Number(p.packageQuantity);if(!name)throw new Error('中文材料名稱不可空白');if(!stockUnit)throw new Error('庫存單位不可空白');if(!baseUnit)throw new Error('基準單位不可空白');if(!(capacity>0))throw new Error('每一庫存單位的容量必須大於0');const now=new Date().toISOString(),item={materialUid:materialUid(),materialId:code,materialCode:code,materialName:name,codeStatus:status,active:true,materialCategories:validateCategories(p.materialCategories),previousCodes:[],stockQuantity:0,stockBaseQuantity:0,stockUnit,packageQuantity:round4(capacity),packageUnit:cleanText(p.packageUnit)||baseUnit,baseUnit,inventoryManaged:true,minimumStockEnabled:false,createdAt:now,createdBy:cleanText(p.operatorName),createReason:cleanText(p.createReason),remarks:cleanText(p.remarks)};if(!item.createdBy)throw new Error('操作人不可空白');await performSystemBackup('DAILY_FIRST_WRITE', '新增材料品項', item.createdBy);d.items.push(item);await saveWarehouseInventory(d);return res.status(201).json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.patch('/api/warehouse/material-items/:uid',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),item=findWarehouseItem(d,req.params.uid);if(!item)throw new Error('找不到該材料主檔');const p=req.body||{},action=cleanText(p.action),operator=cleanText(p.operatorName);if(!operator)throw new Error('操作人不可空白');let backupType='DAILY_FIRST_WRITE';if(action==='RECODE'||action==='FORMALIZE')backupType='HIGH_RISK_RECODE';if(action==='DISABLE')backupType='HIGH_RISK_DISABLE';if(action==='RENAME'){if(!cleanText(p.materialName))throw new Error('中文材料名稱不可空白');if(!cleanText(p.reason))throw new Error('修改原因不可空白');await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);item.materialName=cleanText(p.materialName);item.nameUpdatedAt=new Date().toISOString();item.nameUpdatedBy=operator;item.nameUpdateReason=cleanText(p.reason)}else if(action==='UPDATE_CATEGORIES'){const cats=validateCategories(p.materialCategories);await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);item.materialCategories=cats;item.categoriesUpdatedAt=new Date().toISOString();item.categoriesUpdatedBy=operator}else if(action==='RECODE'||action==='FORMALIZE'){const code=validateMaterialCode(p.materialCode);if(allMaterialCodes(d.items,item.materialUid).has(code))throw new Error('英文代碼已存在');const reason=cleanText(p.reason);if(!reason)throw new Error('更正原因不可空白');await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);const old=materialCode(item.materialCode||item.materialId);if(old!==code)item.previousCodes.push({code:old,changedAt:new Date().toISOString(),changedBy:operator,reason});item.materialId=code;item.materialCode=code;item.codeStatus='FORMAL';if(cleanText(p.materialName))item.materialName=cleanText(p.materialName)}else if(action==='DISABLE'){if(Number(item.stockQuantity||0)!==0)throw new Error('目前仍有庫存，請先報廢材料或使用全部報廢並停用');const reason=cleanText(p.disableReason);if(!DISABLE_REASONS.has(reason))throw new Error('停用原因不正確');if(reason==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他停用原因時，補充說明必填');await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);item.active=false;item.disabledAt=new Date().toISOString();item.disabledBy=operator;item.disabledReason=reason}else if(action==='ENABLE'){if(!cleanText(p.reason))throw new Error('重新啟用原因不可空白');await performSystemBackup(backupType, `執行品項操作: ${action}`, operator);item.active=true;item.reenabledAt=new Date().toISOString();item.reenabledBy=operator;item.reenabledReason=cleanText(p.reason)}else throw new Error('不支援的品項操作');await saveWarehouseInventory(d);return res.json({success:true,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
+app.post('/api/warehouse/material-items/:uid/scrap',requireWarehouseAccess,async(req,res)=>{try{await withWarehouseWriteLock(async()=>{const d=await readGlobalInventory(),t=await readWarehouseTransactions(),item=findWarehouseItem(d,req.params.uid),p=req.body||{};if(!item)throw new Error('找不到該材料主檔');if(item.active===false)throw new Error('已停用品項不可執行報廢');if((t.transactions||[]).some(x=>x.submissionId===cleanText(p.submissionId)))return res.json({success:true,duplicate:true});const qty=round4(Number(p.quantity)),before=round4(Number(item.stockQuantity||0));if(!(qty>0))throw new Error('報廢數量必須大於0');if(qty>before+0.0001)throw new Error(`報廢數量不可超過目前庫存${before}${item.stockUnit||''}`);if(!SCRAP_REASONS.has(cleanText(p.scrapReason)))throw new Error('報廢原因不正確');if(cleanText(p.scrapReason)==='其他'&&!cleanText(p.remarks))throw new Error('選擇其他報廢原因時，補充說明必填');if(!cleanText(p.operatorName))throw new Error('操作人不可空白');const after=round4(Math.max(0,before-qty));if(p.disableAfter===true){if(after!==0)throw new Error('全部報廢並停用必須報廢目前全部庫存');const dr=cleanText(p.disableReason);if(!DISABLE_REASONS.has(dr))throw new Error('停用原因不正確');if(dr==='其他'&&!cleanText(p.disableRemarks||p.remarks))throw new Error('選擇其他停用原因時，補充說明必填')}const transactionDate=validateWarehouseDate(p.transactionDate,getTaiwanDateParts().dateStr);const backupType=p.disableAfter?'HIGH_RISK_DISABLE':'DAILY_FIRST_WRITE';await performSystemBackup(backupType, p.disableAfter?'全部報廢並停用':'材料報廢', cleanText(p.operatorName));const now=new Date().toISOString(),tx={transactionId:`TX-${crypto.randomUUID()}`,submissionId:cleanText(p.submissionId),transferId:null,transactionType:'SCRAP_DISPOSAL',transactionDate,materialUid:item.materialUid,materialId:item.materialId,materialCode:item.materialCode,materialName:item.materialName,quantityChange:round4(-qty),beforeQuantity:before,afterQuantity:after,stockUnit:item.stockUnit,packageQuantity:Number(item.packageQuantity||1),packageUnit:item.packageUnit,baseQuantityChange:round4(-qty*Number(item.packageQuantity||1)),baseUnit:item.baseUnit||item.stockUnit,projectId:null,projectName:null,scrapReason:cleanText(p.scrapReason),operatorName:cleanText(p.operatorName),remarks:cleanText(p.remarks),createdAt:now,writeStatus:'COMPLETED'};item.stockQuantity=after;item.stockBaseQuantity=round4(after*Number(item.packageQuantity||1));if(p.disableAfter===true){const dr=cleanText(p.disableReason);item.active=false;item.disabledAt=now;item.disabledBy=cleanText(p.operatorName);item.disabledReason=dr}enrichWarehouseInventoryItem(item);t.transactions.push(tx);t.updatedAt=now;await writeWarehouseTransactions(t);await saveWarehouseInventory(d);return res.json({success:true,transactionId:tx.transactionId,item:publicWarehouseItem(item)})})}catch(e){return res.status(400).json({success:false,error:safeV65Message(e)})}});
 
 // 其他專案與材料相關 API 路由
 app.get('/api/projects', async (req, res) => {
@@ -1755,6 +1774,7 @@ app.get('/api/projects', async (req, res) => {
         return res.status(500).json({ success: false, error: '無法取得案場清單' });
     }
 });
+
 app.get('/api/materials', async (req, res) => {
     const projectId = req.query.projectId;
     try {
@@ -1804,6 +1824,7 @@ app.get('/api/projects/:projectId/material-balances', async (req, res) => {
         return res.status(500).json({ success: false, error: '取得餘額失敗' });
     }
 });
+
 // Excel 結案報表匯出 (包含完整五張工作表與材料來源欄位)
 app.get('/api/projects/:projectId/export-excel', async (req, res) => {
     try {
@@ -1878,7 +1899,7 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
-        // 工作表 2：材料結案總表
+        // 工作表 2：材料結案總表（僅公司倉庫領入計入尚未退回紀錄）
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
         wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '累計進場數量', '累計進場換算量', '日報登記使用量', '日報登記使用換算量', '已退回倉庫數量', '已退回換算量', '尚未退回紀錄', '尚未退回換算量', '基準單位']);
@@ -1891,7 +1912,9 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
                 materialSummaryMap[uniqueKey] = {
                     materialCode: resolveMaterialCode(item), materialName: item.materialName,
                     packageSpec: pkgSpec, stockUnit: item.stockUnit,
-                    enteredQty: 0, enteredBaseQty: 0, usedQty: 0, usedBaseQty: 0,
+                    enteredQty: 0, enteredBaseQty: 0,
+                    warehouseEnteredQty: 0, warehouseEnteredBaseQty: 0,
+                    usedQty: 0, usedBaseQty: 0,
                     returnedQty: 0, returnedBaseQty: 0, baseUnit: item.baseUnit,
                     packageQuantity
                 };
@@ -1905,7 +1928,12 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             if (tx.transactionType === 'PROJECT_RETURN_OUT') {
                 m.returnedQty += qty;
                 m.returnedBaseQty += baseQty;
-            } else if (['WAREHOUSE_TRANSFER_IN','OPENING_ISSUE','ADDITIONAL_ISSUE'].includes(tx.transactionType) || tx.materialSource === 'SUPPLIER_DIRECT') {
+            } else if (tx.transactionType === 'WAREHOUSE_TRANSFER_IN' || tx.materialSource === 'WAREHOUSE') {
+                m.enteredQty += qty;
+                m.enteredBaseQty += baseQty;
+                m.warehouseEnteredQty += qty;
+                m.warehouseEnteredBaseQty += baseQty;
+            } else if (['OPENING_ISSUE','ADDITIONAL_ISSUE'].includes(tx.transactionType) || tx.materialSource === 'SUPPLIER_DIRECT') {
                 m.enteredQty += qty;
                 m.enteredBaseQty += baseQty;
             }
@@ -1918,8 +1946,8 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             });
         });
         Object.values(materialSummaryMap).forEach(m => {
-            const unreturnedQty = Math.max(0, m.enteredQty - m.returnedQty);
-            const unreturnedBaseQty = Math.max(0, m.enteredBaseQty - m.returnedBaseQty);
+            const unreturnedQty = Math.max(0, m.warehouseEnteredQty - m.returnedQty);
+            const unreturnedBaseQty = Math.max(0, m.warehouseEnteredBaseQty - m.returnedBaseQty);
             wsMaterials.addRow([
                 m.materialCode, m.materialName, m.packageSpec, m.stockUnit,
                 round4(m.enteredQty), round4(m.enteredBaseQty),
@@ -2034,7 +2062,6 @@ app.post('/api/submit-report', async (req, res) => {
 
         const inventoryMap = await buildInventoryMap(project);
 
-        // 系統備份介入：日報或供應商直送不屬於高風險，採用每日首次寫入
         const operatorId = String(reportData.reporterName || '未紀錄').trim();
         const reason = formType === 'material_issue' ? '供應商直送登記' : '施工日報繳交';
         
@@ -2064,8 +2091,6 @@ app.post('/api/submit-report', async (req, res) => {
             let suspiciousMatches = [];
 
             await withMaterialWriteLock(project.projectId, async () => {
-                await performSystemBackup('DAILY_FIRST_WRITE', reason, operatorId);
-
                 const txPath = `${projectFolderPath}/project-material-transactions.json`;
                 let txData = { transactions: [] };
                 try {
@@ -2101,6 +2126,9 @@ app.post('/api/submit-report', async (req, res) => {
                 if (suspiciousMatches.length > 0 && !forceDirectIssue) {
                     return; 
                 }
+
+                // 系統備份介入：通過重複檢查與 409 防呆檢查後，才執行每日首次寫入備份
+                await performSystemBackup('DAILY_FIRST_WRITE', reason, operatorId);
 
                 const issueType = reportData.issueType === 'ADDITIONAL' ? 'ADDITIONAL_ISSUE' : 'OPENING_ISSUE';
                 
@@ -2194,6 +2222,14 @@ app.post('/api/submit-report', async (req, res) => {
         } else contractorItems = [];
         const calculatedTotalWorkerCount = isNoWork ? 0 : contractorItems.reduce((total, item) => total + item.workerCount, 0);
 
+        const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
+        let materialItems;
+        try {
+            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork, inventoryMap);
+        } catch (materialError) {
+            return res.status(400).json({ success: false, error: materialError.message });
+        }
+
         await ensureProjectFolder(project.projectName);
         const [textFolderResult, dataFolderResult] = await Promise.all([
             ensureChildFolder(graphClient, projectFolderPath, '施工日報'),
@@ -2203,14 +2239,6 @@ app.post('/api/submit-report', async (req, res) => {
         const submittedSubmissionId = String(reportData.submissionId || '').trim();
         const fullSubmissionId = submittedSubmissionId || crypto.randomUUID();
         const shortSubmissionId = fullSubmissionId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
-
-        const workItems = Array.isArray(reportData.workItems) ? reportData.workItems : [];
-        let materialItems;
-        try {
-            materialItems = normalizeMaterialItems(reportData.materialItems, isNoWork, inventoryMap);
-        } catch (materialError) {
-            return res.status(400).json({ success: false, error: materialError.message });
-        }
 
         const structuredReport = {
             schemaVersion: 1, projectId: project.projectId, projectName: project.projectName, reportDate: reportDate,
@@ -2238,7 +2266,7 @@ app.post('/api/submit-report', async (req, res) => {
             const issuedStats = {};
             (txData.transactions || []).forEach(tx => {
                 const key = tx.materialId;
-                issuedStats[key] = (issuedStats[key] || 0) + Number(tx.baseQuantity || 0);
+                issuedStats[key] = round4((issuedStats[key] || 0) + Number(tx.baseQuantity || 0));
             });
             
             const sRes = await generateProjectStats(project);
@@ -2247,7 +2275,7 @@ app.post('/api/submit-report', async (req, res) => {
                     const key = m.materialId;
                     const totCons = sRes.stats.materialStats[key] || 0;
                     const totIss = issuedStats[key] || 0;
-                    const bal = totIss - totCons;
+                    const bal = round4(totIss - totCons);
                     
                     if (bal < 0) {
                         alertMsgs.push(`⚠️ ${m.materialName}\n • 累計領入: ${totIss} ${m.baseUnit}\n • 累計耗用: ${totCons} ${m.baseUnit}\n • 理論剩餘: ${bal} ${m.baseUnit}`);
