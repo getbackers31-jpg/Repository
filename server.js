@@ -8,7 +8,7 @@ require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
 // v6.6.4：資料安全、自動備份與來源分流完整版
-const APP_VERSION = '6.6.4';
+const APP_VERSION = '6.6.5';
 const app = express();
 app.use(cors());
 
@@ -1813,11 +1813,44 @@ app.get('/api/projects/:projectId', async (req, res) => {
     }
 });
 
+// Read-only material-card summary. Existing warehouse return fields are unchanged.
+function materialCardBalances(balances, inventoryMap, statsResult) {
+    const ready = Boolean(statsResult && statsResult.stats &&
+        statsResult.dataQuality && statsResult.dataQuality.invalidFileCount === 0);
+    const used = ready ? statsResult.stats.materialStats || {} : {};
+    const byId = new Map(balances.map(b => [b.materialId, b]));
+    for (const id of new Set([...Object.keys(inventoryMap), ...Object.keys(used)])) {
+        if (byId.has(id)) continue;
+        const m = inventoryMap[id] || {};
+        byId.set(id, { materialId:id, stockUnit:m.stockUnit || '',
+            packageQuantity:m.packageQuantity || 1, enteredBaseQuantity:0,
+            returnedBaseQuantity:0, enteredQuantity:0, warehouseEnteredQuantity:0,
+            supplierDirectQuantity:0, returnedQuantity:0, unreturnedQuantity:0 });
+    }
+    return [...byId.values()].map(b => {
+        const capacity = Number(b.packageQuantity || 1);
+        const usedBase = Number(used[b.materialId] ?? 0);
+        const valid = ready && Number.isFinite(capacity) && capacity > 0 && Number.isFinite(usedBase);
+        const theoreticalBase = valid ? round4(Number(b.enteredBaseQuantity || 0) - Number(b.returnedBaseQuantity || 0) - usedBase) : null;
+        return {...b, consumptionAvailable:valid,
+            dailyConsumedBaseQuantity:valid ? round4(usedBase) : null,
+            dailyConsumedQuantity:valid ? round4(usedBase / capacity) : null,
+            theoreticalRemainingBaseQuantity:theoreticalBase,
+            theoreticalRemainingQuantity:valid ? round4(theoreticalBase / capacity) : null};
+    });
+}
+
 app.get('/api/projects/:projectId/material-balances', async (req, res) => {
     try {
         const project = await findProjectById(req.params.projectId, true);
         if (!project) return res.status(404).json({ success: false, error: '找不到指定案場' });
-        const balances = await calculateProjectMaterialBalances(project);
+        let balances = await calculateProjectMaterialBalances(project);
+        if (String(req.query.includeConsumption) === 'true') {
+            let statsResult = null;
+            try { statsResult = await generateProjectStats(project); }
+            catch (error) { console.error('Material-card consumption read failed:', error); }
+            balances = materialCardBalances(balances, await buildInventoryMap(project), statsResult);
+        }
         return res.status(200).json({ success: true, projectId: project.projectId, active: project.active !== false, balances });
     } catch (error) {
         console.error('取得案場材料餘額失敗：', error);
