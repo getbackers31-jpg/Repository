@@ -8,7 +8,7 @@ require('isomorphic-fetch');
 const ExcelJS = require('exceljs');
 
 // v6.6.4：資料安全、自動備份與來源分流完整版
-const APP_VERSION = '6.6.5';
+const APP_VERSION = '6.6.6';
 const app = express();
 app.use(cors());
 
@@ -798,6 +798,40 @@ function resolveMaterialSource(tx) {
     return '其他';
 }
 
+// v6.6.6：填表人名稱正規化（大小寫、全半形、多餘空白視為同一人）
+function normalizeReporterName(name) {
+    return String(name || '未紀錄').normalize('NFKC').replace(/\s+/g, ' ').trim() || '未紀錄';
+}
+
+// v6.6.6：找出開案到結案期間沒有任何日報的日期
+function findMissingReportDates(startDate, endDate, reports) {
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(String(startDate)) || !dateRegex.test(String(endDate))) return [];
+    const reported = new Set((reports || []).map(r => String(r.reportDate || '').trim()));
+    const missing = [];
+    const end = Date.parse(`${endDate}T00:00:00Z`);
+    for (let t = Date.parse(`${startDate}T00:00:00Z`); t <= end; t += 86400000) {
+        const d = new Date(t).toISOString().slice(0, 10);
+        if (!reported.has(d)) missing.push(d);
+    }
+    return missing;
+}
+
+// v6.6.6：把連續日期合併成區間，例如 10/23～10/24、10/27～10/31
+function formatDateRanges(dates) {
+    if (!dates.length) return '無';
+    const label = d => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+    const ranges = [];
+    let start = dates[0], prev = dates[0];
+    for (const d of dates.slice(1)) {
+        if (Date.parse(`${d}T00:00:00Z`) - Date.parse(`${prev}T00:00:00Z`) === 86400000) { prev = d; continue; }
+        ranges.push(start === prev ? label(start) : `${label(start)}～${label(prev)}`);
+        start = prev = d;
+    }
+    ranges.push(start === prev ? label(start) : `${label(start)}～${label(prev)}`);
+    return ranges.join('、');
+}
+
 async function generateProjectStats(project) {
     const safeProjectName = sanitizePathSegment(project.projectName);
     const dataFolderPath = `工程專案管理/2026_工程專案/${safeProjectName}/結構化資料`;
@@ -823,7 +857,7 @@ async function generateProjectStats(project) {
 
     const reports = [];
     const invalidFiles = [];
-    const DOWNLOAD_CONCURRENCY = 5;
+    const DOWNLOAD_CONCURRENCY = 10;
     
     for (let i = 0; i < allItems.length; i += DOWNLOAD_CONCURRENCY) {
         const chunk = allItems.slice(i, i + DOWNLOAD_CONCURRENCY);
@@ -888,6 +922,7 @@ async function generateProjectStats(project) {
         materialDetails: {}, 
         reporterStats: {}
     };
+    const reporterGroups = new Map();
 
     for (const report of validReports) {
         if (report.isNoWork) {
@@ -896,8 +931,12 @@ async function generateProjectStats(project) {
             stats.workDays++;
             stats.totalManDays += Number(report.totalWorkerCount) || 0;
 
-            const reporter = String(report.reporterName || '未紀錄').trim();
-            stats.reporterStats[reporter] = (stats.reporterStats[reporter] || 0) + 1;
+            const reporter = normalizeReporterName(report.reporterName);
+            const reporterKey = reporter.toLowerCase();
+            const group = reporterGroups.get(reporterKey) || { name: reporter, days: 0 };
+            group.name = reporter; // 依日期排序，最後一份的寫法作為顯示名稱
+            group.days += 1;
+            reporterGroups.set(reporterKey, group);
 
             if (Array.isArray(report.contractorItems)) {
                 const dailyContractors = new Map();
@@ -922,6 +961,10 @@ async function generateProjectStats(project) {
                 });
             }
         }
+    }
+
+    for (const group of reporterGroups.values()) {
+        stats.reporterStats[group.name] = (stats.reporterStats[group.name] || 0) + group.days;
     }
 
     const dataQuality = {
@@ -1915,6 +1958,9 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         wsSummary.addRow(['累計日曆天', calDays]);
         wsSummary.addRow(['實際工作天', stats.workDays]);
         wsSummary.addRow(['免計工作天', stats.noWorkDays]);
+        const missingReportDates = findMissingReportDates(startDate, endDate, reports);
+        wsSummary.addRow(['未回報天數', missingReportDates.length]);
+        wsSummary.addRow(['未回報日期', formatDateRanges(missingReportDates)]);
         wsSummary.addRow(['全案總人天', stats.totalManDays]);
         wsSummary.addRow([]);
         
@@ -1932,10 +1978,10 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
             wsSummary.addRow([name, days]);
         }
 
-        // 工作表 2：材料結案總表（僅公司倉庫領入計入尚未退回紀錄）
+        // 工作表 2：材料結案總表（v6.6.6：新增理論剩餘；倉庫領料尚未退回僅計公司倉庫領入）
         const wsMaterials = workbook.addWorksheet('材料結案總表');
         wsMaterials.views = [{ showGridLines: true }];
-        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '累計進場數量', '累計進場換算量', '日報登記使用量', '日報登記使用換算量', '已退回倉庫數量', '已退回換算量', '尚未退回紀錄', '尚未退回換算量', '基準單位']);
+        wsMaterials.addRow(['材料分類編碼', '材料名稱', '包裝規格', '庫存單位', '累計進場數量', '累計進場換算量', '日報登記使用量', '日報登記使用換算量', '已退回倉庫數量', '已退回換算量', '理論剩餘數量', '理論剩餘換算量', '倉庫領料尚未退回', '倉庫領料尚未退回換算量', '基準單位']);
         const materialSummaryMap = {};
         const ensureMaterialSummary = item => {
             const packageQuantity = Number(item.packageQuantity || 1);
@@ -1981,14 +2027,25 @@ app.get('/api/projects/:projectId/export-excel', async (req, res) => {
         Object.values(materialSummaryMap).forEach(m => {
             const unreturnedQty = Math.max(0, m.warehouseEnteredQty - m.returnedQty);
             const unreturnedBaseQty = Math.max(0, m.warehouseEnteredBaseQty - m.returnedBaseQty);
-            wsMaterials.addRow([
+            // 理論剩餘＝累計進場－日報耗用－已退回；不截為 0，負數代表紀錄需核對
+            const theoreticalQty = m.enteredQty - m.usedQty - m.returnedQty;
+            const theoreticalBaseQty = m.enteredBaseQty - m.usedBaseQty - m.returnedBaseQty;
+            const row = wsMaterials.addRow([
                 m.materialCode, m.materialName, m.packageSpec, m.stockUnit,
                 round4(m.enteredQty), round4(m.enteredBaseQty),
                 round4(m.usedQty), round4(m.usedBaseQty),
                 round4(m.returnedQty), round4(m.returnedBaseQty),
+                round4(theoreticalQty), round4(theoreticalBaseQty),
                 round4(unreturnedQty), round4(unreturnedBaseQty), m.baseUnit
             ]);
+            if (theoreticalQty < -0.0001) {
+                row.getCell(11).font = { color: { argb: 'FFB42318' }, bold: true };
+                row.getCell(12).font = { color: { argb: 'FFB42318' }, bold: true };
+            }
         });
+        wsMaterials.addRow([]);
+        wsMaterials.addRow(['說明', '理論剩餘＝累計進場－日報登記使用－已退回倉庫，依登記紀錄計算，實際數量以現場清點為準；負數代表紀錄需核對。']);
+        wsMaterials.addRow(['', '倉庫領料尚未退回＝公司倉庫領入－已退回倉庫，為帳面紀錄，不代表現場剩餘。']);
         // 工作表 3：材料進出紀錄 (含材料來源)
         const wsTxLog = workbook.addWorksheet('材料進出紀錄');
         wsTxLog.views = [{ showGridLines: true }];
