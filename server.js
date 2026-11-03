@@ -823,7 +823,7 @@ async function generateProjectStats(project) {
 
     const reports = [];
     const invalidFiles = [];
-    const DOWNLOAD_CONCURRENCY = 10;
+    const DOWNLOAD_CONCURRENCY = 5;
     
     for (let i = 0; i < allItems.length; i += DOWNLOAD_CONCURRENCY) {
         const chunk = allItems.slice(i, i + DOWNLOAD_CONCURRENCY);
